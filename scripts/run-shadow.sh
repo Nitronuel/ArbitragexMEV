@@ -23,8 +23,8 @@ if [[ -f "$env_file" ]]; then
   set +a
 else
   printf 'warning: runtime env file not found: %s\n' "$env_file" >&2
-  printf '  offline commands (validate-config, verify-catalog) still work.\n' >&2
-  printf '  live commands need BASE_HTTP_RPC_URL / BASE_WS_RPC_URL exports.\n' >&2
+  printf '  validate-config and any live command REQUIRE the env file.\n' >&2
+  printf '  verify-catalog (offline) does not and can run without it.\n' >&2
   printf '  see docs/runbooks/shadow-mode.md, section 2.\n' >&2
 fi
 

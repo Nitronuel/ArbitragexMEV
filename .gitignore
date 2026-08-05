@@ -6,6 +6,9 @@
 *.seed
 secrets/
 
+# Operator-created runtime configuration (created from config/shadow.example.toml)
+config/shadow.toml
+
 target/
 out/
 cache/
