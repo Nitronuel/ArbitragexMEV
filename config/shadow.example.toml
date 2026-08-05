@@ -7,3 +7,4 @@ dirty_lag_milliseconds = 500
 request_cu_ceiling = 24000000
 websocket_bytes_ceiling = 5000000000
 database_limit_bytes = 10000000000
+manifest_path = "data/pools.csv"

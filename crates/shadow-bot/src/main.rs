@@ -2,6 +2,8 @@ use std::{
     collections::HashSet,
     fs,
     path::PathBuf,
+    sync::Arc,
+    sync::atomic::AtomicBool,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,6 +19,7 @@ use shadow::{
     CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceReport, ServiceSnapshot, daily_report,
     observe_snapshot, replay_observation, run_live, run_smoke,
 };
+use signal_hook::consts::{SIGINT, SIGTERM};
 use storage::Storage;
 
 const QUEUE_CAPACITY: usize = 100_000;
@@ -24,6 +27,25 @@ const CYCLE_LIMITS: CycleLimits = CycleLimits {
     max_cycles: 1_000_000,
     max_cycles_per_pool: 10_000,
 };
+
+/// An `AtomicBool` stop flag raised by SIGINT/SIGTERM for graceful drain.
+struct StopOnSignal {
+    flag: Arc<AtomicBool>,
+    _ids: Vec<signal_hook::SigId>,
+}
+
+impl StopOnSignal {
+    fn install() -> Self {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut ids = Vec::new();
+        for signal in [SIGTERM, SIGINT] {
+            if let Ok(id) = signal_hook::flag::register(signal, Arc::clone(&flag)) {
+                ids.push(id);
+            }
+        }
+        Self { flag, _ids: ids }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -44,9 +66,14 @@ enum Command {
         config: PathBuf,
     },
     /// Parses and validates a candidate-pool manifest without RPC access.
+    /// Just make simple builds of the manifest
     VerifyCatalog {
         #[arg(long)]
-        manifest: PathBuf,
+        manifest: Option<PathBuf>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        offline: bool,
     },
     /// Runs a bounded live-provider smoke test (chain, pinned catalog, Sync).
     SmokeTest {
@@ -74,8 +101,10 @@ enum Command {
         manifest: Option<PathBuf>,
         #[arg(long)]
         block: Option<u64>,
-        #[arg(long, default_value_t = 10)]
-        idle_timeout_secs: u64,
+        #[arg(long, default_value_t = 250)]
+        poll_ms: u64,
+        #[arg(long, default_value_t = 250)]
+        drain_ms: u64,
         #[arg(long, default_value_t = 0)]
         max_items: u64,
         #[arg(long)]
@@ -101,7 +130,11 @@ fn main() {
     let cli = Cli::parse();
     let outcome = match cli.command {
         Command::ValidateConfig { config } => validate_config(&config),
-        Command::VerifyCatalog { manifest } => verify_catalog(&manifest),
+        Command::VerifyCatalog {
+            manifest,
+            config,
+            offline: _,
+        } => verify_catalog_command(manifest, config),
         Command::SmokeTest {
             config,
             manifest,
@@ -115,7 +148,8 @@ fn main() {
             db,
             manifest,
             block,
-            idle_timeout_secs,
+            poll_ms,
+            drain_ms,
             max_items,
             anchor,
         } => run(
@@ -124,7 +158,8 @@ fn main() {
             &db,
             manifest.as_deref(),
             block,
-            idle_timeout_secs,
+            poll_ms,
+            drain_ms,
             max_items,
             &anchor,
         ),
@@ -151,6 +186,25 @@ fn verify_catalog(path: &std::path::Path) -> Result<(), String> {
     let candidates = parse_manifest(file).map_err(|error| error.to_string())?;
     println!("manifest valid: {} candidate pools", candidates.len());
     Ok(())
+}
+
+/// Resolves the manifest from `--manifest` or `--config`, then validates it
+/// statically. The offline flag is a paranoia marker: no RPC calls are made.
+fn verify_catalog_command(
+    manifest: Option<PathBuf>,
+    config: Option<PathBuf>,
+) -> Result<(), String> {
+    let manifest_path = if let Some(path) = manifest {
+        path
+    } else {
+        let config_path = config.ok_or_else(|| {
+            "verify-catalog needs --manifest or --config (with manifest_path)".to_owned()
+        })?;
+        let parsed =
+            ShadowConfig::manifest_path_from(&config_path).map_err(|error| error.to_string())?;
+        parsed.ok_or_else(|| "--config has no manifest_path".to_owned())?
+    };
+    verify_catalog(&manifest_path)
 }
 
 fn run_smoke_command(
@@ -232,7 +286,8 @@ fn run(
     db: &std::path::Path,
     manifest_path: Option<&std::path::Path>,
     block: Option<u64>,
-    idle_timeout_secs: u64,
+    poll_ms: u64,
+    drain_ms: u64,
     max_items: u64,
     anchors: &[String],
 ) -> Result<(), String> {
@@ -254,7 +309,8 @@ fn run(
             manifest_path,
             db,
             block,
-            idle_timeout_secs,
+            poll_ms,
+            drain_ms,
             max_items,
             anchors,
             economics,
@@ -301,7 +357,8 @@ fn run_live_command(
     manifest_path: &std::path::Path,
     db: &std::path::Path,
     block: Option<u64>,
-    idle_timeout_secs: u64,
+    poll_ms: u64,
+    drain_ms: u64,
     max_items: u64,
     anchors: &[String],
     economics: Economics,
@@ -330,9 +387,10 @@ fn run_live_command(
         budget.clone(),
         retry,
     );
-    let pinned = match block {
-        Some(block) => block,
-        None => reader.current_block().map_err(|error| error.to_string())?,
+    let pinned = if let Some(block) = block {
+        block
+    } else {
+        reader.current_block().map_err(|error| error.to_string())?
     };
     let rpc = LiveRpc::new(reader);
     let log_stream = LogStream::new(budget.clone());
@@ -353,13 +411,16 @@ fn run_live_command(
             },
         )
     };
+    let stop = StopOnSignal::install();
     let report = run_live(
         fs::File::open(manifest_path).map_err(|error| error.to_string())?,
         &anchor_set,
         pinned,
         &rpc,
         &log_stream,
-        Duration::from_secs(idle_timeout_secs),
+        Duration::from_millis(poll_ms),
+        Duration::from_millis(drain_ms),
+        &stop.flag,
         max_items_usize,
         alloy_primitives::B256::ZERO,
         &mut build_probe,

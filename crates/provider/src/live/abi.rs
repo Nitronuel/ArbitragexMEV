@@ -74,7 +74,7 @@ mod tests {
         let b = Address::with_last_byte(0xbb);
         let data = calldata_with_addresses("getPair(address,address)", a, b);
         assert_eq!(data.len(), 4 + 64);
-        assert_eq!(data.as_ref()[4..16].iter().all(|b| *b == 0), true);
+        assert!(data.as_ref()[4..16].iter().all(|b| *b == 0));
         assert_eq!(&data.as_ref()[16..36], a.as_slice());
         assert_eq!(&data.as_ref()[36..48].iter().all(|byte| *byte == 0), &true);
         assert_eq!(&data.as_ref()[48..], b.as_slice());

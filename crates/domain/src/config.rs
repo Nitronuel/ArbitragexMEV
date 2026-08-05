@@ -1,4 +1,4 @@
-use std::{env, fmt, fs, path::Path};
+use std::{env, fmt, fs, path::Path, path::PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -52,6 +52,8 @@ pub struct ShadowConfig {
     pub request_cu_ceiling: u64,
     pub websocket_bytes_ceiling: u64,
     pub database_limit_bytes: u64,
+    /// Path to the offline catalog (pools CSV) used by offline commands.
+    pub manifest_path: Option<PathBuf>,
     #[serde(skip)]
     pub http_rpc_url: Option<RpcUrl>,
     #[serde(skip)]
@@ -70,6 +72,19 @@ impl ShadowConfig {
         let http = env::var("BASE_HTTP_RPC_URL").ok();
         let websocket = env::var("BASE_WS_RPC_URL").ok();
         Self::from_toml_and_urls(&input, http.as_deref(), websocket.as_deref())
+    }
+
+    /// Reads only the offline catalog path from a TOML file. Does not require
+    /// the RPC environment, so it is safe for fully offline commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or is not valid TOML.
+    pub fn manifest_path_from(path: &Path) -> Result<Option<PathBuf>, ConfigError> {
+        let input = fs::read_to_string(path).map_err(ConfigError::Read)?;
+        toml::from_str::<Self>(&input)
+            .map(|config| config.manifest_path)
+            .map_err(ConfigError::Parse)
     }
 
     fn from_toml_and_urls(

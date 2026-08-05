@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
@@ -24,9 +25,9 @@ use crate::{CostSnapshot, Economics, ServiceError};
 /// Why a live-observation window stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
-    /// The socket went quiet for the idle timeout.
-    IdleTimeout,
-    /// The configured item cap was reached.
+    /// A stop signal was received; buffered frames were drained before exit.
+    Stopped,
+    /// The configured item cap was reached and buffered frames were drained cleanly.
     CapReached,
     /// The subscription closed (cleanly or not).
     Disconnected(provider::DisconnectKind),
@@ -54,24 +55,25 @@ pub struct LiveReport {
     pub ended: EndReason,
 }
 
-/// Runs a bounded live observation window.
+/// Runs a live observation window as a continuous loop.
 ///
 /// The catalog is verified against a pinned `block`, the compiled dirty graph is
 /// bootstrapped, and a subscription probe is built from the verified pool
-/// addresses via `build_probe`. Each `Sync` log drained from the probe is
-/// applied to local state, then marked for re-evaluation; one dirty batch is
-/// scored at the end of the window. The window halts on an idle timeout, the
-/// `max_items` cap, or a socket close (`max_items == 0` means unbounded).
+/// addresses via `build_probe`. The loop serves `Sync` frames until a stop
+/// signal (`stop`), the `max_items` cap (`0` = unbounded), or a socket close.
+/// When stopped by signal or cap, a graceful drain pass pulls already-buffered
+/// frames before one dirty batch is drained and usage/health are flushed.
 ///
-/// Live subscription frames carry no block hash, so reorg-aware ordering on the
-/// canonical chain is deferred to the canary handler; this loop applies frames
-/// with the caller-supplied `block_hash` placeholder.
+/// The loop yields with `poll` on each idle read so it can observe the `stop`
+/// flag without busy-spinning. Live subscription frames carry no block hash, so
+/// reorg-aware canonical ordering is deferred to the canary handler.
 ///
 /// # Errors
 ///
 /// Returns an error when the manifest is invalid, the pinned catalog cannot be
 /// verified, graph compilation fails, storage fails, or the socket errors.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::implicit_hasher)]
 pub fn run_live<P: WsProbe>(
     manifest: impl Read,
@@ -79,7 +81,9 @@ pub fn run_live<P: WsProbe>(
     block: u64,
     rpc: &impl CatalogRpc,
     stream: &LogStream,
-    idle_timeout: Duration,
+    poll: Duration,
+    drain_grace: Duration,
+    stop: &AtomicBool,
     max_items: usize,
     block_hash: B256,
     build_probe: &mut impl FnMut(&[Address]) -> Result<P, StreamError>,
@@ -146,11 +150,17 @@ pub fn run_live<P: WsProbe>(
         requeued: 0,
         skipped_stale: 0,
         degraded: false,
-        ended: EndReason::IdleTimeout,
+        ended: EndReason::Stopped,
     };
 
-    while max_items == 0 || report.sync_observed < max_items {
-        match probe.next(stream, idle_timeout)? {
+    let ended: EndReason = 'serve: loop {
+        if stop.load(Ordering::Relaxed) {
+            break 'serve EndReason::Stopped;
+        }
+        if max_items != 0 && report.sync_observed >= max_items {
+            break 'serve EndReason::CapReached;
+        }
+        match probe.next(stream, poll)? {
             Some(StreamItem::Log(envelope)) => {
                 report.sync_observed += 1;
                 apply_envelope(
@@ -161,19 +171,25 @@ pub fn run_live<P: WsProbe>(
                     &mut report,
                 )?;
             }
-            Some(StreamItem::Disconnected(kind)) => {
-                report.ended = EndReason::Disconnected(kind);
-                break;
-            }
-            None => {
-                report.ended = EndReason::IdleTimeout;
-                break;
-            }
+            Some(StreamItem::Disconnected(kind)) => break 'serve EndReason::Disconnected(kind),
+            None => {}
+        }
+    };
+
+    // Graceful drain: accept frames already buffered before the stop or cap.
+    if !matches!(ended, EndReason::Disconnected(_)) {
+        while let Some(StreamItem::Log(envelope)) = probe.next(stream, drain_grace)? {
+            report.sync_observed += 1;
+            apply_envelope(
+                &mut evaluator,
+                &envelope,
+                &address_to_pool,
+                block_hash,
+                &mut report,
+            )?;
         }
     }
-    if max_items != 0 && report.sync_observed >= max_items {
-        report.ended = EndReason::CapReached;
-    }
+    report.ended = ended;
 
     let outcome = evaluator.run_once(now_ms);
 
@@ -237,6 +253,7 @@ fn apply_envelope(
 mod tests {
     use std::cell::RefCell;
     use std::collections::{HashSet, VecDeque};
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use alloy_primitives::{Address, Bytes, U256};
@@ -376,12 +393,16 @@ mod tests {
         }
     }
 
-    fn run_live_test(items: Vec<provider::StreamItem>, max_items: usize) -> crate::LiveReport {
+    fn run_live_test(
+        items: &[provider::StreamItem],
+        max_items: usize,
+        stop: &AtomicBool,
+    ) -> crate::LiveReport {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("live.sqlite");
         let stream = provider::LogStream::new(provider::ProviderBudget::new(1_000_000, 1_000_000));
         let mut probe = |_: &[Address]| -> Result<MockProbe, provider::StreamError> {
-            Ok(MockProbe::new(items.clone()))
+            Ok(MockProbe::new(items.to_vec()))
         };
         let manifest_text = manifest();
         run_live(
@@ -391,6 +412,8 @@ mod tests {
             &rpc(),
             &stream,
             Duration::from_millis(1),
+            Duration::from_millis(1),
+            stop,
             max_items,
             alloy_primitives::B256::ZERO,
             &mut probe,
@@ -410,26 +433,33 @@ mod tests {
     }
 
     #[test]
-    fn applies_one_sync_log_and_idles_out() {
+    fn drains_buffered_frames_on_stop() {
+        let stop = AtomicBool::new(true);
         let report = run_live_test(
-            vec![sync_envelope(U256::from(5), U256::from(6), BLOCK + 1, 0)],
+            &[
+                sync_envelope(U256::from(5), U256::from(6), BLOCK + 1, 0),
+                sync_envelope(U256::from(7), U256::from(8), BLOCK + 1, 1),
+            ],
             0,
+            &stop,
         );
         assert_eq!(report.pool_count, 1);
-        assert_eq!(report.sync_observed, 1);
-        assert_eq!(report.applied, 1);
+        assert_eq!(report.sync_observed, 2);
+        assert_eq!(report.applied, 2);
         assert_eq!(report.unknown_pool, 0);
-        assert_eq!(report.ended, EndReason::IdleTimeout);
+        assert_eq!(report.ended, EndReason::Stopped);
     }
 
     #[test]
     fn stops_when_item_cap_reached() {
+        let stop = AtomicBool::new(false);
         let report = run_live_test(
-            vec![
+            &[
                 sync_envelope(U256::from(5), U256::from(6), BLOCK + 1, 0),
                 sync_envelope(U256::from(7), U256::from(8), BLOCK + 1, 1),
             ],
             2,
+            &stop,
         );
         assert_eq!(report.sync_observed, 2);
         assert_eq!(report.applied, 2);
@@ -448,9 +478,28 @@ mod tests {
             removed: false,
         };
         envelope.address = Address::repeat_byte(0x99);
-        let report = run_live_test(vec![provider::StreamItem::Log(envelope)], 0);
+        let stop = AtomicBool::new(true);
+        let report = run_live_test(&[provider::StreamItem::Log(envelope)], 0, &stop);
         assert_eq!(report.sync_observed, 1);
         assert_eq!(report.unknown_pool, 1);
         assert_eq!(report.applied, 0);
+        assert_eq!(report.ended, EndReason::Stopped);
+    }
+
+    #[test]
+    fn ends_cleanly_on_disconnect() {
+        let stop = AtomicBool::new(false);
+        let report = run_live_test(
+            &[provider::StreamItem::Disconnected(
+                provider::DisconnectKind::Clean,
+            )],
+            0,
+            &stop,
+        );
+        assert_eq!(report.sync_observed, 0);
+        assert_eq!(
+            report.ended,
+            EndReason::Disconnected(provider::DisconnectKind::Clean)
+        );
     }
 }

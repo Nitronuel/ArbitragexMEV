@@ -27,6 +27,7 @@ serde_json = "1.0.145"
 ruint = "1.20.0"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
+signal-hook = "0.3.18"
 thiserror = "2.0.17"
 tempfile = "3.23.0"
 toml = "0.9.8"

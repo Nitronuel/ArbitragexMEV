@@ -13,6 +13,7 @@ domain = { path = "../domain" }
 provider = { path = "../provider" }
 serde_json.workspace = true
 shadow = { path = "../shadow" }
+signal-hook.workspace = true
 storage = { path = "../storage" }
 
 [dev-dependencies]
