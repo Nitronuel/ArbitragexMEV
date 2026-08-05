@@ -1,0 +1,21 @@
+[package]
+name = "shadow-bot"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+catalog = { path = "../catalog" }
+clap.workspace = true
+domain = { path = "../domain" }
+serde_json.workspace = true
+shadow = { path = "../shadow" }
+storage = { path = "../storage" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

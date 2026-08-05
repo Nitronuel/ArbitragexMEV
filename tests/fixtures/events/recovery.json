@@ -1,0 +1,4 @@
+[
+  {"pool_id":0,"reserve0":"1100","reserve1":"900","block_hash":"0x0101010101010101010101010101010101010101010101010101010101010101","position":{"block_number":101,"transaction_index":0,"log_index":0},"removed":false},
+  {"pool_id":0,"reserve0":"1200","reserve1":"800","block_hash":"0x0202020202020202020202020202020202020202020202020202020202020202","position":{"block_number":111,"transaction_index":0,"log_index":0},"removed":false}
+]

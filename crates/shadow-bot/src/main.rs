@@ -1,0 +1,210 @@
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use alloy_primitives::U256;
+use catalog::{CycleLimits, parse_manifest};
+use clap::{Parser, Subcommand};
+use domain::ShadowConfig;
+use shadow::{
+    CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceSnapshot, daily_report, observe_snapshot,
+    replay_observation,
+};
+use storage::Storage;
+
+const QUEUE_CAPACITY: usize = 100_000;
+const CYCLE_LIMITS: CycleLimits = CycleLimits {
+    max_cycles: 1_000_000,
+    max_cycles_per_pool: 10_000,
+};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "shadow-bot",
+    version,
+    about = "Read-only V2 shadow observer for Base"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Validates the TOML configuration and RPC environment redaction.
+    ValidateConfig {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Parses and validates a candidate-pool manifest without RPC access.
+    VerifyCatalog {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// Runs the offline observation pipeline against a snapshot fixture.
+    Run {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        db: PathBuf,
+    },
+    /// Reproduces one stored observation and fails on any mismatch.
+    ReplayObservation {
+        #[arg(value_name = "ID")]
+        id: i64,
+        #[arg(long)]
+        db: PathBuf,
+    },
+    /// Renders a UTC daily report from the shadow database.
+    DailyReport {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        date: String,
+    },
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let outcome = match cli.command {
+        Command::ValidateConfig { config } => validate_config(&config),
+        Command::VerifyCatalog { manifest } => verify_catalog(&manifest),
+        Command::Run {
+            config,
+            snapshot,
+            db,
+        } => run(&config, &snapshot, &db),
+        Command::ReplayObservation { id, db } => replay_observation_command(id, &db),
+        Command::DailyReport { db, date } => daily_report_command(&db, &date),
+    };
+    if let Err(error) = outcome {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn validate_config(path: &std::path::Path) -> Result<(), String> {
+    let config = ShadowConfig::load(path).map_err(|error| error.to_string())?;
+    println!(
+        "configuration valid: chain_id={} max_hops={} pool_cap={}",
+        config.chain_id, config.max_hops, config.pool_cap
+    );
+    Ok(())
+}
+
+fn verify_catalog(path: &std::path::Path) -> Result<(), String> {
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let candidates = parse_manifest(file).map_err(|error| error.to_string())?;
+    println!("manifest valid: {} candidate pools", candidates.len());
+    Ok(())
+}
+
+fn run(
+    config_path: &std::path::Path,
+    snapshot_path: &std::path::Path,
+    db: &std::path::Path,
+) -> Result<(), String> {
+    let config = ShadowConfig::load(config_path).map_err(|error| error.to_string())?;
+    let snapshot: ServiceSnapshot =
+        serde_json::from_slice(&fs::read(snapshot_path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let now_ms = unix_millis();
+    let economics = Economics {
+        flash_fee_rate: U256::ZERO,
+        gas_cost_usd: U256::from(1_000),
+        expected_win_rate: U256::from(FIXED_POINT_SCALE),
+    };
+    let reference = CostSnapshot {
+        usd_per_token: U256::from(FIXED_POINT_SCALE),
+        gas_price_age_valid: true,
+        reference_price_valid: true,
+    };
+    let report = observe_snapshot(
+        snapshot,
+        now_ms,
+        economics,
+        reference,
+        db,
+        QUEUE_CAPACITY,
+        CYCLE_LIMITS,
+        config.request_cu_ceiling,
+        config.websocket_bytes_ceiling,
+    )
+    .map_err(|error| error.to_string())?;
+    println!(
+        "pools={} cycles={} quarantined={} evaluated={} recorded={} interesting={} not_evaluated={} requeued={} skipped_stale={} degraded={}",
+        report.pool_count,
+        report.cycle_count,
+        report.quarantined,
+        report.evaluated,
+        report.recorded,
+        report.interesting,
+        report.not_evaluated,
+        report.requeued,
+        report.skipped_stale,
+        report.degraded,
+    );
+    Ok(())
+}
+
+fn replay_observation_command(id: i64, db: &std::path::Path) -> Result<(), String> {
+    let storage = Storage::open(db).map_err(|error| error.to_string())?;
+    let result = replay_observation(&storage, id).map_err(|error| error.to_string())?;
+    println!(
+        "observation {} cycle={} input={} output={} profit={} matched={}",
+        result.observation_id,
+        result.cycle_id.0,
+        result.input,
+        result.output,
+        result.estimated_profit,
+        result.matched,
+    );
+    if result.matched {
+        Ok(())
+    } else {
+        Err(format!("observation {id} did not reproduce"))
+    }
+}
+
+fn daily_report_command(db: &std::path::Path, date: &str) -> Result<(), String> {
+    let (year, month, day) = parse_date(date)?;
+    let storage = Storage::open(db).map_err(|error| error.to_string())?;
+    let report = daily_report(&storage, year, month, day).map_err(|error| error.to_string())?;
+    print!("{}", report.render());
+    Ok(())
+}
+
+fn parse_date(date: &str) -> Result<(i32, u32, u32), String> {
+    let mut parts = date.split('-');
+    let year = parts
+        .next()
+        .ok_or_else(|| format!("invalid date {date}"))?
+        .parse::<i32>()
+        .map_err(|_| format!("invalid date {date}"))?;
+    let month = parts
+        .next()
+        .ok_or_else(|| format!("invalid date {date}"))?
+        .parse::<u32>()
+        .map_err(|_| format!("invalid date {date}"))?;
+    let day = parts
+        .next()
+        .ok_or_else(|| format!("invalid date {date}"))?
+        .parse::<u32>()
+        .map_err(|_| format!("invalid date {date}"))?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(format!("invalid date {date}"));
+    }
+    Ok((year, month, day))
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}

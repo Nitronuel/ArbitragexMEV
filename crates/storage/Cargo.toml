@@ -1,0 +1,20 @@
+[package]
+name = "storage"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+domain = { path = "../domain" }
+provider = { path = "../provider" }
+rusqlite.workspace = true
+state = { path = "../state" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
