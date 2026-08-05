@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, B256, Bytes, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -7,6 +7,19 @@ use crate::{BudgetExceeded, ProviderBudget};
 #[must_use]
 pub fn sync_topic() -> B256 {
     keccak256("Sync(uint112,uint112)")
+}
+
+/// Decodes a `Sync(uint112,uint112)` log `data` payload into `(reserve0,
+/// reserve1)`. The ABI packs each `uint112` into its own 32-byte word.
+#[must_use]
+pub fn decode_sync_reserves(data: &Bytes) -> Option<(U256, U256)> {
+    if data.len() < 64 {
+        return None;
+    }
+    Some((
+        U256::from_be_slice(&data[..32]),
+        U256::from_be_slice(&data[32..64]),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

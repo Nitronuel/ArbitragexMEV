@@ -13,5 +13,5 @@ pub use live::{LiveHttp, LiveRpc, LiveWsClient, WsFrame, WsProbe};
 pub use redacted_url::{RedactedUrl, RedactedUrlError};
 pub use ws::{
     DisconnectKind, LogStream, RawLogEnvelope, StreamError, StreamItem, SubscriptionFilter,
-    sync_topic,
+    decode_sync_reserves, sync_topic,
 };

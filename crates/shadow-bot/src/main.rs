@@ -1,20 +1,21 @@
 use std::{
+    collections::HashSet,
     fs,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use catalog::{CycleLimits, parse_manifest};
 use clap::{Parser, Subcommand};
 use domain::ShadowConfig;
 use provider::{
     ChainReader, LiveHttp, LiveRpc, LiveWsClient, LogStream, ProviderBudget, RedactedUrl,
-    RetryPolicy, SubscriptionFilter, ThreadSleeper,
+    RetryPolicy, SubscriptionFilter, ThreadSleeper, sync_topic,
 };
 use shadow::{
-    CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceSnapshot, daily_report, observe_snapshot,
-    replay_observation, run_smoke,
+    CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceReport, ServiceSnapshot, daily_report,
+    observe_snapshot, replay_observation, run_live, run_smoke,
 };
 use storage::Storage;
 
@@ -60,14 +61,25 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
     },
-    /// Runs the offline observation pipeline against a snapshot fixture.
+    /// Runs the observation pipeline. Use `--manifest` for a bounded live run,
+    /// otherwise an offline snapshot fixture.
     Run {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
-        snapshot: PathBuf,
+        snapshot: Option<PathBuf>,
         #[arg(long)]
         db: PathBuf,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        #[arg(long)]
+        block: Option<u64>,
+        #[arg(long, default_value_t = 10)]
+        idle_timeout_secs: u64,
+        #[arg(long, default_value_t = 0)]
+        max_items: u64,
+        #[arg(long)]
+        anchor: Vec<String>,
     },
     /// Reproduces one stored observation and fails on any mismatch.
     ReplayObservation {
@@ -101,7 +113,21 @@ fn main() {
             config,
             snapshot,
             db,
-        } => run(&config, &snapshot, &db),
+            manifest,
+            block,
+            idle_timeout_secs,
+            max_items,
+            anchor,
+        } => run(
+            &config,
+            snapshot.as_deref(),
+            &db,
+            manifest.as_deref(),
+            block,
+            idle_timeout_secs,
+            max_items,
+            &anchor,
+        ),
         Command::ReplayObservation { id, db } => replay_observation_command(id, &db),
         Command::DailyReport { db, date } => daily_report_command(&db, &date),
     };
@@ -199,15 +225,18 @@ fn run_smoke_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     config_path: &std::path::Path,
-    snapshot_path: &std::path::Path,
+    snapshot_path: Option<&std::path::Path>,
     db: &std::path::Path,
+    manifest_path: Option<&std::path::Path>,
+    block: Option<u64>,
+    idle_timeout_secs: u64,
+    max_items: u64,
+    anchors: &[String],
 ) -> Result<(), String> {
     let config = ShadowConfig::load(config_path).map_err(|error| error.to_string())?;
-    let snapshot: ServiceSnapshot =
-        serde_json::from_slice(&fs::read(snapshot_path).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
     let now_ms = unix_millis();
     let economics = Economics {
         flash_fee_rate: U256::ZERO,
@@ -219,6 +248,37 @@ fn run(
         gas_price_age_valid: true,
         reference_price_valid: true,
     };
+    if let Some(manifest_path) = manifest_path {
+        run_live_command(
+            &config,
+            manifest_path,
+            db,
+            block,
+            idle_timeout_secs,
+            max_items,
+            anchors,
+            economics,
+            reference,
+        )
+    } else {
+        let snapshot_path =
+            snapshot_path.ok_or_else(|| "--snapshot is required without --manifest".to_owned())?;
+        run_snapshot_command(snapshot_path, db, now_ms, economics, reference, &config)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_snapshot_command(
+    snapshot_path: &std::path::Path,
+    db: &std::path::Path,
+    now_ms: u64,
+    economics: Economics,
+    reference: CostSnapshot,
+    config: &ShadowConfig,
+) -> Result<(), String> {
+    let snapshot: ServiceSnapshot =
+        serde_json::from_slice(&fs::read(snapshot_path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
     let report = observe_snapshot(
         snapshot,
         now_ms,
@@ -231,6 +291,115 @@ fn run(
         config.websocket_bytes_ceiling,
     )
     .map_err(|error| error.to_string())?;
+    print_report(&report);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_live_command(
+    config: &ShadowConfig,
+    manifest_path: &std::path::Path,
+    db: &std::path::Path,
+    block: Option<u64>,
+    idle_timeout_secs: u64,
+    max_items: u64,
+    anchors: &[String],
+    economics: Economics,
+    reference: CostSnapshot,
+) -> Result<(), String> {
+    let http =
+        std::env::var("BASE_HTTP_RPC_URL").map_err(|_| "missing BASE_HTTP_RPC_URL".to_owned())?;
+    let websocket =
+        std::env::var("BASE_WS_RPC_URL").map_err(|_| "missing BASE_WS_RPC_URL".to_owned())?;
+    let http_url: RedactedUrl = http
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let websocket_url: RedactedUrl = websocket
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+
+    let budget = ProviderBudget::new(config.request_cu_ceiling, config.websocket_bytes_ceiling);
+    let retry = RetryPolicy {
+        max_retries: 3,
+        initial_delay: Duration::from_millis(250),
+        max_delay: Duration::from_secs(2),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+    );
+    let pinned = match block {
+        Some(block) => block,
+        None => reader.current_block().map_err(|error| error.to_string())?,
+    };
+    let rpc = LiveRpc::new(reader);
+    let log_stream = LogStream::new(budget.clone());
+
+    let anchor_set: HashSet<Address> = anchors
+        .iter()
+        .map(|value| value.parse::<Address>().map_err(|error| error.to_string()))
+        .collect::<Result<HashSet<_>, String>>()?;
+
+    let max_items_usize: usize =
+        usize::try_from(max_items).map_err(|_| "max-items exceeds platform usize".to_owned())?;
+    let mut build_probe = |addresses: &[Address]| {
+        LiveWsClient::connect(
+            websocket_url.clone(),
+            SubscriptionFilter {
+                addresses: addresses.to_vec(),
+                topic0: sync_topic(),
+            },
+        )
+    };
+    let report = run_live(
+        fs::File::open(manifest_path).map_err(|error| error.to_string())?,
+        &anchor_set,
+        pinned,
+        &rpc,
+        &log_stream,
+        Duration::from_secs(idle_timeout_secs),
+        max_items_usize,
+        alloy_primitives::B256::ZERO,
+        &mut build_probe,
+        unix_millis(),
+        economics,
+        reference,
+        db,
+        QUEUE_CAPACITY,
+        CYCLE_LIMITS,
+        config.request_cu_ceiling,
+        config.websocket_bytes_ceiling,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let usage = budget.snapshot();
+    println!(
+        "live: block={} pools={} cycles={} quarantined={} sync={} applied={} unknown={} evaluated={} recorded={} interesting={} ended={:?}",
+        pinned,
+        report.pool_count,
+        report.cycle_count,
+        report.quarantined,
+        report.sync_observed,
+        report.applied,
+        report.unknown_pool,
+        report.evaluated,
+        report.recorded,
+        report.interesting,
+        report.ended,
+    );
+    println!(
+        "usage: request_cu={} http_bytes={} ws_delivered={} ws_accounted={}",
+        usage.request_cu,
+        usage.http_response_bytes,
+        usage.websocket_delivered_bytes,
+        usage.websocket_accounted_bytes
+    );
+    Ok(())
+}
+
+fn print_report(report: &ServiceReport) {
     println!(
         "pools={} cycles={} quarantined={} evaluated={} recorded={} interesting={} not_evaluated={} requeued={} skipped_stale={} degraded={}",
         report.pool_count,
@@ -244,7 +413,6 @@ fn run(
         report.skipped_stale,
         report.degraded,
     );
-    Ok(())
 }
 
 fn replay_observation_command(id: i64, db: &std::path::Path) -> Result<(), String> {
