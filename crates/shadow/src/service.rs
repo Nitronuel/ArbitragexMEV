@@ -77,6 +77,8 @@ pub enum ServiceError {
     State(#[from] state::StateError),
     #[error("storage failed: {0}")]
     Storage(#[from] StorageError),
+    #[error("live transport failed: {0}")]
+    Live(#[from] provider::StreamError),
     #[error("replay failed for observation {observation_id}: {source}")]
     Replay {
         observation_id: i64,

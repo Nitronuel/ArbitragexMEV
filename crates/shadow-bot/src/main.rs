@@ -1,16 +1,20 @@
 use std::{
     fs,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::U256;
 use catalog::{CycleLimits, parse_manifest};
 use clap::{Parser, Subcommand};
 use domain::ShadowConfig;
+use provider::{
+    ChainReader, LiveHttp, LiveRpc, LiveWsClient, LogStream, ProviderBudget, RedactedUrl,
+    RetryPolicy, SubscriptionFilter, ThreadSleeper,
+};
 use shadow::{
     CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceSnapshot, daily_report, observe_snapshot,
-    replay_observation,
+    replay_observation, run_smoke,
 };
 use storage::Storage;
 
@@ -43,6 +47,19 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
+    /// Runs a bounded live-provider smoke test (chain, pinned catalog, Sync).
+    SmokeTest {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        block: Option<u64>,
+        #[arg(long, default_value_t = 1000)]
+        limit: u64,
+        #[arg(long, default_value_t = 10)]
+        timeout_secs: u64,
+    },
     /// Runs the offline observation pipeline against a snapshot fixture.
     Run {
         #[arg(long)]
@@ -73,6 +90,13 @@ fn main() {
     let outcome = match cli.command {
         Command::ValidateConfig { config } => validate_config(&config),
         Command::VerifyCatalog { manifest } => verify_catalog(&manifest),
+        Command::SmokeTest {
+            config,
+            manifest,
+            block,
+            limit,
+            timeout_secs,
+        } => run_smoke_command(&config, &manifest, block, limit, timeout_secs),
         Command::Run {
             config,
             snapshot,
@@ -100,6 +124,78 @@ fn verify_catalog(path: &std::path::Path) -> Result<(), String> {
     let file = fs::File::open(path).map_err(|error| error.to_string())?;
     let candidates = parse_manifest(file).map_err(|error| error.to_string())?;
     println!("manifest valid: {} candidate pools", candidates.len());
+    Ok(())
+}
+
+fn run_smoke_command(
+    config_path: &std::path::Path,
+    manifest_path: &std::path::Path,
+    block: Option<u64>,
+    limit: u64,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let config = ShadowConfig::load(config_path).map_err(|error| error.to_string())?;
+    let http =
+        std::env::var("BASE_HTTP_RPC_URL").map_err(|_| "missing BASE_HTTP_RPC_URL".to_owned())?;
+    let websocket =
+        std::env::var("BASE_WS_RPC_URL").map_err(|_| "missing BASE_WS_RPC_URL".to_owned())?;
+    let http_url: RedactedUrl = http
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let websocket_url: RedactedUrl = websocket
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+
+    let budget = ProviderBudget::new(config.request_cu_ceiling, config.websocket_bytes_ceiling);
+    let retry = RetryPolicy {
+        max_retries: 3,
+        initial_delay: Duration::from_millis(250),
+        max_delay: Duration::from_secs(2),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+    );
+    let pinned = match block {
+        Some(block) => block,
+        None => reader.current_block().map_err(|error| error.to_string())?,
+    };
+    let rpc = LiveRpc::new(reader);
+    let log_stream = LogStream::new(budget.clone());
+    let mut build_probe =
+        |filter: SubscriptionFilter| LiveWsClient::connect(websocket_url.clone(), filter);
+
+    let limit_usize: usize =
+        usize::try_from(limit).map_err(|_| "limit exceeds platform usize".to_owned())?;
+    let report = run_smoke(
+        fs::File::open(manifest_path).map_err(|error| error.to_string())?,
+        pinned,
+        limit_usize,
+        Duration::from_secs(timeout_secs),
+        &rpc,
+        &log_stream,
+        &mut build_probe,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let usage = budget.snapshot();
+    println!(
+        "smoke: block={} verified={} quarantined={} sync_received={} subscription_ok={}",
+        report.block,
+        report.verified,
+        report.quarantined,
+        report.sync_received,
+        report.subscription_ok
+    );
+    println!(
+        "usage: request_cu={} http_bytes={} ws_delivered={} ws_accounted={}",
+        usage.request_cu,
+        usage.http_response_bytes,
+        usage.websocket_delivered_bytes,
+        usage.websocket_accounted_bytes
+    );
     Ok(())
 }
 

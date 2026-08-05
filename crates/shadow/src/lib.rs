@@ -3,6 +3,7 @@ pub mod evaluator;
 pub mod queue;
 pub mod report;
 pub mod service;
+pub mod smoke;
 
 pub use economics::{
     Classification, ClassificationReason, CostSnapshot, Economics, FIXED_POINT_SCALE,
@@ -14,3 +15,4 @@ pub use service::{
     ReplayError, ReplayResult, ServiceError, ServiceReport, ServiceSnapshot, SnapshotPool,
     observe_catalog, observe_snapshot, replay_observation,
 };
+pub use smoke::{SmokeReport, run_smoke};

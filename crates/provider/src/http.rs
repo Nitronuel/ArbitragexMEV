@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, Bytes};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -37,6 +37,16 @@ pub trait HttpBackend {
 
 pub trait Sleeper {
     fn sleep(&self, duration: Duration);
+}
+
+/// A `Sleeper` that blocks the calling thread for the requested duration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThreadSleeper;
+
+impl Sleeper for ThreadSleeper {
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,20 +109,63 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
     /// Returns an error for transport, budget, malformed-response, or wrong-chain
     /// failures.
     pub fn validate_chain_id(&self) -> Result<(), TransportError> {
-        let response = self.execute(&RpcRequest {
-            method: "eth_chainId".to_owned(),
-            params: json!([]),
-        })?;
-        let encoded = response
-            .result
-            .as_str()
-            .ok_or(TransportError::InvalidResponse)?;
-        let chain_id = u64::from_str_radix(encoded.trim_start_matches("0x"), 16)
-            .map_err(|_| TransportError::InvalidResponse)?;
+        let chain_id = self.chain_id()?;
         if chain_id != 8453 {
             return Err(TransportError::WrongChain(chain_id));
         }
         Ok(())
+    }
+
+    /// Reads the provider chain ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response failures.
+    pub fn chain_id(&self) -> Result<u64, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_chainId".to_owned(),
+            params: json!([]),
+        })?;
+        quantity(&response.result)
+    }
+
+    /// Reads the current (latest) block number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response failures.
+    pub fn current_block(&self) -> Result<u64, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_blockNumber".to_owned(),
+            params: json!([]),
+        })?;
+        quantity(&response.result)
+    }
+
+    /// Reads contract bytecode at a block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response failures.
+    pub fn code(&self, address: Address, block: u64) -> Result<Vec<u8>, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_getCode".to_owned(),
+            params: json!([address_hex(address), hex_block(block)]),
+        })?;
+        result_bytes(&response.result)
+    }
+
+    /// Executes one `eth_call` against a block and returns the raw return bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response failures.
+    pub fn call(&self, to: Address, data: &Bytes, block: u64) -> Result<Bytes, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_call".to_owned(),
+            params: json!([{ "to": address_hex(to), "data": bytes_hex(data) }, hex_block(block)]),
+        })?;
+        result_bytes(&response.result).map(Bytes::from)
     }
 
     /// Fetches explicitly filtered logs in provider-safe chunks of at most ten
@@ -171,5 +224,59 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+fn quantity(result: &Value) -> Result<u64, TransportError> {
+    let encoded = result.as_str().ok_or(TransportError::InvalidResponse)?;
+    u64::from_str_radix(encoded.trim_start_matches("0x"), 16)
+        .map_err(|_| TransportError::InvalidResponse)
+}
+
+fn result_bytes(result: &Value) -> Result<Vec<u8>, TransportError> {
+    let encoded = result.as_str().ok_or(TransportError::InvalidResponse)?;
+    hex_to_bytes(encoded)
+}
+
+fn hex_block(block: u64) -> String {
+    format!("0x{block:x}")
+}
+
+fn address_hex(address: Address) -> String {
+    format!("0x{}", alloy_primitives::hex::encode(address))
+}
+
+fn bytes_hex(data: &Bytes) -> String {
+    format!("0x{}", alloy_primitives::hex::encode(data))
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, TransportError> {
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    alloy_primitives::hex::decode(hex).map_err(|_| TransportError::InvalidResponse)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn quantity_parses_hex() {
+        assert_eq!(quantity(&json!("0x2105")), Ok(8453));
+        assert!(quantity(&json!(null)).is_err());
+        assert!(quantity(&json!("zz")).is_err());
+    }
+
+    #[test]
+    fn hex_transforms_roundtrip() {
+        let address = Address::with_last_byte(0xaa);
+        assert_eq!(address_hex(address).len(), 42);
+        assert_eq!(
+            hex_to_bytes(&address_hex(Address::with_last_byte(0xaa))).unwrap(),
+            Address::with_last_byte(0xaa).as_slice()
+        );
+        let bytes = Bytes::from_static(&[0xde_u8, 0xad]);
+        assert_eq!(bytes_hex(&bytes), "0xdead");
+        assert_eq!(hex_to_bytes("0xdead").unwrap(), vec![0xde, 0xad]);
     }
 }
