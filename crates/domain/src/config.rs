@@ -165,7 +165,7 @@ pub enum ConfigError {
     Parse(#[source] toml::de::Error),
     #[error("missing required environment variable {0}")]
     MissingEnvironment(&'static str),
-    #[error("chain ID {0} is unsupported; supported: 8453 (base), 4663 (robinhood)")]
+    #[error("chain ID {0} is unsupported or disabled; active chain ID is 4663 (robinhood)")]
     InvalidChainId(u64),
     #[error("max_hops must be in 2..=4, got {0}")]
     InvalidMaxHops(u8),
@@ -184,7 +184,7 @@ mod tests {
     use super::{ConfigError, ShadowConfig};
 
     const VALID_TOML: &str = r"
-chain_id = 8453
+chain_id = 4663
 max_hops = 4
 pool_cap = 2000
 stale_timeout_seconds = 60
@@ -200,38 +200,39 @@ database_limit_bytes = 10000000000
         let error = ShadowConfig::from_toml_and_urls(VALID_TOML, None, None).unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::MissingEnvironment("BASE_HTTP_RPC_URL")
+            ConfigError::MissingEnvironment("ROBINHOOD_HTTP_RPC_URL")
         ));
 
         let error = ShadowConfig::from_toml_and_urls(
             VALID_TOML,
-            Some("https://base.example/v2/http-secret"),
+            Some("https://robinhood.example/v2/http-secret"),
             None,
         )
         .unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::MissingEnvironment("BASE_WS_RPC_URL")
+            ConfigError::MissingEnvironment("ROBINHOOD_WS_RPC_URL")
         ));
     }
 
     #[test]
-    fn rejects_non_base_chain_id() {
-        let input = VALID_TOML.replace("chain_id = 8453", "chain_id = 1");
-        let error = ShadowConfig::from_toml_and_urls(
-            &input,
-            Some("https://base.example/v2/http-secret"),
-            Some("wss://base.example/v2/ws-secret"),
-        )
-        .unwrap_err();
-        assert!(matches!(error, ConfigError::InvalidChainId(1)));
+    fn rejects_disabled_base_and_unknown_chain_ids() {
+        for chain_id in [8453, 1] {
+            let input = VALID_TOML.replace("chain_id = 4663", &format!("chain_id = {chain_id}"));
+            let error = ShadowConfig::from_toml_and_urls(
+                &input,
+                Some("https://robinhood.example/v2/http-secret"),
+                Some("wss://robinhood.example/v2/ws-secret"),
+            )
+            .unwrap_err();
+            assert!(matches!(error, ConfigError::InvalidChainId(value) if value == chain_id));
+        }
     }
 
     #[test]
     fn accepts_robinhood_chain_id_with_chain_env_names() {
-        let input = VALID_TOML.replace("chain_id = 8453", "chain_id = 4663");
         let config = ShadowConfig::from_toml_and_urls(
-            &input,
+            VALID_TOML,
             Some("https://robinhood.example/v2/http-secret"),
             Some("wss://robinhood.example/v2/ws-secret"),
         )
@@ -239,7 +240,7 @@ database_limit_bytes = 10000000000
         assert_eq!(config.chain, Some(crate::Chain::Robinhood));
         assert_eq!(config.chain_id, crate::ROBINHOOD_CHAIN_ID);
 
-        let error = ShadowConfig::from_toml_and_urls(&input, None, None).unwrap_err();
+        let error = ShadowConfig::from_toml_and_urls(VALID_TOML, None, None).unwrap_err();
         assert!(matches!(
             error,
             ConfigError::MissingEnvironment("ROBINHOOD_HTTP_RPC_URL")
@@ -252,8 +253,8 @@ database_limit_bytes = 10000000000
             let input = VALID_TOML.replace("max_hops = 4", &format!("max_hops = {max_hops}"));
             let error = ShadowConfig::from_toml_and_urls(
                 &input,
-                Some("https://base.example/v2/http-secret"),
-                Some("wss://base.example/v2/ws-secret"),
+                Some("https://robinhood.example/v2/http-secret"),
+                Some("wss://robinhood.example/v2/ws-secret"),
             )
             .unwrap_err();
             assert!(matches!(error, ConfigError::InvalidMaxHops(value) if value == max_hops));
@@ -262,8 +263,8 @@ database_limit_bytes = 10000000000
 
     #[test]
     fn debug_and_display_redact_rpc_urls() {
-        let http = "https://base.example/v2/http-secret";
-        let websocket = "wss://base.example/v2/ws-secret";
+        let http = "https://robinhood.example/v2/http-secret";
+        let websocket = "wss://robinhood.example/v2/ws-secret";
         let config =
             ShadowConfig::from_toml_and_urls(VALID_TOML, Some(http), Some(websocket)).unwrap();
 

@@ -141,7 +141,7 @@ mod tests {
 
     fn row(pool: &str, token0: &str, token1: &str, source: &str) -> String {
         format!(
-            "8453,{pool},0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6,{token0},{token1},997,1000,{source}\n"
+            "4663,{pool},0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6,{token0},{token1},997,1000,{source}\n"
         )
     }
 
@@ -150,7 +150,7 @@ mod tests {
         let input = include_bytes!("../../../tests/fixtures/catalog/valid.csv");
         let pools = parse_manifest(Cursor::new(input)).unwrap();
         assert_eq!(pools.len(), 2);
-        assert_eq!(pools[0].chain_id, 8453);
+        assert_eq!(pools[0].chain_id, 4663);
         assert_eq!(pools[0].fee.numerator, 997);
     }
 
@@ -222,8 +222,11 @@ mod tests {
             "0x0000000000000000000000000000000000000002",
             "source",
         );
-        let wrong_chain = format!("{HEADER}{}", valid.replacen("8453", "1", 1));
+        let wrong_chain = format!("{HEADER}{}", valid.replacen("4663", "1", 1));
         assert!(parse_manifest(wrong_chain.as_bytes()).is_err());
+
+        let disabled_base = format!("{HEADER}{}", valid.replacen("4663", "8453", 1));
+        assert!(parse_manifest(disabled_base.as_bytes()).is_err());
 
         let invalid_fee = format!("{HEADER}{}", valid.replace(",997,1000,", ",1001,1000,"));
         assert!(parse_manifest(invalid_fee.as_bytes()).is_err());

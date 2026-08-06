@@ -1,6 +1,8 @@
-# Base shadow observer profile. RHC equivalent in shadow-rhc.example.toml.
-# chain_id: 8453 = Base, 4663 = Robinhood Chain (mainnet).
-chain_id = 8453
+# Robinhood Chain shadow observer profile (primary). Base is disabled while the
+# project tracks the Alchemy API budget; see crates/domain/src/chain.rs.
+# chain_id 4663 = Robinhood Chain mainnet. RPC URLs come from the runtime
+# environment: ROBINHOOD_HTTP_RPC_URL and ROBINHOOD_WS_RPC_URL.
+chain_id = 4663
 max_hops = 4
 pool_cap = 2000
 stale_timeout_seconds = 60
@@ -9,4 +11,4 @@ dirty_lag_milliseconds = 500
 request_cu_ceiling = 24000000
 websocket_bytes_ceiling = 5000000000
 database_limit_bytes = 10000000000
-manifest_path = "data/pools.csv"
+manifest_path = "data/pools-rhc.csv"

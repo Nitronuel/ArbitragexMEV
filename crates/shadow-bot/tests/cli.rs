@@ -8,7 +8,7 @@ use std::{
 use tempfile::TempDir;
 
 const VALID_TOML: &str = r"
-chain_id = 8453
+chain_id = 4663
 max_hops = 4
 pool_cap = 2000
 stale_timeout_seconds = 60
@@ -49,8 +49,11 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
 
 fn rpc_env() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("BASE_HTTP_RPC_URL", "https://example.test/v2/secret-http"),
-        ("BASE_WS_RPC_URL", "wss://example.test/v2/secret-ws"),
+        (
+            "ROBINHOOD_HTTP_RPC_URL",
+            "https://example.test/v2/secret-http",
+        ),
+        ("ROBINHOOD_WS_RPC_URL", "wss://example.test/v2/secret-ws"),
     ]
 }
 
@@ -97,7 +100,7 @@ fn validate_config_rejects_wrong_chain_and_redacts_urls() {
     let directory = tempfile::tempdir().unwrap();
     let env = rpc_env();
 
-    let wrong_chain = VALID_TOML.replace("chain_id = 8453", "chain_id = 1");
+    let wrong_chain = VALID_TOML.replace("chain_id = 4663", "chain_id = 1");
     let config = write_config(&directory, &wrong_chain);
     let output = run(
         &["validate-config", "--config", config.to_str().unwrap()],
@@ -136,7 +139,7 @@ fn verify_catalog_parses_or_rejects_a_manifest_offline() {
     fs::write(
         &bad,
         "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,source\n\
-         8453,not-an-address,0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6,0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002,997,1000,s\n",
+         4663,not-an-address,0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6,0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002,997,1000,s\n",
     )
     .unwrap();
     let output = run(

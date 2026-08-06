@@ -95,12 +95,12 @@ fn observe_catalog_wires_verification_graph_and_evaluation() {
 
     let (_directory, db) = setup();
     let report = shadow::observe_catalog(
-        two_factory_manifest(8453).as_bytes(),
+        two_factory_manifest(4663).as_bytes(),
         &factories,
         &anchors,
         2_000_000,
         &TwoFactoryRpc {
-            chain_id: Ok(8453),
+            chain_id: Ok(4663),
             pools: pools.clone(),
         },
         two_factory_events(),
@@ -143,7 +143,7 @@ fn observe_catalog_fails_closed_on_wrong_chain_and_invalid_manifest() {
         &anchors,
         2_000_000,
         &TwoFactoryRpc {
-            chain_id: Ok(8453),
+            chain_id: Ok(4663),
             pools: pools.clone(),
         },
         vec![],
@@ -160,7 +160,7 @@ fn observe_catalog_fails_closed_on_wrong_chain_and_invalid_manifest() {
     assert!(matches!(invalid_chain, ServiceError::Manifest(_)));
 
     let wrong_chain_rpc = shadow::observe_catalog(
-        two_factory_manifest(8453).as_bytes(),
+        two_factory_manifest(4663).as_bytes(),
         &factories,
         &anchors,
         2_000_000,

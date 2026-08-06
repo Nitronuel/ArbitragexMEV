@@ -38,8 +38,8 @@ fn policy() -> RetryPolicy {
 }
 
 #[test]
-fn validates_base_chain_and_rejects_other_chains() {
-    for (chain, expected_ok) in [("0x2105", true), ("0x1", false)] {
+fn validates_robinhood_chain_and_rejects_other_chains() {
+    for (chain, expected_ok) in [("0x1237", true), ("0x1", false)] {
         let backend = MockHttp {
             responses: RefCell::new(VecDeque::from([Ok(HttpResponse {
                 result: json!(chain),
@@ -52,17 +52,17 @@ fn validates_base_chain_and_rejects_other_chains() {
             RecordingSleeper::default(),
             ProviderBudget::new(1_000, 1_000),
             policy(),
-            8453,
+            4663,
         );
         assert_eq!(reader.validate_chain_id().is_ok(), expected_ok);
     }
 }
 
 #[test]
-fn validates_robinhood_chain_when_expected() {
+fn rejects_disabled_base_chain() {
     let backend = MockHttp {
         responses: RefCell::new(VecDeque::from([Ok(HttpResponse {
-            result: json!("0x1237"),
+            result: json!("0x2105"),
             response_bytes: 10,
         })])),
         requests: Rc::default(),
@@ -74,7 +74,10 @@ fn validates_robinhood_chain_when_expected() {
         policy(),
         4663,
     );
-    reader.validate_chain_id().unwrap();
+    assert!(matches!(
+        reader.validate_chain_id(),
+        Err(TransportError::WrongChain(8453))
+    ));
 }
 
 #[test]
@@ -85,7 +88,7 @@ fn retries_transient_http_errors_with_capped_backoff() {
             Err(TransportError::Transient("two".to_owned())),
             Err(TransportError::Transient("three".to_owned())),
             Ok(HttpResponse {
-                result: json!("0x2105"),
+                result: json!("0x1237"),
                 response_bytes: 10,
             }),
         ])),
@@ -94,7 +97,7 @@ fn retries_transient_http_errors_with_capped_backoff() {
     let sleeper = RecordingSleeper::default();
     let delays = Rc::clone(&sleeper.0);
     let budget = ProviderBudget::new(1_000, 1_000);
-    let reader = ChainReader::new(backend, sleeper, budget.clone(), policy(), 8453);
+    let reader = ChainReader::new(backend, sleeper, budget.clone(), policy(), 4663);
     reader.validate_chain_id().unwrap();
     assert_eq!(
         *delays.borrow(),
@@ -132,7 +135,7 @@ fn chunks_logs_by_ten_blocks_with_explicit_filters() {
         RecordingSleeper::default(),
         ProviderBudget::new(1_000, 1_000),
         policy(),
-        8453,
+        4663,
     );
     let address = Address::repeat_byte(1);
     reader
