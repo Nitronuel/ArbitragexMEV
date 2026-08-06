@@ -2,23 +2,43 @@
 # Resource-capped shadow-mode observation invocation.
 #
 # Usage:
-#   ./scripts/run-canary.sh <config.toml> <snapshot.json> <db.sqlite>
+#   ./scripts/run-canary.sh <config.toml> <snapshot.json> <db.sqlite3>   # offline pass
+#   ./scripts/run-canary.sh --live <config.toml> <manifest.csv> <db.sqlite3> [--poll-ms N --drain-ms N]
 #
 # Applies a memory and file-size ceiling via systemd-run or shell ulimit where
-# available, then runs the offline observation pipeline once. This is the
-# resource harness that a live 24-hour canary (Task 11) will reuse; live
-# provider access is a separately gated stage and is NOT authorized by the
-# Tasks 1-10 shadow implementation, so this script never attempts a live run.
+# available, then runs the observation pipeline. The default is a single offline
+# snapshot pass. `--live` switches to the live manifest-observation mode: it
+# sources the runtime RPC endpoints from a file OUTSIDE the repo, then runs
+# `shadow-bot run --manifest`, which keeps reserves current from a WS `Sync`
+# subscription and exits gracefully on SIGTERM (the 24-hour canary harness).
 set -euo pipefail
 
-if [[ $# -lt 3 ]]; then
-  printf 'usage: %s <config.toml> <snapshot.json> <db.sqlite3>\n' "$0" >&2
+if [[ $# -lt 1 ]]; then
+  printf 'usage: %s [--live] <config.toml> <snapshot.json|manifest.csv> <db.sqlite3> [--poll-ms S] [--drain-ms N]\n' "$0" >&2
   exit 2
 fi
 
+live=0
+poll_ms=250
+drain_ms=250
+args=( "$@" )
+if [[ ${args[0]} == --live ]]; then
+  live=1
+  shift
+fi
+
+# Accept optional poll/drain overrides after the three positional arguments.
 config=$1
-snapshot=$2
+input=$2
 db=$3
+shift 3
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --poll-ms) poll_ms=$2; shift 2 ;;
+    --drain-ms) drain_ms=$2; shift 2 ;;
+    *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
@@ -27,11 +47,32 @@ mem_limit_mb=${RUNTIME_MEMORY_LIMIT_MB:-2457}
 file_limit_mb=${RUNTIME_FILE_LIMIT_MB:-20480}
 
 run_command() {
-  cargo run -q -p shadow-bot -- run \
-    --config "$config" \
-    --snapshot "$snapshot" \
-    --db "$db"
+  if [[ $live -eq 1 ]]; then
+    cargo run -q -p shadow-bot -- run \
+      --config "$config" \
+      --manifest "$input" \
+      --db "$db" \
+      --poll-ms "$poll_ms" \
+      --drain-ms "$drain_ms"
+  else
+    cargo run -q -p shadow-bot -- run \
+      --config "$config" \
+      --snapshot "$input" \
+      --db "$db"
+  fi
 }
+
+# Live mode requires the RPC endpoints, which live outside the repo.
+if [[ $live -eq 1 ]]; then
+  env_file=${SHADOW_RUNTIME_ENV:-$HOME/.config/base-shadow/runtime.env}
+  if [[ -f "$env_file" ]]; then
+    # shellcheck disable=SC1090
+    set -a; source "$env_file"; set +a
+  else
+    printf 'error: live canary requires runtime env file: %s\n' "$env_file" >&2
+    exit 1
+  fi
+fi
 
 case "$(uname -s)" in
   Linux)
