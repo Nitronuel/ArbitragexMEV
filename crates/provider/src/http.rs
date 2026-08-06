@@ -74,7 +74,7 @@ pub enum TransportError {
     Transient(String),
     #[error("permanent transport error: {0}")]
     Permanent(String),
-    #[error("expected Base chain ID 8453, got {0}")]
+    #[error("unexpected chain ID {0}")]
     WrongChain(u64),
     #[error("invalid JSON-RPC response")]
     InvalidResponse,
@@ -89,16 +89,24 @@ pub struct ChainReader<B, S> {
     sleeper: S,
     budget: ProviderBudget,
     retry: RetryPolicy,
+    expected_chain_id: u64,
 }
 
 impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
     #[must_use]
-    pub fn new(backend: B, sleeper: S, budget: ProviderBudget, retry: RetryPolicy) -> Self {
+    pub fn new(
+        backend: B,
+        sleeper: S,
+        budget: ProviderBudget,
+        retry: RetryPolicy,
+        expected_chain_id: u64,
+    ) -> Self {
         Self {
             backend,
             sleeper,
             budget,
             retry,
+            expected_chain_id,
         }
     }
 
@@ -110,7 +118,7 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
     /// failures.
     pub fn validate_chain_id(&self) -> Result<(), TransportError> {
         let chain_id = self.chain_id()?;
-        if chain_id != 8453 {
+        if chain_id != self.expected_chain_id {
             return Err(TransportError::WrongChain(chain_id));
         }
         Ok(())

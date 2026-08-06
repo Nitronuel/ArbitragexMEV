@@ -1,3 +1,5 @@
+# Base shadow observer profile. RHC equivalent in shadow-rhc.example.toml.
+# chain_id: 8453 = Base, 4663 = Robinhood Chain (mainnet).
 chain_id = 8453
 max_hops = 4
 pool_cap = 2000

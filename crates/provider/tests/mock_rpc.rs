@@ -52,9 +52,29 @@ fn validates_base_chain_and_rejects_other_chains() {
             RecordingSleeper::default(),
             ProviderBudget::new(1_000, 1_000),
             policy(),
+            8453,
         );
         assert_eq!(reader.validate_chain_id().is_ok(), expected_ok);
     }
+}
+
+#[test]
+fn validates_robinhood_chain_when_expected() {
+    let backend = MockHttp {
+        responses: RefCell::new(VecDeque::from([Ok(HttpResponse {
+            result: json!("0x1237"),
+            response_bytes: 10,
+        })])),
+        requests: Rc::default(),
+    };
+    let reader = ChainReader::new(
+        backend,
+        RecordingSleeper::default(),
+        ProviderBudget::new(1_000, 1_000),
+        policy(),
+        4663,
+    );
+    reader.validate_chain_id().unwrap();
 }
 
 #[test]
@@ -74,7 +94,7 @@ fn retries_transient_http_errors_with_capped_backoff() {
     let sleeper = RecordingSleeper::default();
     let delays = Rc::clone(&sleeper.0);
     let budget = ProviderBudget::new(1_000, 1_000);
-    let reader = ChainReader::new(backend, sleeper, budget.clone(), policy());
+    let reader = ChainReader::new(backend, sleeper, budget.clone(), policy(), 8453);
     reader.validate_chain_id().unwrap();
     assert_eq!(
         *delays.borrow(),
@@ -112,6 +132,7 @@ fn chunks_logs_by_ten_blocks_with_explicit_filters() {
         RecordingSleeper::default(),
         ProviderBudget::new(1_000, 1_000),
         policy(),
+        8453,
     );
     let address = Address::repeat_byte(1);
     reader

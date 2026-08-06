@@ -174,9 +174,12 @@ fn main() {
 
 fn validate_config(path: &std::path::Path) -> Result<(), String> {
     let config = ShadowConfig::load(path).map_err(|error| error.to_string())?;
+    let chain = config
+        .chain
+        .map_or_else(|| "unknown".to_owned(), |chain| chain.name().to_owned());
     println!(
-        "configuration valid: chain_id={} max_hops={} pool_cap={}",
-        config.chain_id, config.max_hops, config.pool_cap
+        "configuration valid: chain={} chain_id={} max_hops={} pool_cap={}",
+        chain, config.chain_id, config.max_hops, config.pool_cap
     );
     Ok(())
 }
@@ -215,10 +218,13 @@ fn run_smoke_command(
     timeout_secs: u64,
 ) -> Result<(), String> {
     let config = ShadowConfig::load(config_path).map_err(|error| error.to_string())?;
-    let http =
-        std::env::var("BASE_HTTP_RPC_URL").map_err(|_| "missing BASE_HTTP_RPC_URL".to_owned())?;
+    let chain = config
+        .chain
+        .ok_or_else(|| "configuration did not resolve a supported chain".to_owned())?;
+    let http = std::env::var(chain.http_env_var())
+        .map_err(|_| format!("missing {}", chain.http_env_var()))?;
     let websocket =
-        std::env::var("BASE_WS_RPC_URL").map_err(|_| "missing BASE_WS_RPC_URL".to_owned())?;
+        std::env::var(chain.ws_env_var()).map_err(|_| format!("missing {}", chain.ws_env_var()))?;
     let http_url: RedactedUrl = http
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
@@ -237,6 +243,7 @@ fn run_smoke_command(
         ThreadSleeper,
         budget.clone(),
         retry,
+        config.chain_id,
     );
     let pinned = match block {
         Some(block) => block,
@@ -364,10 +371,13 @@ fn run_live_command(
     economics: Economics,
     reference: CostSnapshot,
 ) -> Result<(), String> {
-    let http =
-        std::env::var("BASE_HTTP_RPC_URL").map_err(|_| "missing BASE_HTTP_RPC_URL".to_owned())?;
+    let chain = config
+        .chain
+        .ok_or_else(|| "configuration did not resolve a supported chain".to_owned())?;
+    let http = std::env::var(chain.http_env_var())
+        .map_err(|_| format!("missing {}", chain.http_env_var()))?;
     let websocket =
-        std::env::var("BASE_WS_RPC_URL").map_err(|_| "missing BASE_WS_RPC_URL".to_owned())?;
+        std::env::var(chain.ws_env_var()).map_err(|_| format!("missing {}", chain.ws_env_var()))?;
     let http_url: RedactedUrl = http
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
@@ -386,6 +396,7 @@ fn run_live_command(
         ThreadSleeper,
         budget.clone(),
         retry,
+        config.chain_id,
     );
     let pinned = if let Some(block) = block {
         block

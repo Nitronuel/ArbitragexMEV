@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, U256};
-use domain::{BASE_CHAIN_ID, Fee, Pool, PoolId, PoolState, StateVersion};
+use domain::{Fee, Pool, PoolId, PoolState, StateVersion};
 use thiserror::Error;
 
 use crate::CandidatePool;
@@ -63,7 +63,7 @@ pub trait CatalogRpc {
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
-    #[error("expected Base chain ID {BASE_CHAIN_ID}, got {0}")]
+    #[error("unexpected chain ID {0} for this catalog")]
     WrongChain(u64),
     #[error("pinned block {0} is unavailable")]
     PinnedBlockUnavailable(u64),
@@ -73,13 +73,14 @@ pub enum CatalogError {
 
 /// Verifies candidate contracts and metadata at one pinned block.
 ///
-/// Candidate-local failures are quarantined. A wrong chain ID or any indication
-/// that the pinned block is unavailable aborts the complete bootstrap.
+/// The expected chain is derived from the candidates' own `chain_id`; the live
+/// RPC must report the same chain or the bootstrap aborts. Candidate-local
+/// failures are quarantined.
 ///
 /// # Errors
 ///
-/// Returns a fatal error when the RPC reports a non-Base chain or cannot serve
-/// the pinned block.
+/// Returns a fatal error when the RPC reports a chain other than the catalog's
+/// chain or cannot serve the pinned block.
 pub fn verify_catalog<R: CatalogRpc>(
     candidates: Vec<CandidatePool>,
     factories: &[FactorySpec],
@@ -89,14 +90,17 @@ pub fn verify_catalog<R: CatalogRpc>(
     if candidates.len() > 2_000 {
         return Err(CatalogError::PoolCapExceeded);
     }
-    let chain_id = fatal(rpc.chain_id(block), block)?;
-    if chain_id != BASE_CHAIN_ID {
-        return Err(CatalogError::WrongChain(chain_id));
+    let Some(expected) = candidates.first().map(|candidate| candidate.chain_id) else {
+        return Ok(CatalogResult::default());
+    };
+    let actual = fatal(rpc.chain_id(block), block)?;
+    if actual != expected {
+        return Err(CatalogError::WrongChain(actual));
     }
 
     let mut result = CatalogResult::default();
     for candidate in candidates {
-        if candidate.chain_id != BASE_CHAIN_ID {
+        if candidate.chain_id != expected {
             result.quarantined.push(QuarantinedPool {
                 candidate,
                 reason: "candidate chain ID mismatch".to_owned(),
@@ -451,13 +455,13 @@ mod tests {
             ..candidate.clone()
         };
         let result = verify_catalog(
-            vec![wrong_chain],
+            vec![candidate.clone(), wrong_chain],
             &factories(&candidate),
             BLOCK,
             &rpc(&candidate),
         )
         .unwrap();
-        assert!(result.verified.is_empty());
+        assert_eq!(result.verified.len(), 1);
         assert_eq!(result.quarantined.len(), 1);
     }
 }

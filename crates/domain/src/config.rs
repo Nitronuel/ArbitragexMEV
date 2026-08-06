@@ -4,21 +4,35 @@ use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
-use crate::BASE_CHAIN_ID;
+use crate::Chain;
+
+/// The role of an RPC URL, which selects the accepted URL scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlRole {
+    Http,
+    WebSocket,
+}
 
 #[derive(Clone)]
 pub struct RpcUrl(Url);
 
 impl RpcUrl {
-    fn parse(variable: &'static str, value: Option<&str>) -> Result<Self, ConfigError> {
+    fn parse(
+        variable: &'static str,
+        role: UrlRole,
+        value: Option<&str>,
+    ) -> Result<Self, ConfigError> {
         let value = value.ok_or(ConfigError::MissingEnvironment(variable))?;
         let url =
             Url::parse(value).map_err(|source| ConfigError::InvalidUrl { variable, source })?;
-        match (variable, url.scheme()) {
-            ("BASE_HTTP_RPC_URL", "http" | "https") | ("BASE_WS_RPC_URL", "ws" | "wss") => {
-                Ok(Self(url))
-            }
-            _ => Err(ConfigError::InvalidUrlScheme(variable)),
+        let scheme_ok = match role {
+            UrlRole::Http => matches!(url.scheme(), "http" | "https"),
+            UrlRole::WebSocket => matches!(url.scheme(), "ws" | "wss"),
+        };
+        if scheme_ok {
+            Ok(Self(url))
+        } else {
+            Err(ConfigError::InvalidUrlScheme(variable))
         }
     }
 
@@ -54,6 +68,8 @@ pub struct ShadowConfig {
     pub database_limit_bytes: u64,
     /// Path to the offline catalog (pools CSV) used by offline commands.
     pub manifest_path: Option<PathBuf>,
+    #[serde(skip, default)]
+    pub chain: Option<Chain>,
     #[serde(skip)]
     pub http_rpc_url: Option<RpcUrl>,
     #[serde(skip)]
@@ -69,9 +85,23 @@ impl ShadowConfig {
     /// environment variables are absent or invalid, or validation fails.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let input = fs::read_to_string(path).map_err(ConfigError::Read)?;
-        let http = env::var("BASE_HTTP_RPC_URL").ok();
-        let websocket = env::var("BASE_WS_RPC_URL").ok();
-        Self::from_toml_and_urls(&input, http.as_deref(), websocket.as_deref())
+        let config = toml::from_str::<Self>(&input).map_err(ConfigError::Parse)?;
+        let chain = config.resolve_chain()?;
+        let http = env::var(chain.http_env_var()).ok();
+        let websocket = env::var(chain.ws_env_var()).ok();
+        let mut config = config;
+        config.chain = Some(chain);
+        config.http_rpc_url = Some(RpcUrl::parse(
+            chain.http_env_var(),
+            UrlRole::Http,
+            http.as_deref(),
+        )?);
+        config.websocket_rpc_url = Some(RpcUrl::parse(
+            chain.ws_env_var(),
+            UrlRole::WebSocket,
+            websocket.as_deref(),
+        )?);
+        Ok(config)
     }
 
     /// Reads only the offline catalog path from a TOML file. Does not require
@@ -87,21 +117,33 @@ impl ShadowConfig {
             .map_err(ConfigError::Parse)
     }
 
+    #[cfg(test)]
     fn from_toml_and_urls(
         input: &str,
         http: Option<&str>,
         websocket: Option<&str>,
     ) -> Result<Self, ConfigError> {
         let mut config: Self = toml::from_str(input).map_err(ConfigError::Parse)?;
-        if config.chain_id != BASE_CHAIN_ID {
-            return Err(ConfigError::InvalidChainId(config.chain_id));
-        }
-        if !(2..=4).contains(&config.max_hops) {
-            return Err(ConfigError::InvalidMaxHops(config.max_hops));
-        }
-        config.http_rpc_url = Some(RpcUrl::parse("BASE_HTTP_RPC_URL", http)?);
-        config.websocket_rpc_url = Some(RpcUrl::parse("BASE_WS_RPC_URL", websocket)?);
+        let chain = config.resolve_chain()?;
+        config.chain = Some(chain);
+        config.http_rpc_url = Some(RpcUrl::parse(chain.http_env_var(), UrlRole::Http, http)?);
+        config.websocket_rpc_url = Some(RpcUrl::parse(
+            chain.ws_env_var(),
+            UrlRole::WebSocket,
+            websocket,
+        )?);
         Ok(config)
+    }
+
+    fn resolve_chain(&self) -> Result<Chain, ConfigError> {
+        Chain::from_id(self.chain_id)
+            .ok_or(ConfigError::InvalidChainId(self.chain_id))
+            .and_then(|chain| {
+                if !(2..=4).contains(&self.max_hops) {
+                    return Err(ConfigError::InvalidMaxHops(self.max_hops));
+                }
+                Ok(chain)
+            })
     }
 }
 
@@ -123,7 +165,7 @@ pub enum ConfigError {
     Parse(#[source] toml::de::Error),
     #[error("missing required environment variable {0}")]
     MissingEnvironment(&'static str),
-    #[error("chain ID must be {BASE_CHAIN_ID}, got {0}")]
+    #[error("chain ID {0} is unsupported; supported: 8453 (base), 4663 (robinhood)")]
     InvalidChainId(u64),
     #[error("max_hops must be in 2..=4, got {0}")]
     InvalidMaxHops(u8),
@@ -183,6 +225,25 @@ database_limit_bytes = 10000000000
         )
         .unwrap_err();
         assert!(matches!(error, ConfigError::InvalidChainId(1)));
+    }
+
+    #[test]
+    fn accepts_robinhood_chain_id_with_chain_env_names() {
+        let input = VALID_TOML.replace("chain_id = 8453", "chain_id = 4663");
+        let config = ShadowConfig::from_toml_and_urls(
+            &input,
+            Some("https://robinhood.example/v2/http-secret"),
+            Some("wss://robinhood.example/v2/ws-secret"),
+        )
+        .unwrap();
+        assert_eq!(config.chain, Some(crate::Chain::Robinhood));
+        assert_eq!(config.chain_id, crate::ROBINHOOD_CHAIN_ID);
+
+        let error = ShadowConfig::from_toml_and_urls(&input, None, None).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::MissingEnvironment("ROBINHOOD_HTTP_RPC_URL")
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::Read;
 
 use alloy_primitives::Address;
-use domain::{BASE_CHAIN_ID, Fee};
+use domain::{Chain, Fee};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -73,7 +73,7 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
             return Err(ManifestError::PoolCapExceeded);
         }
         let row: ManifestRow = record?;
-        if row.chain_id != BASE_CHAIN_ID {
+        if Chain::from_id(row.chain_id).is_none() {
             return Err(ManifestError::InvalidChainId {
                 row: row_number,
                 chain_id: row.chain_id,
@@ -227,5 +227,19 @@ mod tests {
 
         let invalid_fee = format!("{HEADER}{}", valid.replace(",997,1000,", ",1001,1000,"));
         assert!(parse_manifest(invalid_fee.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn accepts_robinhood_chain_rows() {
+        let input = format!(
+            "{HEADER}4663,0x0000000000000000000000000000000000000010,\
+             0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f,\
+             0x0000000000000000000000000000000000000001,\
+             0x0000000000000000000000000000000000000002,997,1000,rhc\n"
+        );
+        let pools = parse_manifest(input.as_bytes()).unwrap();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].chain_id, domain::ROBINHOOD_CHAIN_ID);
+        assert_eq!(pools[0].chain_id, 4663);
     }
 }
