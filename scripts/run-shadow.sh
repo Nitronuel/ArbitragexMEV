@@ -6,10 +6,12 @@
 #   ./scripts/run-shadow.sh <shadow-bot args...>      e.g. validate-config --config config/shadow.toml
 #
 # The runtime env file defaults to $HOME/.config/base-shadow/runtime.env and can
-# be overridden with SHADOW_RUNTIME_ENV. It must export the endpoints for the
+# be overridden with SHADOW_RUNTIME_ENV. It must export the HTTP endpoint for the
 # configured chain, e.g. for the current Robinhood Chain profile:
-#   ROBINHOOD_HTTP_RPC_URL='https://...'   (Alchemy/Public HTTPS endpoint)
-#   ROBINHOOD_WS_RPC_URL='wss://...'       (Alchemy/Public WebSocket endpoint)
+#   ROBINHOOD_HTTP_RPC_URL='https://rpc.mainnet.chain.robinhood.com'  (Public HTTPS)
+# Live transport is the HTTP `eth_getLogs` poller (RHC rejects filtered WS
+# `logs` subscriptions), so `ROBINHOOD_WS_RPC_URL` is not consumed by live
+# commands; the config loader still expects it present (set it if you use it).
 # Offline commands still work when the file is absent; live commands warn loudly.
 set -euo pipefail
 

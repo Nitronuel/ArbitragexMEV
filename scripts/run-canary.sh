@@ -9,8 +9,11 @@
 # available, then runs the observation pipeline. The default is a single offline
 # snapshot pass. `--live` switches to the live manifest-observation mode: it
 # sources the runtime RPC endpoints from a file OUTSIDE the repo, then runs
-# `shadow-bot run --manifest`, which keeps reserves current from a WS `Sync`
-# subscription and exits gracefully on SIGTERM (the 24-hour canary harness).
+# `shadow-bot run --manifest`, which keeps reserves current from the HTTP
+# `eth_getLogs` poller (RHC rejects filtered WS `logs` subscriptions) and exits
+# gracefully on SIGTERM (the 24-hour canary harness). `--poll-ms` is the poll
+# cadence: it is the canary's CU/request budget control, default 2000 (≈3M local
+# request-CU/day vs. the 24M ceiling); lower = more responsive, higher budget burn.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -19,7 +22,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 live=0
-poll_ms=250
+poll_ms=2000
 drain_ms=250
 args=( "$@" )
 if [[ ${args[0]} == --live ]]; then
