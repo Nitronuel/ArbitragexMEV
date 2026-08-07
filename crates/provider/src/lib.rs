@@ -9,7 +9,7 @@ pub use http::{
     ChainReader, HttpBackend, HttpResponse, LogFilter, RetryPolicy, RpcRequest, Sleeper,
     ThreadSleeper, TransportError,
 };
-pub use live::{LiveHttp, LiveRpc, LiveWsClient, WsFrame, WsProbe};
+pub use live::{LiveHttp, LiveHttpProbe, LiveRpc, LiveWsClient, WsFrame, WsProbe};
 pub use redacted_url::{RedactedUrl, RedactedUrlError};
 pub use ws::{
     DisconnectKind, LogStream, RawLogEnvelope, StreamError, StreamItem, SubscriptionFilter,

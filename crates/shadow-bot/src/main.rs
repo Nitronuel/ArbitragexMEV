@@ -12,8 +12,8 @@ use catalog::{CycleLimits, parse_manifest};
 use clap::{Parser, Subcommand};
 use domain::ShadowConfig;
 use provider::{
-    ChainReader, LiveHttp, LiveRpc, LiveWsClient, LogStream, ProviderBudget, RedactedUrl,
-    RetryPolicy, SubscriptionFilter, ThreadSleeper, sync_topic,
+    ChainReader, LiveHttp, LiveHttpProbe, LiveRpc, LogStream, ProviderBudget, RedactedUrl,
+    RetryPolicy, SubscriptionFilter, ThreadSleeper,
 };
 use shadow::{
     CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceReport, ServiceSnapshot, daily_report,
@@ -223,12 +223,7 @@ fn run_smoke_command(
         .ok_or_else(|| "configuration did not resolve a supported chain".to_owned())?;
     let http = std::env::var(chain.http_env_var())
         .map_err(|_| format!("missing {}", chain.http_env_var()))?;
-    let websocket =
-        std::env::var(chain.ws_env_var()).map_err(|_| format!("missing {}", chain.ws_env_var()))?;
     let http_url: RedactedUrl = http
-        .parse::<RedactedUrl>()
-        .map_err(|error| error.to_string())?;
-    let websocket_url: RedactedUrl = websocket
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
 
@@ -239,7 +234,7 @@ fn run_smoke_command(
         max_delay: Duration::from_secs(2),
     };
     let reader = ChainReader::new(
-        LiveHttp::new(http_url),
+        LiveHttp::new(http_url.clone()),
         ThreadSleeper,
         budget.clone(),
         retry,
@@ -251,8 +246,21 @@ fn run_smoke_command(
     };
     let rpc = LiveRpc::new(reader);
     let log_stream = LogStream::new(budget.clone());
-    let mut build_probe =
-        |filter: SubscriptionFilter| LiveWsClient::connect(websocket_url.clone(), filter);
+    let probe_cadence = Duration::from_millis(200);
+    let mut build_probe = |filter: SubscriptionFilter| {
+        Ok(LiveHttpProbe::new(
+            ChainReader::new(
+                LiveHttp::new(http_url.clone()),
+                ThreadSleeper,
+                budget.clone(),
+                retry,
+                config.chain_id,
+            ),
+            filter.addresses,
+            pinned,
+            probe_cadence,
+        ))
+    };
 
     let limit_usize: usize =
         usize::try_from(limit).map_err(|_| "limit exceeds platform usize".to_owned())?;
@@ -376,12 +384,7 @@ fn run_live_command(
         .ok_or_else(|| "configuration did not resolve a supported chain".to_owned())?;
     let http = std::env::var(chain.http_env_var())
         .map_err(|_| format!("missing {}", chain.http_env_var()))?;
-    let websocket =
-        std::env::var(chain.ws_env_var()).map_err(|_| format!("missing {}", chain.ws_env_var()))?;
     let http_url: RedactedUrl = http
-        .parse::<RedactedUrl>()
-        .map_err(|error| error.to_string())?;
-    let websocket_url: RedactedUrl = websocket
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
 
@@ -392,7 +395,7 @@ fn run_live_command(
         max_delay: Duration::from_secs(2),
     };
     let reader = ChainReader::new(
-        LiveHttp::new(http_url),
+        LiveHttp::new(http_url.clone()),
         ThreadSleeper,
         budget.clone(),
         retry,
@@ -413,14 +416,20 @@ fn run_live_command(
 
     let max_items_usize: usize =
         usize::try_from(max_items).map_err(|_| "max-items exceeds platform usize".to_owned())?;
+    let probe_cadence = Duration::from_millis(poll_ms);
     let mut build_probe = |addresses: &[Address]| {
-        LiveWsClient::connect(
-            websocket_url.clone(),
-            SubscriptionFilter {
-                addresses: addresses.to_vec(),
-                topic0: sync_topic(),
-            },
-        )
+        Ok(LiveHttpProbe::new(
+            ChainReader::new(
+                LiveHttp::new(http_url.clone()),
+                ThreadSleeper,
+                budget.clone(),
+                retry,
+                config.chain_id,
+            ),
+            addresses.to_vec(),
+            pinned,
+            probe_cadence,
+        ))
     };
     let stop = StopOnSignal::install();
     let report = run_live(

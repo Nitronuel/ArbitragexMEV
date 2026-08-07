@@ -73,6 +73,8 @@ pub enum StreamError {
     EmptyAddressFilter,
     #[error("invalid WebSocket log message")]
     InvalidMessage,
+    #[error("provider transport error: {0}")]
+    Transport(String),
 }
 
 pub struct LogStream {
@@ -125,6 +127,38 @@ impl LogStream {
     }
 }
 
+impl RawLogEnvelope {
+    /// Decodes one raw `eth_getLogs` result object into an envelope.
+    ///
+    /// Used by the HTTP-backed poller where the provider refuses the
+    /// `address`/`topics` options of an `eth_subscribe` `logs` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamError::InvalidMessage`] when a required field is absent
+    /// or malformed.
+    pub fn from_rpc_value(value: &Value) -> Result<Self, StreamError> {
+        Ok(Self {
+            address: parse(value, "address")?,
+            topics: serde_json::from_value(
+                value
+                    .get("topics")
+                    .cloned()
+                    .ok_or(StreamError::InvalidMessage)?,
+            )
+            .map_err(|_| StreamError::InvalidMessage)?,
+            data: parse(value, "data")?,
+            block_number: quantity(value, "blockNumber")?,
+            transaction_index: quantity(value, "transactionIndex")?,
+            log_index: quantity(value, "logIndex")?,
+            removed: value
+                .get("removed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned>(value: &Value, field: &str) -> Result<T, StreamError> {
     serde_json::from_value(
         value
@@ -142,4 +176,36 @@ fn quantity(value: &Value, field: &str) -> Result<u64, StreamError> {
         .ok_or(StreamError::InvalidMessage)?;
     u64::from_str_radix(encoded.trim_start_matches("0x"), 16)
         .map_err(|_| StreamError::InvalidMessage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_rpc_value_decodes_raw_getlogs_object() {
+        let value = serde_json::json!({
+            "address": "0x0000000000000000000000000000000000000010",
+            "topics": [format!("{}", sync_topic())],
+            "data": "0x000000000000000000000000000000000000000000000000000000000000002a000000000000000000000000000000000000000000000000000000000000003c",
+            "blockNumber": "0x2a",
+            "transactionIndex": "0x1",
+            "logIndex": "0x2",
+            "removed": false,
+        });
+        let envelope = RawLogEnvelope::from_rpc_value(&value).unwrap();
+        assert_eq!(envelope.address, Address::with_last_byte(0x10));
+        assert_eq!(envelope.block_number, 0x2a);
+        assert_eq!(envelope.transaction_index, 1);
+        assert_eq!(envelope.log_index, 2);
+        assert_eq!(envelope.topics.len(), 1);
+        assert_eq!(envelope.data.len(), 64);
+        assert!(!envelope.removed);
+    }
+
+    #[test]
+    fn from_rpc_value_rejects_missing_fields() {
+        let value = serde_json::json!({ "address": "0x0000000000000000000000000000000000000010" });
+        assert!(RawLogEnvelope::from_rpc_value(&value).is_err());
+    }
 }
