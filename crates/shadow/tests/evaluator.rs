@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use alloy_primitives::{Address, B256, U256};
 use catalog::{CompiledGraph, CycleLimits, VerifiedPool, compile_cycles};
-use domain::{CycleId, Fee, Pool, PoolId, PoolState, StateVersion};
+use domain::{CycleId, Fee, Pool, PoolId, PoolState, Profile, StateVersion};
 use shadow::{ClassificationReason, CostSnapshot, DirtyEvaluator, Economics, FIXED_POINT_SCALE};
 use state::{CanonicalPosition, StateMachine, SyncLog};
 use storage::Storage;
@@ -37,6 +37,7 @@ fn pool(
             token0: token(token0),
             token1: token(token1),
             fee: FEE,
+            profile: Profile::ConstantProduct,
         },
         token0_decimals: 18,
         token1_decimals: 18,

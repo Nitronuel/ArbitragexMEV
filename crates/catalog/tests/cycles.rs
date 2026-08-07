@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use alloy_primitives::{Address, U256};
 use catalog::{CycleError, CycleLimits, VerifiedPool, compile_cycles};
-use domain::{Fee, Pool, PoolId, PoolState, StateVersion};
+use domain::{Fee, Pool, PoolId, PoolState, Profile, StateVersion};
 
 const LIMITS: CycleLimits = CycleLimits {
     max_cycles: 1_000,
@@ -25,6 +25,7 @@ fn pool(id: u32, address: u8, token0: u8, token1: u8) -> VerifiedPool {
             token0: token(token0),
             token1: token(token1),
             fee: FEE,
+            profile: Profile::ConstantProduct,
         },
         token0_decimals: 18,
         token1_decimals: 18,

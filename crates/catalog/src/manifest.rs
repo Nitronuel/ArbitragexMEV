@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::Read;
 
 use alloy_primitives::Address;
-use domain::{Chain, Fee};
+use domain::{Chain, Fee, Profile};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -16,6 +16,7 @@ pub struct CandidatePool {
     pub token0: Address,
     pub token1: Address,
     pub fee: Fee,
+    pub profile: Profile,
     pub source: String,
 }
 
@@ -41,6 +42,8 @@ pub enum ManifestError {
     },
     #[error("row {row} is missing source metadata")]
     MissingSource { row: usize },
+    #[error("row {row} has unsupported profile {profile:?}")]
+    UnsupportedProfile { row: usize, profile: String },
     #[error("row {row} duplicates pool address {address}")]
     DuplicatePool { row: usize, address: Address },
 }
@@ -55,6 +58,8 @@ struct ManifestRow {
     token1: String,
     fee_numerator: u32,
     fee_denominator: u32,
+    #[serde(default)]
+    profile: Option<String>,
     source: String,
 }
 
@@ -100,6 +105,17 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
         if source.is_empty() {
             return Err(ManifestError::MissingSource { row: row_number });
         }
+        let profile = match row.profile.as_deref() {
+            None | Some("v2" | "constant_product" | "ConstantProduct") => Profile::ConstantProduct,
+            Some("v3" | "concentrated" | "Concentrated") => Profile::Concentrated,
+            Some("v4" | "volatile_managed" | "VolatileManaged") => Profile::VolatileManaged,
+            Some(other) => {
+                return Err(ManifestError::UnsupportedProfile {
+                    row: row_number,
+                    profile: other.to_owned(),
+                });
+            }
+        };
         if !addresses.insert(address) {
             return Err(ManifestError::DuplicatePool {
                 row: row_number,
@@ -116,6 +132,7 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
                 numerator: row.fee_numerator,
                 denominator: row.fee_denominator,
             },
+            profile,
             source,
         });
     }
@@ -134,6 +151,8 @@ fn parse_address(value: &str, row: usize, field: &'static str) -> Result<Address
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    use std::fmt::Write;
 
     use super::parse_manifest;
 
@@ -197,6 +216,49 @@ mod tests {
             )
         );
         assert!(parse_manifest(missing.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn defaults_absent_profile_to_constant_product() {
+        let input = include_bytes!("../../../tests/fixtures/catalog/valid.csv");
+        let pools = parse_manifest(Cursor::new(input)).unwrap();
+        for pool in &pools {
+            assert_eq!(pool.profile, domain::Profile::ConstantProduct);
+        }
+    }
+
+    #[test]
+    fn parses_explicit_profiles() {
+        let mut input = String::from(
+            "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,source\n",
+        );
+        for (profile, pool) in [
+            ("v2", "0x0000000000000000000000000000000000000010"),
+            ("concentrated", "0x0000000000000000000000000000000000000011"),
+            ("v4", "0x0000000000000000000000000000000000000012"),
+        ] {
+            writeln!(
+                input,
+                "4663,{pool},0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f,0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002,997,1000,{profile},src"
+            )
+            .unwrap();
+        }
+        let pools = parse_manifest(input.as_bytes()).unwrap();
+        assert_eq!(pools.len(), 3);
+        assert_eq!(pools[0].profile, domain::Profile::ConstantProduct);
+        assert_eq!(pools[1].profile, domain::Profile::Concentrated);
+        assert_eq!(pools[2].profile, domain::Profile::VolatileManaged);
+    }
+
+    #[test]
+    fn rejects_unknown_profile() {
+        let input = format!(
+            "{HEADER}4663,0x0000000000000000000000000000000000000010,\
+             0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f,\
+             0x0000000000000000000000000000000000000001,\
+             0x0000000000000000000000000000000000000002,997,1000,v5,src\n"
+        );
+        assert!(parse_manifest(input.as_bytes()).is_err());
     }
 
     #[test]

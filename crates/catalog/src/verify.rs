@@ -187,6 +187,7 @@ fn verify_candidate<R: CatalogRpc>(
             token0: candidate.token0,
             token1: candidate.token1,
             fee: candidate.fee,
+            profile: candidate.profile,
         },
         token0_decimals,
         token1_decimals,
@@ -216,7 +217,7 @@ fn local<T>(result: Result<T, RpcError>) -> Result<T, VerifyFailure> {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, U256};
-    use domain::Fee;
+    use domain::{Fee, Profile};
 
     use super::{CatalogError, CatalogRpc, FactorySpec, RpcError, verify_catalog};
     use crate::CandidatePool;
@@ -280,6 +281,7 @@ mod tests {
             token0: Address::repeat_byte(1),
             token1: Address::repeat_byte(2),
             fee: FEE,
+            profile: Profile::ConstantProduct,
             source: "protocol deployment".to_owned(),
         }
     }

@@ -2,7 +2,7 @@ use std::{collections::HashSet, io::Read, path::Path};
 
 use alloy_primitives::{Address, U256};
 use catalog::{CatalogRpc, CycleLimits, FactorySpec, VerifiedPool, compile_cycles, verify_catalog};
-use domain::{Cycle, CycleHop, Fee, Pool, PoolId, PoolState, StateVersion};
+use domain::{Cycle, CycleHop, Fee, Pool, PoolId, PoolState, Profile, StateVersion};
 use provider::ProviderBudget;
 use serde::Deserialize;
 use state::{StateMachine, SyncLog};
@@ -36,6 +36,8 @@ pub struct SnapshotPool {
     pub reserve0: U256,
     pub reserve1: U256,
     pub source: String,
+    #[serde(default)]
+    pub profile: Profile,
 }
 
 /// Aggregate outcome of one wired observation pass.
@@ -172,6 +174,7 @@ pub fn observe_snapshot(
                     numerator: pool.fee_numerator,
                     denominator: pool.fee_denominator,
                 },
+                profile: pool.profile,
             },
             token0_decimals: pool.token0_decimals,
             token1_decimals: pool.token1_decimals,
