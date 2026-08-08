@@ -342,6 +342,19 @@ pub struct GapObservation {
     pub round_trip_toll: f64,
 }
 
+/// A ranked cross-venue pair carrying the tokens that define the round trip
+/// (`lo` sorts before `hi`), its observed skew, and the combined toll of the
+/// two legs it crosses. Selection for the Task B manifest sorts by profit
+/// margin (`skew - toll`), not raw skew.
+#[derive(Debug, Clone, Copy)]
+pub struct PairRank {
+    pub token_lo: Address,
+    pub token_hi: Address,
+    pub log2_skew: f64,
+    pub toll: f64,
+    pub margin: f64,
+}
+
 /// A distribution summary of gap-vs-toll observations across cross pairs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GapSummary {
@@ -371,18 +384,20 @@ pub fn pool_key(entry: &PoolEntry) -> [u8; 32] {
 }
 
 /// Combines the latest per-pool prices on both venues with the catalog pair
-/// overlap and computes gap-vs-toll per cross-venue pair. A pair is priced by
-/// averaging the `sqrtPriceX96`-derived prices across all its pools on each
-/// venue; the toll is the sum of the minimum `leg_toll` per venue for that
-/// pair.
+/// overlap and ranks every cross-venue pair by observed skew-vs-toll margin.
+/// A pair is priced by averaging the `sqrtPriceX96`-derived prices across all
+/// its pools on each venue (orientated into the canonical pair direction); the
+/// toll is the sum of the minimum `leg_toll` per venue for that pair. Pairs
+/// with a price on only one venue, or with only dynamic/zero-fee v4 pools, are
+/// omitted.
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::type_complexity)]
-pub fn gap_distribution(
+pub fn gap_rankings(
     a: &[PoolEntry],
     b: &[PoolEntry],
     prices_a: &HashMap<[u8; 32], PoolPrice>,
     prices_b: &HashMap<[u8; 32], PoolPrice>,
-) -> GapSummary {
+) -> Vec<PairRank> {
     // pair -> (sum_price_a, count_a, min_toll_a, sum_price_b, count_b,
     //          min_toll_b)
     let mut per_pair: HashMap<([u8; 20], [u8; 20]), (f64, u64, f64, f64, u64, f64)> =
@@ -423,8 +438,8 @@ pub fn gap_distribution(
     accumulate(a, prices_a, 0);
     accumulate(b, prices_b, 1);
 
-    let mut observations = Vec::new();
-    for (_, (pa, ca, ta, pb, cb, tb)) in per_pair {
+    let mut ranks = Vec::new();
+    for (k, (pa, ca, ta, pb, cb, tb)) in per_pair {
         // `f64::MAX` marks an unobservable toll (only dynamic/zero-fee v4
         // pools on that venue for the pair).
         if ca == 0 || cb == 0 || !ta.is_finite() || !tb.is_finite() {
@@ -433,12 +448,42 @@ pub fn gap_distribution(
         let avg_a = pa / ca as f64;
         let avg_b = pb / cb as f64;
         let skew = (avg_b / avg_a.max(1e-30)).max(1e-30).log2().abs();
-        observations.push(GapObservation {
+        let toll = ta + tb;
+        ranks.push(PairRank {
+            token_lo: Address::from_slice(&k.0),
+            token_hi: Address::from_slice(&k.1),
             log2_skew: skew,
-            round_trip_toll: ta + tb,
+            toll,
+            margin: skew - toll,
         });
     }
+    ranks.sort_by(|x, y| {
+        y.margin
+            .partial_cmp(&x.margin)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranks
+}
 
+/// Combines the latest per-pool prices and computes gap-vs-toll aggregate
+/// statistics over the cross-venue pairs (see [`gap_rankings`] for the
+/// per-pair ranking it summarizes).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn gap_distribution(
+    a: &[PoolEntry],
+    b: &[PoolEntry],
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+) -> GapSummary {
+    let ranks = gap_rankings(a, b, prices_a, prices_b);
+    let observations: Vec<GapObservation> = ranks
+        .iter()
+        .map(|r| GapObservation {
+            log2_skew: r.log2_skew,
+            round_trip_toll: r.toll,
+        })
+        .collect();
     let observed_pairs = observations.len();
     if observed_pairs == 0 {
         return GapSummary::default();
@@ -767,6 +812,11 @@ mod tests {
         assert!(summary.above_1pct >= 1);
         assert!((summary.median_log2_skew - 2.0).abs() < 1e-9);
         assert!((summary.median_toll - 0.0055).abs() < 1e-9);
+        let ranks = gap_rankings(&a_entries, &b_entries, &pa, &pb);
+        assert_eq!(ranks.len(), 1);
+        assert_eq!(ranks[0].token_lo, a_entries[0].token0);
+        assert_eq!(ranks[0].token_hi, a_entries[0].token1);
+        assert!((ranks[0].margin - (2.0 - 0.0055)).abs() < 1e-9);
     }
 
     #[test]

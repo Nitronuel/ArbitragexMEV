@@ -281,3 +281,49 @@ fn gap_vs_toll_rejects_unknown_venue_without_rpc_access() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("unsupported venue"));
 }
+
+#[test]
+fn gap_vs_toll_help_exposes_selection_filters() {
+    let output = run(&["gap-vs-toll", "--help"], &[]);
+    assert!(output.status.success());
+    let help = format!("{}\n{}", stdout(&output), stderr(&output));
+    assert!(help.contains("--min-margin"));
+    assert!(help.contains("--max-skew"));
+    assert!(help.contains("--csv"));
+    assert!(help.contains("--top"));
+}
+
+#[test]
+fn gap_vs_toll_rejects_full_history_without_route_to_block() {
+    // A `from` newer than `to` must fail the range check before any transport
+    // work; regression guard for the selection-args plumbing.
+    let directory = tempfile::tempdir().unwrap();
+    let csv = directory.path().join("pools.csv");
+    fs::write(
+        &csv,
+        "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+         4663,0xfa00000000000000000000000000000000000001,0x0000000000000000000000000000000000000000,0x1000000000000000000000000000000000000000,0x2000000000000000000000000000000000000000,3000,1000000,v3,,\n",
+    )
+    .unwrap();
+    let output = run(
+        &[
+            "gap-vs-toll",
+            "--a",
+            csv.to_str().unwrap(),
+            "--b",
+            csv.to_str().unwrap(),
+            "--profile-a",
+            "v3",
+            "--profile-b",
+            "v4",
+            "--rpc",
+            "https://example.test/rpc",
+            "--from",
+            "2000",
+            "--to",
+            "1999",
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+}

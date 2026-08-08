@@ -189,6 +189,19 @@ enum Command {
         window: u64,
         #[arg(long, default_value_t = 600)]
         delay_ms: u64,
+        /// Print the top N cross-venue pairs ranked by (skew - toll) margin.
+        #[arg(long, default_value_t = 0)]
+        top: usize,
+        /// Drop pairs whose skew is below this margin floor.
+        #[arg(long, default_value_t = 0.0)]
+        min_margin: f64,
+        /// Drop pairs whose |log2 skew| exceeds this cap (catches degenerate
+        /// near-empty pool price gaps that are not captureable).
+        #[arg(long, default_value = "0.5")]
+        max_skew: f64,
+        /// Write each selected pair as one CSV row to this path (overwrites).
+        #[arg(long)]
+        csv: Option<PathBuf>,
     },
 }
 
@@ -252,6 +265,10 @@ fn main() {
             to,
             window,
             delay_ms,
+            top,
+            min_margin,
+            max_skew,
+            csv,
         } => gap_vs_toll_command(&GapVsTollArgs {
             a: &a,
             b: &b,
@@ -263,6 +280,10 @@ fn main() {
             to,
             window,
             delay_ms,
+            top,
+            min_margin,
+            max_skew,
+            csv: csv.as_deref(),
         }),
     };
     if let Err(error) = outcome {
@@ -422,10 +443,15 @@ struct GapVsTollArgs<'a> {
     to: u64,
     window: u64,
     delay_ms: u64,
+    top: usize,
+    min_margin: f64,
+    max_skew: f64,
+    csv: Option<&'a std::path::Path>,
 }
 
 /// Samples live Swap prices across two catalogs and reports the skew-vs-toll
 /// distribution. Read-only; no signing or submission.
+#[allow(clippy::too_many_lines)]
 fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
     let a_path: &std::path::Path = args.a;
     let b_path: &std::path::Path = args.b;
@@ -434,6 +460,10 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
     let to = args.to;
     let window = args.window;
     let delay_ms = args.delay_ms;
+    let top = args.top;
+    let min_margin = args.min_margin;
+    let max_skew = args.max_skew;
+    let csv_path = args.csv;
     let pool_manager = args.pool_manager;
     let profile_a = args.profile_a;
     let profile_b = args.profile_b;
@@ -503,6 +533,41 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
         prices_a.len(),
         prices_b.len(),
     );
+    if top > 0 || csv_path.is_some() {
+        use std::io::Write;
+        let ranks = gaps::gap_rankings(&cross_a, &cross_b, &prices_a, &prices_b);
+        let selected: Vec<_> = ranks
+            .iter()
+            .filter(|r| r.margin >= min_margin && r.log2_skew <= max_skew)
+            .collect();
+        if let Some(path) = csv_path {
+            let mut out =
+                std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+            writeln!(out, "token_lo,token_hi,log2_skew,toll,margin").map_err(|e| e.to_string())?;
+            for rank in &selected {
+                writeln!(
+                    out,
+                    "{},{},{:.6},{:.6},{:.6}",
+                    rank.token_lo, rank.token_hi, rank.log2_skew, rank.toll, rank.margin
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            println!(
+                "wrote {} selected pairs -> {}",
+                selected.len(),
+                path.display()
+            );
+        }
+        if top > 0 {
+            println!("top-{top} selected pairs by skew-vs-toll margin:");
+            for rank in selected.iter().take(top) {
+                println!(
+                    "{}::{}\tmargin={:.6}\tskew={:.6}\ttoll={:.6}",
+                    rank.token_lo, rank.token_hi, rank.margin, rank.log2_skew, rank.toll,
+                );
+            }
+        }
+    }
     Ok(())
 }
 
