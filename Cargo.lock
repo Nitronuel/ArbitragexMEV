@@ -2529,6 +2529,7 @@ dependencies = [
  "alloy-primitives",
  "catalog",
  "clap",
+ "csv",
  "domain",
  "provider",
  "serde_json",

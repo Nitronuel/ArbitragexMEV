@@ -24,6 +24,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use storage::Storage;
 
 mod enumerate;
+mod gaps;
 
 const QUEUE_CAPACITY: usize = 100_000;
 const CYCLE_LIMITS: CycleLimits = CycleLimits {
@@ -144,6 +145,16 @@ enum Command {
         #[arg(value_name = "OUT")]
         out: PathBuf,
     },
+    /// Counts cross-venue opportunities (shared pairs, optional 2/3-hop
+    /// cycles) between two enumerated venue catalogs (read-only, offline).
+    MeasureCrossVenues {
+        /// Enumerated catalog A (e.g. v3) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        a: PathBuf,
+        /// Enumerated catalog B (e.g. v4) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        b: PathBuf,
+    },
 }
 
 fn main() {
@@ -194,6 +205,7 @@ fn main() {
             delay_ms,
             out,
         } => enumerate_pools_command(&venue, factory, from, to, window, delay_ms, &out),
+        Command::MeasureCrossVenues { a, b } => measure_cross_venues_command(&a, &b),
     };
     if let Err(error) = outcome {
         eprintln!("error: {error}");
@@ -317,6 +329,25 @@ fn enumerate_pools_command(
         "enumerated {} pools from venue {venue_name} blocks {from}..{head} -> {}",
         pools.len(),
         out.display()
+    );
+    Ok(())
+}
+
+fn measure_cross_venues_command(
+    a_path: &std::path::Path,
+    b_path: &std::path::Path,
+) -> Result<(), String> {
+    let catalog_a = gaps::load_catalog(a_path)?;
+    let catalog_b = gaps::load_catalog(b_path)?;
+    let report = gaps::cross_measure(&catalog_a, &catalog_b);
+    println!(
+        "cross-venue: catalog_a={} catalog_b={} cross_pairs={} toll_free={} three_hop={} tokens={}",
+        catalog_a.len(),
+        catalog_b.len(),
+        report.cross_pairs,
+        report.toll_free_cross_pairs,
+        report.three_hop_cycles,
+        report.cross_tokens,
     );
     Ok(())
 }
