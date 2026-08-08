@@ -236,10 +236,48 @@ fn help_has_no_signing_or_send_command() {
         "run",
         "replay-observation",
         "daily-report",
+        "measure-cross-venues",
+        "gap-vs-toll",
     ] {
         assert!(help.contains(command));
     }
     assert!(!help.contains("sign"));
     assert!(!help.contains("send"));
     assert!(!help.contains("private key"));
+}
+
+#[test]
+fn gap_vs_toll_rejects_unknown_venue_without_rpc_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let csv = directory.path().join("pools.csv");
+    fs::write(
+        &csv,
+        "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+         4663,0xfa00000000000000000000000000000000000001,0x0000000000000000000000000000000000000000,0x1000000000000000000000000000000000000000,0x2000000000000000000000000000000000000000,3000,1000000,v3,,\n",
+    )
+    .unwrap();
+    // A venue label outside v3/v4 is rejected after catalog load but before any
+    // RPC call, so this must fail fast with a clear message and no traffic.
+    let output = run(
+        &[
+            "gap-vs-toll",
+            "--a",
+            csv.to_str().unwrap(),
+            "--b",
+            csv.to_str().unwrap(),
+            "--profile-a",
+            "v1",
+            "--profile-b",
+            "v4",
+            "--rpc",
+            "https://example.test/rpc",
+            "--from",
+            "1",
+            "--to",
+            "2",
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("unsupported venue"));
 }

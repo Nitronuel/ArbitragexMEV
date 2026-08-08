@@ -32,6 +32,11 @@ const CYCLE_LIMITS: CycleLimits = CycleLimits {
     max_cycles_per_pool: 10_000,
 };
 
+/// Uniswap V4 `PoolManager` singleton on Base; emits all Swap logs with the
+/// pool id as topic1 (confirmed from the enumerated catalog).
+const V4_POOL_MANAGER: Address =
+    alloy_primitives::address!("0x8366a39CC670B4001A1121B8F6A443A643e40951");
+
 /// An `AtomicBool` stop flag raised by SIGINT/SIGTERM for graceful drain.
 struct StopOnSignal {
     flag: Arc<AtomicBool>,
@@ -155,6 +160,36 @@ enum Command {
         #[arg(long)]
         b: PathBuf,
     },
+    /// Samples live Swap prices (latest per pool) across two venue catalogs
+    /// over a block window and reports the gap-vs-toll distribution (read-only).
+    GapVsToll {
+        /// Enumerated catalog A (e.g. v3) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        a: PathBuf,
+        /// Enumerated catalog B (e.g. v4) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        b: PathBuf,
+        /// Venue label for catalog A, one of `v3` or `v4`.
+        #[arg(long, default_value = "v3")]
+        profile_a: String,
+        /// Venue label for catalog B, one of `v3` or `v4`.
+        #[arg(long, default_value = "v4")]
+        profile_b: String,
+        /// v4 `PoolManager` contract address (only required when a profile is v4).
+        #[arg(long)]
+        pool_manager: Option<Address>,
+        /// Base chain endpoint URL.
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        from: u64,
+        #[arg(long)]
+        to: u64,
+        #[arg(long, default_value_t = 50_000)]
+        window: u64,
+        #[arg(long, default_value_t = 600)]
+        delay_ms: u64,
+    },
 }
 
 fn main() {
@@ -206,6 +241,29 @@ fn main() {
             out,
         } => enumerate_pools_command(&venue, factory, from, to, window, delay_ms, &out),
         Command::MeasureCrossVenues { a, b } => measure_cross_venues_command(&a, &b),
+        Command::GapVsToll {
+            a,
+            b,
+            profile_a,
+            profile_b,
+            pool_manager,
+            rpc,
+            from,
+            to,
+            window,
+            delay_ms,
+        } => gap_vs_toll_command(&GapVsTollArgs {
+            a: &a,
+            b: &b,
+            profile_a: &profile_a,
+            profile_b: &profile_b,
+            pool_manager,
+            rpc: &rpc,
+            from,
+            to,
+            window,
+            delay_ms,
+        }),
     };
     if let Err(error) = outcome {
         eprintln!("error: {error}");
@@ -348,6 +406,100 @@ fn measure_cross_venues_command(
         report.toll_free_cross_pairs,
         report.three_hop_cycles,
         report.cross_tokens,
+    );
+    Ok(())
+}
+
+/// Arguments for [`gap_vs_toll_command`].
+struct GapVsTollArgs<'a> {
+    a: &'a PathBuf,
+    b: &'a PathBuf,
+    profile_a: &'a str,
+    profile_b: &'a str,
+    pool_manager: Option<Address>,
+    rpc: &'a str,
+    from: u64,
+    to: u64,
+    window: u64,
+    delay_ms: u64,
+}
+
+/// Samples live Swap prices across two catalogs and reports the skew-vs-toll
+/// distribution. Read-only; no signing or submission.
+fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
+    let a_path: &std::path::Path = args.a;
+    let b_path: &std::path::Path = args.b;
+    let rpc = args.rpc;
+    let from = args.from;
+    let to = args.to;
+    let window = args.window;
+    let delay_ms = args.delay_ms;
+    let pool_manager = args.pool_manager;
+    let profile_a = args.profile_a;
+    let profile_b = args.profile_b;
+    let catalog_a = gaps::load_catalog(a_path)?;
+    let catalog_b = gaps::load_catalog(b_path)?;
+    let (profile_bytes_a, profile_bytes_b) = (
+        profile_a
+            .as_bytes()
+            .try_into()
+            .map_err(|_| format!("profile_a must be exactly 2 bytes, got {profile_a}"))?,
+        profile_b.as_bytes().try_into().unwrap(),
+    );
+    for (label, profile) in [(profile_a, &profile_bytes_a), (profile_b, &profile_bytes_b)] {
+        if profile != b"v3" && profile != b"v4" {
+            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        }
+    }
+    let http_url: RedactedUrl = rpc
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let budget = ProviderBudget::new(40_000, 1 << 24);
+    let retry = RetryPolicy {
+        max_retries: 3,
+        initial_delay: Duration::from_millis(delay_ms.min(600_000)),
+        max_delay: Duration::from_secs(2),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url.clone()),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+        8453,
+    );
+    let (cross_a, cross_b) = gaps::restrict_to_cross(&catalog_a, &catalog_b);
+    println!("cross pools: a={} b={}", cross_a.len(), cross_b.len());
+    let prices_a = gaps::sweep_swap_prices(
+        &reader,
+        profile_bytes_a,
+        pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &cross_a,
+        from,
+        to,
+        window,
+    )
+    .map_err(|e| e.to_string())?;
+    let prices_b = gaps::sweep_swap_prices(
+        &reader,
+        profile_bytes_b,
+        pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &cross_b,
+        from,
+        to,
+        window,
+    )
+    .map_err(|e| e.to_string())?;
+    let s = gaps::gap_distribution(&cross_a, &cross_b, &prices_a, &prices_b);
+    println!(
+        "gap-vs-toll: observed={} above_toll={} above_1pct={} pct_skewed={:.3} median_skew={:.6} median_toll={:.6} samples_a={} samples_b={}",
+        s.observed_pairs,
+        s.above_toll,
+        s.above_1pct,
+        s.pct_skewed,
+        s.median_log2_skew,
+        s.median_toll,
+        prices_a.len(),
+        prices_b.len(),
     );
     Ok(())
 }
