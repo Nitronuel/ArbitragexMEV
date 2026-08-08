@@ -456,9 +456,9 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let budget = ProviderBudget::new(40_000, 1 << 24);
     let retry = RetryPolicy {
-        max_retries: 3,
-        initial_delay: Duration::from_millis(delay_ms.min(600_000)),
-        max_delay: Duration::from_secs(2),
+        max_retries: 8,
+        initial_delay: Duration::from_millis(600),
+        max_delay: Duration::from_secs(12),
     };
     let reader = ChainReader::new(
         LiveHttp::new(http_url.clone()),
@@ -477,6 +477,7 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
         from,
         to,
         window,
+        Duration::from_millis(delay_ms),
     )
     .map_err(|e| e.to_string())?;
     let prices_b = gaps::sweep_swap_prices(
@@ -487,6 +488,7 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
         from,
         to,
         window,
+        Duration::from_millis(delay_ms),
     )
     .map_err(|e| e.to_string())?;
     let s = gaps::gap_distribution(&cross_a, &cross_b, &prices_a, &prices_b);

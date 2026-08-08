@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
 use provider::{
@@ -177,9 +178,10 @@ pub struct PoolPrice {
 /// it is the `PoolId`s kept from the singleton's full `Swap` stream after
 /// matching `topic1`.
 ///
-/// Maximum number of pool addresses per `eth_getLogs` filter request. Some
-/// providers limit the address-OR list; chunking keeps filters portable.
-const MAX_ADDRESS_CHUNK: usize = 1_000;
+/// Maximum number of pool addresses per `eth_getLogs` filter request. RHC caps
+/// combined address+topic selectors at 1000, so keep 1 slot free for the swap
+/// `topic0`.
+const MAX_ADDRESS_CHUNK: usize = 999;
 
 /// Keeps only the [`PoolEntry`]s whose normalized pair appears in *either*
 /// catalog, i.e. the cross-venue pair overlap. Used to bound the live price
@@ -217,6 +219,7 @@ pub fn restrict_to_cross(
 ///
 /// Returns a [`TransportError`] on an empty filter or a transport/budget
 /// failure.
+#[allow(clippy::too_many_arguments)]
 pub fn sweep_swap_prices<B, S>(
     reader: &ChainReader<B, S>,
     profile: [u8; 2],
@@ -225,6 +228,7 @@ pub fn sweep_swap_prices<B, S>(
     from: u64,
     to: u64,
     window: u64,
+    request_delay: Duration,
 ) -> Result<HashMap<[u8; 32], PoolPrice>, TransportError>
 where
     B: HttpBackend,
@@ -290,6 +294,9 @@ where
                 )?;
                 let ids: HashSet<[u8; 32]> = keys.iter().map(|e| e.id).collect();
                 ingest(&logs, Some(&ids));
+                if !request_delay.is_zero() {
+                    std::thread::sleep(request_delay);
+                }
             }
             _ => {
                 for chunk in keys.chunks(MAX_ADDRESS_CHUNK) {
@@ -304,6 +311,9 @@ where
                         window,
                     )?;
                     ingest(&logs, None);
+                    if !request_delay.is_zero() {
+                        std::thread::sleep(request_delay);
+                    }
                 }
             }
         }
