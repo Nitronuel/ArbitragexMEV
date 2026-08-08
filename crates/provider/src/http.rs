@@ -184,16 +184,34 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
     /// Returns an error for empty filters, invalid ranges, transport, budget, or
     /// malformed-response failures.
     pub fn get_logs(&self, filter: &LogFilter) -> Result<Vec<Value>, TransportError> {
+        self.get_logs_windowed(filter, 10)
+    }
+
+    /// Fetches explicitly filtered logs in windows of at most `window` inclusive
+    /// blocks per `eth_getLogs` request, with at least one block per window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty filters, invalid ranges, transport, budget, or
+    /// malformed-response failures.
+    pub fn get_logs_windowed(
+        &self,
+        filter: &LogFilter,
+        window: u64,
+    ) -> Result<Vec<Value>, TransportError> {
         if filter.addresses.is_empty() {
             return Err(TransportError::EmptyAddressFilter);
         }
         if filter.from_block > filter.to_block {
             return Err(TransportError::InvalidBlockRange);
         }
+        let window = window.max(1);
         let mut logs = Vec::new();
         let mut start = filter.from_block;
         loop {
-            let end = start.saturating_add(9).min(filter.to_block);
+            let end = start
+                .saturating_add(window.saturating_sub(1))
+                .min(filter.to_block);
             let response = self.execute(&RpcRequest {
                 method: "eth_getLogs".to_owned(),
                 params: json!([{

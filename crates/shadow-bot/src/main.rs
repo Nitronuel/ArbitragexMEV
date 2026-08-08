@@ -11,6 +11,7 @@ use alloy_primitives::{Address, U256};
 use catalog::{CycleLimits, parse_manifest};
 use clap::{Parser, Subcommand};
 use domain::ShadowConfig;
+use enumerate::{CrawlPace, Venue, sweep_venue};
 use provider::{
     ChainReader, LiveHttp, LiveHttpProbe, LiveRpc, LogStream, ProviderBudget, RedactedUrl,
     RetryPolicy, SubscriptionFilter, ThreadSleeper,
@@ -21,6 +22,8 @@ use shadow::{
 };
 use signal_hook::consts::{SIGINT, SIGTERM};
 use storage::Storage;
+
+mod enumerate;
 
 const QUEUE_CAPACITY: usize = 100_000;
 const CYCLE_LIMITS: CycleLimits = CycleLimits {
@@ -124,6 +127,23 @@ enum Command {
         #[arg(long, value_name = "YYYY-MM-DD")]
         date: String,
     },
+    /// Enumerates pools for a DEX venue across a block range (read-only).
+    EnumeratePools {
+        #[arg(long)]
+        venue: String,
+        #[arg(long)]
+        factory: Address,
+        #[arg(long)]
+        from: u64,
+        #[arg(long)]
+        to: Option<u64>,
+        #[arg(long, default_value_t = 50_000)]
+        window: u64,
+        #[arg(long, default_value_t = 600)]
+        delay_ms: u64,
+        #[arg(value_name = "OUT")]
+        out: PathBuf,
+    },
 }
 
 fn main() {
@@ -165,6 +185,15 @@ fn main() {
         ),
         Command::ReplayObservation { id, db } => replay_observation_command(id, &db),
         Command::DailyReport { db, date } => daily_report_command(&db, &date),
+        Command::EnumeratePools {
+            venue,
+            factory,
+            from,
+            to,
+            window,
+            delay_ms,
+            out,
+        } => enumerate_pools_command(&venue, factory, from, to, window, delay_ms, &out),
     };
     if let Err(error) = outcome {
         eprintln!("error: {error}");
@@ -208,6 +237,88 @@ fn verify_catalog_command(
         parsed.ok_or_else(|| "--config has no manifest_path".to_owned())?
     };
     verify_catalog(&manifest_path)
+}
+
+fn enumerate_pools_command(
+    venue_name: &str,
+    factory: Address,
+    from: u64,
+    to: Option<u64>,
+    window: u64,
+    delay_ms: u64,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    use std::io::Write;
+    let venue = match venue_name {
+        "v3" => Venue::v3_pools(factory),
+        "v4" => Venue::v4_pools(factory),
+        other => return Err(format!("unsupported venue {other:?}; use v3 or v4")),
+    };
+    let http = std::env::var("ROBINHOOD_HTTP_RPC_URL")
+        .map_err(|_| "missing ROBINHOOD_HTTP_RPC_URL".to_owned())?;
+    let http_url: RedactedUrl = http
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let budget = ProviderBudget::new(24_000_000, 10_000_000);
+    let retry = RetryPolicy {
+        max_retries: 3,
+        initial_delay: Duration::from_millis(250),
+        max_delay: Duration::from_secs(2),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+        domain::ROBINHOOD_CHAIN_ID,
+    );
+    reader
+        .validate_chain_id()
+        .map_err(|error| error.to_string())?;
+    let head = match to {
+        Some(to) => to,
+        None => reader.current_block().map_err(|error| error.to_string())?,
+    };
+    let pace = CrawlPace {
+        window,
+        delay: Duration::from_millis(delay_ms),
+    };
+    let pools =
+        sweep_venue(&reader, &venue, from, head, pace).map_err(|error| error.to_string())?;
+    let mut writer = std::fs::File::create(out).map_err(|error| error.to_string())?;
+    writeln!(
+        writer,
+        "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source"
+    )
+    .map_err(|error| error.to_string())?;
+    for pool in &pools {
+        let line = match pool {
+            enumerate::EnumeratedPool::V3 {
+                token0,
+                token1,
+                fee,
+                pool: address,
+            } => format!("4663,{address},{factory},{token0},{token1},{fee},1000000,v3,,\n"),
+            enumerate::EnumeratedPool::V4 {
+                id,
+                currency0,
+                currency1,
+                fee,
+                ..
+            } => {
+                format!("4663,{factory},{factory},{currency0},{currency1},{fee},1000000,v4,{id},\n")
+            }
+        };
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|error| error.to_string())?;
+    }
+    println!(
+        "enumerated {} pools from venue {venue_name} blocks {from}..{head} -> {}",
+        pools.len(),
+        out.display()
+    );
+    Ok(())
 }
 
 fn run_smoke_command(
