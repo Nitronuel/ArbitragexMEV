@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::Read;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use domain::{Chain, Fee, Profile};
 use serde::Deserialize;
 use thiserror::Error;
@@ -17,6 +17,10 @@ pub struct CandidatePool {
     pub token1: Address,
     pub fee: Fee,
     pub profile: Profile,
+    /// Uniswap V4 `PoolId` (keccak of the pool key) for singleton-based pools.
+    /// Present when `profile` is `VolatileManaged`; a conventional address key
+    /// otherwise identifies the pool.
+    pub pool_id: Option<B256>,
     pub source: String,
 }
 
@@ -44,8 +48,12 @@ pub enum ManifestError {
     MissingSource { row: usize },
     #[error("row {row} has unsupported profile {profile:?}")]
     UnsupportedProfile { row: usize, profile: String },
-    #[error("row {row} duplicates pool address {address}")]
-    DuplicatePool { row: usize, address: Address },
+    #[error("row {row} has an invalid pool_id")]
+    InvalidPoolId { row: usize },
+    #[error("row {row} is a v4 pool missing a pool_id")]
+    MissingPoolId { row: usize },
+    #[error("row {row} duplicates pool identity {identity}")]
+    DuplicatePool { row: usize, identity: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +68,8 @@ struct ManifestRow {
     fee_denominator: u32,
     #[serde(default)]
     profile: Option<String>,
+    #[serde(default)]
+    pool_id: Option<String>,
     source: String,
 }
 
@@ -71,7 +81,7 @@ struct ManifestRow {
 /// chain or fee data, missing source metadata, or a manifest over 2,000 pools.
 pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestError> {
     let mut pools = Vec::new();
-    let mut addresses = HashSet::new();
+    let mut identities: HashSet<B256> = HashSet::new();
     for (index, record) in csv::Reader::from_reader(reader).deserialize().enumerate() {
         let row_number = index + 2;
         if pools.len() == MAX_POOLS {
@@ -116,10 +126,29 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
                 });
             }
         };
-        if !addresses.insert(address) {
+        let pool_id = match (&row.pool_id, profile) {
+            (Some(raw), Profile::VolatileManaged) => {
+                let trimmed = raw.trim();
+                let parsed = parse_pool_id(trimmed)
+                    .ok_or(ManifestError::InvalidPoolId { row: row_number })?;
+                if parsed.is_zero() {
+                    return Err(ManifestError::InvalidPoolId { row: row_number });
+                }
+                Some(parsed)
+            }
+            (None, Profile::VolatileManaged) => {
+                return Err(ManifestError::MissingPoolId { row: row_number });
+            }
+            (Some(_), _) => {
+                return Err(ManifestError::InvalidPoolId { row: row_number });
+            }
+            (None, _) => None,
+        };
+        let identity = pool_id.unwrap_or_else(|| address.into_word());
+        if !identities.insert(identity) {
             return Err(ManifestError::DuplicatePool {
                 row: row_number,
-                address,
+                identity: format!("{identity}"),
             });
         }
         pools.push(CandidatePool {
@@ -133,10 +162,20 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
                 denominator: row.fee_denominator,
             },
             profile,
+            pool_id,
             source,
         });
     }
     Ok(pools)
+}
+
+fn parse_pool_id(raw: &str) -> Option<B256> {
+    let hex = raw.strip_prefix("0x").unwrap_or(raw);
+    let bytes = alloy_primitives::hex::decode(hex).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    Some(B256::from_slice(&bytes))
 }
 
 fn parse_address(value: &str, row: usize, field: &'static str) -> Result<Address, ManifestError> {
@@ -154,7 +193,7 @@ mod tests {
 
     use std::fmt::Write;
 
-    use super::parse_manifest;
+    use super::{ManifestError, parse_manifest};
 
     const HEADER: &str = "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,source\n";
 
@@ -230,16 +269,25 @@ mod tests {
     #[test]
     fn parses_explicit_profiles() {
         let mut input = String::from(
-            "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,source\n",
+            "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n",
         );
-        for (profile, pool) in [
-            ("v2", "0x0000000000000000000000000000000000000010"),
-            ("concentrated", "0x0000000000000000000000000000000000000011"),
-            ("v4", "0x0000000000000000000000000000000000000012"),
+        for (profile, pool, pool_id) in [
+            ("v2", "0x0000000000000000000000000000000000000010", None),
+            (
+                "concentrated",
+                "0x0000000000000000000000000000000000000011",
+                None,
+            ),
+            (
+                "v4",
+                "0x0000000000000000000000000000000000000012",
+                Some("0x1111111111111111111111111111111111111111111111111111111111111111"),
+            ),
         ] {
+            let id = pool_id.unwrap_or_default();
             writeln!(
                 input,
-                "4663,{pool},0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f,0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002,997,1000,{profile},src"
+                "4663,{pool},0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f,0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002,997,1000,{profile},{id},src"
             )
             .unwrap();
         }
@@ -248,6 +296,53 @@ mod tests {
         assert_eq!(pools[0].profile, domain::Profile::ConstantProduct);
         assert_eq!(pools[1].profile, domain::Profile::Concentrated);
         assert_eq!(pools[2].profile, domain::Profile::VolatileManaged);
+        assert!(pools[2].pool_id.is_some());
+    }
+
+    #[test]
+    fn v4_requires_and_validates_pool_id() {
+        let header = "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n";
+        let base = "0x0000000000000000000000000000000000000010,0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f,0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002,997,1000,v4";
+        // v4 without pool_id is rejected.
+        let missing = format!("{header}4663,{base},,src\n");
+        assert!(matches!(
+            parse_manifest(missing.as_bytes()),
+            Err(ManifestError::MissingPoolId { row: 2 })
+        ));
+        // Non-v4 rows cannot carry a pool_id.
+        let non_v4 = format!(
+            "{header}4663,0x0000000000000000000000000000000000000010,0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f,0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002,997,1000,v2,0x1111111111111111111111111111111111111111111111111111111111111111,src\n"
+        );
+        assert!(matches!(
+            parse_manifest(non_v4.as_bytes()),
+            Err(ManifestError::InvalidPoolId { .. })
+        ));
+        // Malformed pool_id hex is rejected.
+        let malformed = format!("{header}4663,{base},0xzz,src\n");
+        assert!(matches!(
+            parse_manifest(malformed.as_bytes()),
+            Err(ManifestError::InvalidPoolId { .. })
+        ));
+    }
+
+    #[test]
+    fn v4_pool_ids_must_be_unique() {
+        let header = "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n";
+        let id = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let row = |pool: &str, id: &str| {
+            format!(
+                "4663,{pool},0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f,0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002,997,1000,v4,{id},src\n"
+            )
+        };
+        let dup = format!(
+            "{header}{}{}",
+            row("0x0000000000000000000000000000000000000010", id),
+            row("0x0000000000000000000000000000000000000011", id)
+        );
+        assert!(matches!(
+            parse_manifest(dup.as_bytes()),
+            Err(ManifestError::DuplicatePool { .. })
+        ));
     }
 
     #[test]

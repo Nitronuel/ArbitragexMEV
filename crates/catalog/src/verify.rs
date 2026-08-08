@@ -282,6 +282,7 @@ mod tests {
             token1: Address::repeat_byte(2),
             fee: FEE,
             profile: Profile::ConstantProduct,
+            pool_id: None,
             source: "protocol deployment".to_owned(),
         }
     }
