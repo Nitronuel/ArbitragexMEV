@@ -5,7 +5,7 @@
 //! runtime, never hard-coded from memory. The constants are pinned in tests
 //! against independently verified primary sources.
 
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, B256, I256, U256, keccak256};
 
 use crate::ws::RawLogEnvelope;
 
@@ -22,6 +22,16 @@ pub fn v3_pool_created_topic() -> B256 {
 #[must_use]
 pub fn v4_initialize_topic() -> B256 {
     keccak256("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)")
+}
+
+#[must_use]
+pub fn v3_swap_topic() -> B256 {
+    keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
+}
+
+#[must_use]
+pub fn v4_swap_topic() -> B256 {
+    keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +59,31 @@ pub struct V4PoolInitialize {
     pub hooks: Address,
     pub sqrt_price_x96: U256,
     pub tick: i32,
+}
+
+/// The price-observable fields of a V3 `Swap` event. `amount0`/`amount1` are
+/// the signed deltas of the swap; `sqrt_price_x96` is the pool price immediately
+/// after the swap, and `tick` is the post-swap price tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V3Swap {
+    pub amount0: I256,
+    pub amount1: I256,
+    pub sqrt_price_x96: U256,
+    pub liquidity: U256,
+    pub tick: i32,
+}
+
+/// The price-observable fields of one V4 `Swap` event. Signed amounts, the
+/// post-swap pool price in `sqrt_price_x96`, the post-swap `liquidity`, the
+/// price `tick`, and the `fee` charged for the swap are all data words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V4Swap {
+    pub amount0: I256,
+    pub amount1: I256,
+    pub sqrt_price_x96: U256,
+    pub liquidity: U256,
+    pub tick: i32,
+    pub fee: u32,
 }
 
 /// Decodes a V2 `PairCreated` log. The indexed `token0`/`token1` are the two
@@ -114,6 +149,50 @@ pub fn decode_v4_initialize(envelope: &RawLogEnvelope) -> Option<V4PoolInitializ
         sqrt_price_x96: uint160(&data[96..128]),
         tick: int24(&data[128..160]),
     })
+}
+
+/// Decodes the V3 `Swap` event from a pool address. `amount0` and `amount1`
+/// are the first two data words; `sqrt_price_x96`, `liquidity`, and `tick` are
+/// the trailing right-aligned words.
+#[must_use]
+pub fn decode_v3_swap(envelope: &RawLogEnvelope) -> Option<V3Swap> {
+    let data = envelope.data.as_ref();
+    if data.len() < 160 {
+        return None;
+    }
+    Some(V3Swap {
+        amount0: signed_word(&data[..32]),
+        amount1: signed_word(&data[32..64]),
+        sqrt_price_x96: uint160(&data[64..96]),
+        liquidity: U256::from_be_slice(&data[96..128]),
+        tick: int24(&data[128..160]),
+    })
+}
+
+/// Decodes the V4 `Swap` event from the `PoolManager` across a pool `id`. The
+/// data layout matches V3 with an extra `uint24` fee word.
+#[must_use]
+pub fn decode_v4_swap(envelope: &RawLogEnvelope) -> Option<V4Swap> {
+    if envelope.topics.len() < 3 {
+        return None;
+    }
+    let data = envelope.data.as_ref();
+    if data.len() < 192 {
+        return None;
+    }
+    Some(V4Swap {
+        amount0: signed_word(&data[..32]),
+        amount1: signed_word(&data[32..64]),
+        sqrt_price_x96: uint160(&data[64..96]),
+        liquidity: U256::from_be_slice(&data[96..128]),
+        tick: int24(&data[128..160]),
+        fee: uint24(&data[160..192]),
+    })
+}
+
+/// The two's-complement `int256` value in a full 32-byte word.
+fn signed_word(word: &[u8]) -> I256 {
+    I256::from_raw(U256::from_be_slice(word))
 }
 
 /// The address occupying the final 20 bytes of a 32-byte word.
@@ -267,5 +346,76 @@ mod tests {
         assert!(decode_v2_pair_created(&empty).is_none());
         assert!(decode_v3_pool_created(&empty).is_none());
         assert!(decode_v4_initialize(&empty).is_none());
+        assert!(decode_v3_swap(&empty).is_none());
+        assert!(decode_v4_swap(&empty).is_none());
+    }
+
+    #[test]
+    fn decodes_v3_swap() {
+        let mut data = vec![0u8; 160];
+        // amount0 = -1_000_000_000_000_000_000 (two's complement in a full word)
+        let negative = I256::from_raw(U256::from(1_000_000_000_000_000_000_u64)).wrapping_neg();
+        data[..32].copy_from_slice(negative.to_be_bytes::<32>().as_slice());
+        // amount1 = +5_000_000
+        let amount1 = U256::from(5_000_000_u64);
+        let amount1_bytes = amount1.to_be_bytes::<32>();
+        data[32..64].copy_from_slice(&amount1_bytes);
+        // sqrtPriceX96 = 0xDEAD (uint160, right-aligned: last two bytes)
+        data[94] = 0xDE;
+        data[95] = 0xAD;
+        // liquidity = 123456 (uint128, full word)
+        let liquidity = U256::from(123_456_u64).to_be_bytes::<32>();
+        data[96..128].copy_from_slice(&liquidity);
+        // tick = 200 (int24)
+        data[159] = 0xC8;
+
+        let log = envelope(vec![v3_swap_topic(), B256::default()], data);
+        let parsed = decode_v3_swap(&log).unwrap();
+        assert_eq!(
+            parsed.amount0,
+            I256::from_raw(U256::from(1_000_000_000_000_000_000_u64)).wrapping_neg()
+        );
+        assert_eq!(parsed.amount1, I256::from_raw(U256::from(5_000_000_u64)));
+        assert_eq!(parsed.sqrt_price_x96, U256::from(0xDEAD_u64));
+        assert_eq!(parsed.liquidity, U256::from(123_456_u64));
+        assert_eq!(parsed.tick, 200);
+    }
+
+    #[test]
+    fn decodes_v4_swap() {
+        let mut data = vec![0u8; 192];
+        // amount0 = -1 (two's complement: all ones)
+        data[..32].copy_from_slice(B256::repeat_byte(0xFF).as_slice());
+        // amount1 = +3_000_000
+        let amount1 = U256::from(3_000_000_u64).to_be_bytes::<32>();
+        data[32..64].copy_from_slice(&amount1);
+        // sqrtPriceX96 = 0x11 (uint160, right-aligned)
+        data[95] = 0x11;
+        // liquidity = 7 (uint128)
+        data[127] = 0x07;
+        // tick = -3 (int24, sign-extended word: 0xFFFF...FFFD)
+        data[156] = 0xFF;
+        data[157] = 0xFF;
+        data[158] = 0xFF;
+        data[159] = 0xFD;
+        // fee = 3000 (uint24)
+        data[190] = 0x0B;
+        data[191] = 0xB8;
+
+        let log = envelope(
+            vec![
+                v4_swap_topic(),
+                B256::with_last_byte(0x42),
+                padded(Address::with_last_byte(0x01)),
+            ],
+            data,
+        );
+        let parsed = decode_v4_swap(&log).unwrap();
+        assert_eq!(parsed.amount0, I256::from_raw(U256::MAX));
+        assert_eq!(parsed.amount1, I256::from_raw(U256::from(3_000_000_u64)));
+        assert_eq!(parsed.sqrt_price_x96, U256::from(0x11_u64));
+        assert_eq!(parsed.liquidity, U256::from(7_u64));
+        assert_eq!(parsed.tick, -3);
+        assert_eq!(parsed.fee, 3000);
     }
 }
