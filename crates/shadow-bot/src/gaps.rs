@@ -73,6 +73,12 @@ pub struct PoolEntry {
     pub token0: Address,
     /// Pool token1 (normalized, never zero).
     pub token1: Address,
+    /// Fee denominator carried through from the catalog row (`1_000_000`).
+    pub fee_denominator: u32,
+    /// Factory / pool-manager contract for this pool.
+    pub factory: Address,
+    /// Source chain ID from the catalog row.
+    pub chain_id: u64,
 }
 
 /// Loads a venue catalog CSV written by `enumerate-pools` into a map keyed by
@@ -90,11 +96,22 @@ pub fn load_catalog(path: &Path) -> Result<HashMap<[u8; 32], PoolEntry>, String>
     //  fee_denominator,profile,pool_id,source`
     for record in reader.records() {
         let record = record.map_err(|e| e.to_string())?;
+        let chain_id = record
+            .get(0)
+            .ok_or_else(|| "row lacks chain_id".to_owned())?
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "bad chain_id".to_owned())?;
         let venue = record
             .get(1)
             .ok_or_else(|| "row lacks pool_address".to_owned())?
             .parse::<Address>()
             .map_err(|_| "bad pool_address".to_owned())?;
+        let factory = record
+            .get(2)
+            .ok_or_else(|| "row lacks factory_address".to_owned())?
+            .parse::<Address>()
+            .map_err(|_| "bad factory_address".to_owned())?;
         let token0 = normalize_currency(
             record
                 .get(3)
@@ -114,6 +131,11 @@ pub fn load_catalog(path: &Path) -> Result<HashMap<[u8; 32], PoolEntry>, String>
             .ok_or_else(|| "row lacks fee".to_owned())?
             .parse::<u32>()
             .map_err(|_| "bad fee".to_owned())?;
+        let fee_denominator = record
+            .get(6)
+            .ok_or_else(|| "row lacks fee_denominator".to_owned())?
+            .parse::<u32>()
+            .map_err(|_| "bad fee_denominator".to_owned())?;
         let profile_bytes = record
             .get(7)
             .ok_or_else(|| "row lacks profile".to_owned())?
@@ -144,6 +166,9 @@ pub fn load_catalog(path: &Path) -> Result<HashMap<[u8; 32], PoolEntry>, String>
                 fee,
                 token0,
                 token1,
+                fee_denominator,
+                factory,
+                chain_id,
             },
         );
     }
@@ -381,6 +406,77 @@ pub fn pool_key(entry: &PoolEntry) -> [u8; 32] {
     } else {
         entry.venue.into_word().into()
     }
+}
+
+/// The normalized sorted-pair key used to match a pool across venues
+/// (canonical `pair_key`; see [`pair_key`]).
+pub type PairSet = HashSet<([u8; 20], [u8; 20])>;
+
+/// Loads a `gap-vs-toll --csv` selection file (one pair per row,
+/// `token_lo,token_hi,...`) into a set of canonical pair keys.
+///
+/// # Errors
+///
+/// Returns the parser's message on a malformed row.
+pub fn load_selected_pairs(path: &Path) -> Result<PairSet, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut reader = csv::Reader::from_reader(file);
+    let mut out = HashSet::new();
+    for record in reader.records() {
+        let record = record.map_err(|e| e.to_string())?;
+        let token_lo: Address = record
+            .get(0)
+            .ok_or_else(|| "row lacks token_lo".to_owned())?
+            .parse::<Address>()
+            .map_err(|_| "bad token_lo".to_owned())?;
+        let token_hi: Address = record
+            .get(1)
+            .ok_or_else(|| "row lacks token_hi".to_owned())?
+            .parse::<Address>()
+            .map_err(|_| "bad token_hi".to_owned())?;
+        out.insert(pair_key(token_lo, token_hi));
+    }
+    Ok(out)
+}
+
+/// Selects the subset of two venue catalogs whose normalized pair is in
+/// `selected`, yielding the concrete pools a Task B manifest must load to
+/// quote those pairs. Rows keep their catalog venue/factory/chain metadata so
+/// the manifest can round-trip through `enumerate-pools` catalog readers.
+/// Rows whose fee cannot be represented in a candidate list (zero, sentinel,
+/// or exceeding the fee denominator) are dropped, since the manifest validator
+/// rejects them.
+///
+/// # Errors
+///
+/// Returns an error when the expanded manifest exceeds `pool_cap`.
+pub fn expand_manifest_catalog(
+    a: &[PoolEntry],
+    b: &[PoolEntry],
+    selected: &PairSet,
+    pool_cap: usize,
+) -> Result<Vec<PoolEntry>, String> {
+    let mut out = Vec::new();
+    for (label, entries) in [("a", a), ("b", b)] {
+        for entry in entries {
+            if !selected.contains(&pair_key(entry.token0, entry.token1)) {
+                continue;
+            }
+            if entry.fee == 0
+                || entry.fee > entry.fee_denominator
+                || leg_toll(entry.fee, entry.profile).is_none()
+            {
+                continue;
+            }
+            if out.len() >= pool_cap {
+                return Err(format!(
+                    "manifest exceeds the {pool_cap}-pool cap while expanding catalog {label}"
+                ));
+            }
+            out.push(*entry);
+        }
+    }
+    Ok(out)
 }
 
 /// Combines the latest per-pool prices on both venues with the catalog pair
@@ -877,5 +973,116 @@ mod tests {
         let summary = gap_distribution(&a_entries, &b_entries, &pa, &pb);
         assert_eq!(summary.observed_pairs, 1);
         assert!(summary.median_log2_skew < 1e-9);
+    }
+
+    #[test]
+    fn load_selected_pairs_reads_gap_csv_output() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("selection.csv");
+        let a = "0x1000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        let c = "0x3000000000000000000000000000000000000000";
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            write!(
+                f,
+                "token_lo,token_hi,log2_skew,toll,margin\n\
+                 {a},{b},0.100000,0.005000,0.095000\n\
+                 {b},{c},0.200000,0.010000,0.190000\n"
+            )
+            .unwrap();
+        }
+        let selected = load_selected_pairs(&path).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&pair_key(a.parse().unwrap(), b.parse().unwrap())));
+        assert!(selected.contains(&pair_key(b.parse().unwrap(), c.parse().unwrap())));
+    }
+
+    #[test]
+    fn expand_manifest_catalog_keeps_selected_pairs_and_caps() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let a = "0x1000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        let c = "0x3000000000000000000000000000000000000000";
+        let p3 = dir.path().join("v3.csv");
+        let p4 = dir.path().join("v4.csv");
+        {
+            let mut f = std::fs::File::create(&p3).unwrap();
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n\
+                 4663,0xfa00000000000000000000000000000000000002,0x1111111111111111111111111111111111111111,{b},{c},3000,1000000,v3,,\n"
+            )
+            .unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&p4).unwrap();
+            let id = "22".repeat(32);
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},2500,1000000,v4,0x{id},\n"
+            )
+            .unwrap();
+        }
+        let m3 = load_catalog(&p3).unwrap();
+        let m4 = load_catalog(&p4).unwrap();
+        let all_a: Vec<_> = m3.into_values().collect();
+        let all_b: Vec<_> = m4.into_values().collect();
+
+        let selected = HashSet::from([pair_key(a.parse().unwrap(), b.parse().unwrap())]);
+        let kept = expand_manifest_catalog(&all_a, &all_b, &selected, 2_000).unwrap();
+        // Only the a/b pool on each venue survives.
+        assert_eq!(kept.len(), 2);
+        let a_addr: Address = a.parse().unwrap();
+        let b_addr: Address = b.parse().unwrap();
+        assert!(kept.iter().all(|e| {
+            (e.token0 == a_addr && e.token1 == b_addr) || (e.token0 == b_addr && e.token1 == a_addr)
+        }));
+
+        // A cap of 1 must fail once the second venue row is reached.
+        let err = expand_manifest_catalog(&all_a, &all_b, &selected, 1).unwrap_err();
+        assert!(err.contains("pool cap"));
+    }
+
+    #[test]
+    fn expand_manifest_catalog_drops_unrepresentable_fees() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let a = "0x1000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        let p3 = dir.path().join("v3.csv");
+        let p4 = dir.path().join("v4.csv");
+        {
+            let mut f = std::fs::File::create(&p3).unwrap();
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n"
+            )
+            .unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&p4).unwrap();
+            let id = "22".repeat(32);
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},0,1000000,v4,0x{id},\n"
+            )
+            .unwrap();
+        }
+        let m3 = load_catalog(&p3).unwrap();
+        let m4 = load_catalog(&p4).unwrap();
+        let all_a: Vec<_> = m3.into_values().collect();
+        let all_b: Vec<_> = m4.into_values().collect();
+        let selected = HashSet::from([pair_key(a.parse().unwrap(), b.parse().unwrap())]);
+        let kept = expand_manifest_catalog(&all_a, &all_b, &selected, 2_000).unwrap();
+        // The zero-fee v4 row must be dropped; only the v3 leg survives.
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].profile, *b"v3");
     }
 }

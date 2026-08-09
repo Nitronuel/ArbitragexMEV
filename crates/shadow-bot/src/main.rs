@@ -203,6 +203,25 @@ enum Command {
         #[arg(long)]
         csv: Option<PathBuf>,
     },
+    /// Expands a selected-pairs CSV into a concrete-pool manifest, merging the
+    /// pools from two enumerated catalogs that carry the selected pairs
+    /// (read-only, offline).
+    BuildManifest {
+        /// Enumerated catalog A (e.g. v3) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        a: PathBuf,
+        /// Enumerated catalog B (e.g. v4) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        b: PathBuf,
+        /// `gap-vs-toll --csv` selection output (`token_lo,token_hi,...`).
+        #[arg(long)]
+        selection: PathBuf,
+        /// Hard cap on manifest pool rows (mirrors the catalog manifest cap).
+        #[arg(long, default_value_t = 2_000)]
+        pool_cap: usize,
+        #[arg(value_name = "OUT")]
+        out: PathBuf,
+    },
 }
 
 fn main() {
@@ -285,6 +304,13 @@ fn main() {
             max_skew,
             csv: csv.as_deref(),
         }),
+        Command::BuildManifest {
+            a,
+            b,
+            selection,
+            pool_cap,
+            out,
+        } => build_manifest_command(&a, &b, &selection, pool_cap, &out),
     };
     if let Err(error) = outcome {
         eprintln!("error: {error}");
@@ -427,6 +453,80 @@ fn measure_cross_venues_command(
         report.toll_free_cross_pairs,
         report.three_hop_cycles,
         report.cross_tokens,
+    );
+    Ok(())
+}
+
+/// Expands a `gap-vs-toll --csv` pair selection into a concrete-pool manifest
+/// by keeping, from both enumerated catalogs, every pool whose normalized pair
+/// is in the selection. Manifest rows keep each pool's catalog lineage so
+/// `enumerate-pools` readers can re-load them. Read-only; requires no RPC.
+fn build_manifest_command(
+    a_path: &std::path::Path,
+    b_path: &std::path::Path,
+    selection_path: &std::path::Path,
+    pool_cap: usize,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let catalog_a = gaps::load_catalog(a_path)?;
+    let catalog_b = gaps::load_catalog(b_path)?;
+    let catalog_a: Vec<_> = catalog_a.into_values().collect();
+    let catalog_b: Vec<_> = catalog_b.into_values().collect();
+    let selected = gaps::load_selected_pairs(selection_path)?;
+    if selected.is_empty() {
+        return Err("selection contains no pairs".to_owned());
+    }
+    let mut entries = gaps::expand_manifest_catalog(&catalog_a, &catalog_b, &selected, pool_cap)?;
+    entries.sort_by_key(|entry| {
+        (
+            entry.chain_id,
+            entry.factory,
+            entry.profile,
+            entry.venue,
+            entry.id,
+        )
+    });
+    let mut writer =
+        std::io::BufWriter::new(std::fs::File::create(out).map_err(|error| error.to_string())?);
+    writeln!(
+        writer,
+        "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source"
+    )
+    .map_err(|error| error.to_string())?;
+    for entry in &entries {
+        let pool_id = if entry.profile == *b"v4" {
+            let mut hex = String::with_capacity(66);
+            hex.push_str("0x");
+            for byte in entry.id {
+                use std::fmt::Write as _;
+                write!(hex, "{byte:02x}").map_err(|error| error.to_string())?;
+            }
+            hex
+        } else {
+            String::new()
+        };
+        let profile = std::str::from_utf8(&entry.profile)
+            .map_err(|_| "catalog profile is not utf8".to_owned())?;
+        writeln!(
+            writer,
+            "{},{},{},{},{},{},{},{profile},{pool_id},selection",
+            entry.chain_id,
+            entry.venue,
+            entry.factory,
+            entry.token0,
+            entry.token1,
+            entry.fee,
+            entry.fee_denominator,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    println!(
+        "manifest: {} pool rows from {} selected pairs -> {}",
+        entries.len(),
+        selected.len(),
+        out.display()
     );
     Ok(())
 }

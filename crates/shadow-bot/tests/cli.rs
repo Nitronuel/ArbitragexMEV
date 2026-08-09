@@ -327,3 +327,68 @@ fn gap_vs_toll_rejects_full_history_without_route_to_block() {
     );
     assert!(!output.status.success());
 }
+
+#[test]
+fn build_manifest_expands_selection_offline() {
+    let directory = tempfile::tempdir().unwrap();
+    let v3 = directory.path().join("v3.csv");
+    let v4 = directory.path().join("v4.csv");
+    let selection = directory.path().join("selection.csv");
+    let out = directory.path().join("manifest.csv");
+    let a = "0x1000000000000000000000000000000000000000";
+    let b = "0x2000000000000000000000000000000000000000";
+    let (lo, hi) = {
+        let a_addr: alloy_primitives::Address = a.parse().unwrap();
+        let b_addr: alloy_primitives::Address = b.parse().unwrap();
+        if a_addr <= b_addr { (a, b) } else { (b, a) }
+    };
+    fs::write(
+        &v3,
+        &format!(
+            "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+             4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n"
+        ),
+    )
+    .unwrap();
+    let id = "22".repeat(32);
+    fs::write(
+        &v4,
+        &format!(
+            "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+             4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},2500,1000000,v4,0x{id},\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &selection,
+        &format!(
+            "token_lo,token_hi,log2_skew,toll,margin\n\
+         {lo},{hi},0.100000,0.005000,0.095000\n",
+            lo = lo,
+            hi = b,
+        ),
+    )
+    .unwrap();
+    let output = run(
+        &[
+            "build-manifest",
+            "--a",
+            v3.to_str().unwrap(),
+            "--b",
+            v4.to_str().unwrap(),
+            "--selection",
+            selection.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let rendered = stdout(&output);
+    assert!(rendered.contains("manifest: 2 pool rows from 1 selected pairs"));
+    let rows = fs::read_to_string(&out).unwrap();
+    let lower = rows.to_lowercase();
+    assert!(lower.contains("0xfa00000000000000000000000000000000000001"));
+    assert!(lower.contains("0x8366a39cc670b4001a1121b8f6a443a643e40951"));
+    assert!(rows.contains(",v3,,"));
+    assert!(rows.contains(",v4,0x22"));
+}
