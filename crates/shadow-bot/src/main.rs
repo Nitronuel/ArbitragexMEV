@@ -260,6 +260,48 @@ enum Command {
         #[arg(long)]
         csv: Option<PathBuf>,
     },
+    /// Polls live Swap prices from the chain tip and re-checks only the
+    /// cross-venue pairs touched by each changed pool, gating each re-quote
+    /// through the conservative economics floor (read-only).
+    RunPairs {
+        /// Enumerated catalog A (e.g. v3) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        a: PathBuf,
+        /// Enumerated catalog B (e.g. v4) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        b: PathBuf,
+        /// Restrict the live sweep to the pools of this manifest CSV (the
+        /// selected-seed list), instead of the full catalogs in `--a`/`--b`.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Venue label for catalog A, one of `v3` or `v4`.
+        #[arg(long, default_value = "v3")]
+        profile_a: String,
+        /// Venue label for catalog B, one of `v3` or `v4`.
+        #[arg(long, default_value = "v4")]
+        profile_b: String,
+        /// v4 `PoolManager` contract address (only required when a profile is v4).
+        #[arg(long)]
+        pool_manager: Option<Address>,
+        /// Base chain endpoint URL.
+        #[arg(long)]
+        rpc: String,
+        /// Block to poll from (inclusive); defaults to the current tip.
+        #[arg(long)]
+        from: Option<u64>,
+        /// Poll cadence in milliseconds.
+        #[arg(long, default_value_t = 1000)]
+        poll_ms: u64,
+        /// Drained swap events after which the loop stops (0 = unbounded).
+        #[arg(long, default_value_t = 0)]
+        max_swaps: u64,
+        /// Width of each `eth_getLogs` window in blocks.
+        #[arg(long, default_value_t = 50_000)]
+        window: u64,
+        /// Minimum poll delay between `eth_getLogs` requests.
+        #[arg(long, default_value_t = 600)]
+        delay_ms: u64,
+    },
 }
 
 #[allow(clippy::too_many_lines)]
@@ -376,6 +418,33 @@ fn main() {
             window,
             delay_ms,
             csv: csv.as_deref(),
+        }),
+        Command::RunPairs {
+            a,
+            b,
+            manifest,
+            profile_a,
+            profile_b,
+            pool_manager,
+            rpc,
+            from,
+            poll_ms,
+            max_swaps,
+            window,
+            delay_ms,
+        } => run_pairs_command(&RunPairsArgs {
+            a: &a,
+            b: &b,
+            manifest: manifest.as_deref(),
+            profile_a: &profile_a,
+            profile_b: &profile_b,
+            pool_manager,
+            rpc: &rpc,
+            from,
+            poll_ms,
+            max_swaps,
+            window,
+            delay_ms,
         }),
     };
     if let Err(error) = outcome {
@@ -903,6 +972,190 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
         }
         println!("wrote {} quotes -> {}", quotes.len(), path.display());
     }
+    Ok(())
+}
+
+/// Arguments for [`run_pairs_command`].
+struct RunPairsArgs<'a> {
+    a: &'a PathBuf,
+    b: &'a PathBuf,
+    manifest: Option<&'a std::path::Path>,
+    profile_a: &'a str,
+    profile_b: &'a str,
+    pool_manager: Option<Address>,
+    rpc: &'a str,
+    from: Option<u64>,
+    poll_ms: u64,
+    max_swaps: u64,
+    window: u64,
+    delay_ms: u64,
+}
+
+/// Polls Swap events from the chain tip and re-checks only the cross-venue
+/// pairs touched by changed pools, draining each batch through the dirty-set
+/// evaluator and the conservative economics gate. Read-only: prices are cached
+/// locally from Swap logs, never `eth_call`ed per quote; nothing is submitted.
+#[allow(clippy::too_many_lines)]
+fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
+    let a_path: &std::path::Path = args.a;
+    let b_path: &std::path::Path = args.b;
+    let manifest_path = args.manifest;
+    let profile_a = args.profile_a;
+    let profile_b = args.profile_b;
+    let pool_manager: Option<Address> = args.pool_manager;
+    let rpc_url = args.rpc;
+    let from = args.from;
+    let poll_ms = args.poll_ms;
+    let max_swaps = args.max_swaps;
+    let window = args.window;
+    let delay_ms = args.delay_ms;
+    let profile_bytes_a: [u8; 2] = profile_a
+        .as_bytes()
+        .try_into()
+        .map_err(|_| format!("profile_a must be exactly 2 bytes, got {profile_a}"))?;
+    let profile_bytes_b: [u8; 2] = profile_b
+        .as_bytes()
+        .try_into()
+        .map_err(|_| format!("profile_b must be exactly 2 bytes, got {profile_b}"))?;
+    for (label, profile) in [(profile_a, &profile_bytes_a), (profile_b, &profile_bytes_b)] {
+        if profile != b"v3" && profile != b"v4" {
+            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        }
+    }
+
+    let http_url: RedactedUrl = rpc_url
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let budget = ProviderBudget::new(40_000, 1 << 24);
+    let retry = RetryPolicy {
+        max_retries: 8,
+        initial_delay: Duration::from_millis(600),
+        max_delay: Duration::from_secs(12),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url.clone()),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+        4663,
+    );
+
+    let (a_entries, b_entries) = if let Some(path) = manifest_path {
+        gaps::restrict_to_manifest(path, profile_bytes_a, profile_bytes_b)?
+    } else {
+        let catalog_a = gaps::load_catalog(a_path)?;
+        let catalog_b = gaps::load_catalog(b_path)?;
+        (
+            catalog_a.into_values().collect::<Vec<_>>(),
+            catalog_b.into_values().collect::<Vec<_>>(),
+        )
+    };
+    if a_entries.is_empty() || b_entries.is_empty() {
+        return Err(format!(
+            "no pools for profiles v{} on both venues",
+            profile_bytes_a[1]
+        ));
+    }
+
+    let economics = Economics {
+        flash_fee_rate: U256::ZERO,
+        gas_cost_usd: U256::from(1_000),
+        expected_win_rate: U256::from(FIXED_POINT_SCALE),
+    };
+    let reference = CostSnapshot {
+        usd_per_token: U256::from(FIXED_POINT_SCALE),
+        gas_price_age_valid: true,
+        reference_price_valid: true,
+    };
+    let queue_capacity = a_entries.len() + b_entries.len();
+    let mut evaluator =
+        dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, queue_capacity);
+    evaluator.set_reference(reference);
+
+    let start = match from {
+        Some(block) => block,
+        None => reader.current_block().map_err(|e| e.to_string())?,
+    };
+    let stop = StopOnSignal::install();
+    let poll = Duration::from_millis(poll_ms);
+    let delay = Duration::from_millis(delay_ms);
+    let since = std::time::Instant::now();
+    let mut high_water = start;
+    let mut applied = 0u64;
+    let mut evals = 0usize;
+    let mut interesting = 0usize;
+    let mut not_evaluated = 0usize;
+    let mut last_window = 0u64;
+
+    loop {
+        if stop.flag.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        if max_swaps != 0 && applied >= max_swaps {
+            break;
+        }
+        let latest = reader.current_block().map_err(|e| e.to_string())?;
+        if latest <= high_water {
+            std::thread::sleep(poll);
+            continue;
+        }
+        let window_from = high_water + 1;
+        let priced_a = gaps::sweep_swap_prices(
+            &reader,
+            profile_bytes_a,
+            pool_manager.unwrap_or(V4_POOL_MANAGER),
+            &a_entries,
+            window_from,
+            latest,
+            window,
+            delay,
+        )
+        .map_err(|e| e.to_string())?;
+        let priced_b = gaps::sweep_swap_prices(
+            &reader,
+            profile_bytes_b,
+            pool_manager.unwrap_or(V4_POOL_MANAGER),
+            &b_entries,
+            window_from,
+            latest,
+            window,
+            delay,
+        )
+        .map_err(|e| e.to_string())?;
+        let applied_this = priced_a.len() + priced_b.len();
+        applied = applied.saturating_add(applied_this as u64);
+        evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
+        evaluator.seed_prices(profile_bytes_b, &b_entries, &priced_b)?;
+        let outcome = evaluator.run_once();
+        evals += outcome.evaluated.len();
+        interesting += outcome.interesting.len();
+        not_evaluated += outcome.not_evaluated.len();
+        last_window = latest;
+        high_water = latest;
+        println!(
+            "run-pairs: poll {}-{} priced a={} b={} evals={} gated={} dirty={}",
+            window_from,
+            latest,
+            priced_a.len(),
+            priced_b.len(),
+            outcome.evaluated.len(),
+            outcome.interesting.len(),
+            outcome.not_evaluated.len(),
+        );
+        std::thread::sleep(poll);
+    }
+
+    let dirty_now = evaluator.queue_len();
+    println!(
+        "run-pairs: done at block {} applied={} evals={} gated={} not_evaluated={} dirty={} elapsed_s={}",
+        last_window,
+        applied,
+        evals,
+        interesting,
+        not_evaluated,
+        dirty_now,
+        since.elapsed().as_secs(),
+    );
     Ok(())
 }
 
