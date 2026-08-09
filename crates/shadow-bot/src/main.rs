@@ -222,8 +222,42 @@ enum Command {
         #[arg(value_name = "OUT")]
         out: PathBuf,
     },
+    /// Samples live Swap prices over the enumerated manifest and emits the
+    /// closed-form optimal round-trip quote per cross-venue pair (read-only).
+    QuoteManifest {
+        /// Enumerated catalog A (e.g. v3) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        a: PathBuf,
+        /// Enumerated catalog B (e.g. v4) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        b: PathBuf,
+        /// Venue label for catalog A, one of `v3` or `v4`.
+        #[arg(long, default_value = "v3")]
+        profile_a: String,
+        /// Venue label for catalog B, one of `v3` or `v4`.
+        #[arg(long, default_value = "v4")]
+        profile_b: String,
+        /// v4 `PoolManager` contract address (only required when a profile is v4).
+        #[arg(long)]
+        pool_manager: Option<Address>,
+        /// Base chain endpoint URL.
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        from: u64,
+        #[arg(long)]
+        to: u64,
+        #[arg(long, default_value_t = 50_000)]
+        window: u64,
+        #[arg(long, default_value_t = 600)]
+        delay_ms: u64,
+        /// Write one quote row per captureable pair to this path (overwrites).
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let cli = Cli::parse();
     let outcome = match cli.command {
@@ -311,6 +345,31 @@ fn main() {
             pool_cap,
             out,
         } => build_manifest_command(&a, &b, &selection, pool_cap, &out),
+        Command::QuoteManifest {
+            a,
+            b,
+            profile_a,
+            profile_b,
+            pool_manager,
+            rpc,
+            from,
+            to,
+            window,
+            delay_ms,
+            csv,
+        } => quote_manifest_command(&QuoteManifestArgs {
+            a: &a,
+            b: &b,
+            profile_a: &profile_a,
+            profile_b: &profile_b,
+            pool_manager,
+            rpc: &rpc,
+            from,
+            to,
+            window,
+            delay_ms,
+            csv: csv.as_deref(),
+        }),
     };
     if let Err(error) = outcome {
         eprintln!("error: {error}");
@@ -549,6 +608,21 @@ struct GapVsTollArgs<'a> {
     csv: Option<&'a std::path::Path>,
 }
 
+/// Arguments for [`quote_manifest_command`].
+struct QuoteManifestArgs<'a> {
+    a: &'a PathBuf,
+    b: &'a PathBuf,
+    profile_a: &'a str,
+    profile_b: &'a str,
+    pool_manager: Option<Address>,
+    rpc: &'a str,
+    from: u64,
+    to: u64,
+    window: u64,
+    delay_ms: u64,
+    csv: Option<&'a std::path::Path>,
+}
+
 /// Samples live Swap prices across two catalogs and reports the skew-vs-toll
 /// distribution. Read-only; no signing or submission.
 #[allow(clippy::too_many_lines)]
@@ -667,6 +741,113 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// Samples live prices over the enumerated pair overlap and emits the closed
+/// form optimal round trip per captureable pair (positive-profit cycles only).
+fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
+    use std::io::Write;
+
+    let a_path: &std::path::Path = args.a;
+    let b_path: &std::path::Path = args.b;
+    let profile_a = args.profile_a;
+    let profile_b = args.profile_b;
+    let pool_manager = args.pool_manager;
+    let from = args.from;
+    let to = args.to;
+    let window = args.window;
+    let delay_ms = args.delay_ms;
+    let csv_path = args.csv;
+
+    let profile_bytes_a: [u8; 2] = profile_a
+        .as_bytes()
+        .try_into()
+        .map_err(|_| format!("profile_a must be exactly 2 bytes, got {profile_a}"))?;
+    let profile_bytes_b: [u8; 2] = profile_b
+        .as_bytes()
+        .try_into()
+        .map_err(|_| format!("profile_b must be exactly 2 bytes, got {profile_b}"))?;
+    for (label, profile) in [(profile_a, &profile_bytes_a), (profile_b, &profile_bytes_b)] {
+        if profile != b"v3" && profile != b"v4" {
+            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        }
+    }
+
+    let http_url: RedactedUrl = args
+        .rpc
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let budget = ProviderBudget::new(40_000, 1 << 24);
+    let retry = RetryPolicy {
+        max_retries: 8,
+        initial_delay: Duration::from_millis(600),
+        max_delay: Duration::from_secs(12),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url.clone()),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+        8453,
+    );
+
+    let catalog_a = gaps::load_catalog(a_path)?;
+    let catalog_b = gaps::load_catalog(b_path)?;
+    let a_entries: Vec<_> = catalog_a.into_values().collect();
+    let b_entries: Vec<_> = catalog_b.into_values().collect();
+    let priced_a = gaps::sweep_swap_prices(
+        &reader,
+        profile_bytes_a,
+        pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &a_entries,
+        from,
+        to,
+        window,
+        Duration::from_millis(delay_ms),
+    )
+    .map_err(|e| e.to_string())?;
+    let priced_b = gaps::sweep_swap_prices(
+        &reader,
+        profile_bytes_b,
+        pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &b_entries,
+        from,
+        to,
+        window,
+        Duration::from_millis(delay_ms),
+    )
+    .map_err(|e| e.to_string())?;
+    let quotes = gaps::quote_manifest(&a_entries, &b_entries, &priced_a, &priced_b);
+    println!(
+        "quote-manifest: pools a={} b={} priced a={} b={} captureable={}",
+        a_entries.len(),
+        b_entries.len(),
+        priced_a.len(),
+        priced_b.len(),
+        quotes.len(),
+    );
+    if let Some(path) = csv_path {
+        let mut out =
+            std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+        writeln!(out, "token_lo,token_hi,input,output,profit,toll,log2_skew")
+            .map_err(|e| e.to_string())?;
+        for quote in &quotes {
+            writeln!(
+                out,
+                "{},{},{},{},{},{:.6},{:.6}",
+                quote.token_lo,
+                quote.token_hi,
+                quote.input,
+                quote.output,
+                quote.profit,
+                quote.toll,
+                quote.log2_skew,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        println!("wrote {} quotes -> {}", quotes.len(), path.display());
     }
     Ok(())
 }

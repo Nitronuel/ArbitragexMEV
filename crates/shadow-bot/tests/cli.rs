@@ -238,6 +238,8 @@ fn help_has_no_signing_or_send_command() {
         "daily-report",
         "measure-cross-venues",
         "gap-vs-toll",
+        "build-manifest",
+        "quote-manifest",
     ] {
         assert!(help.contains(command));
     }
@@ -391,4 +393,39 @@ fn build_manifest_expands_selection_offline() {
     assert!(lower.contains("0x8366a39cc670b4001a1121b8f6a443a643e40951"));
     assert!(rows.contains(",v3,,"));
     assert!(rows.contains(",v4,0x22"));
+}
+
+#[test]
+fn quote_manifest_rejects_unknown_venue_without_rpc_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let csv = directory.path().join("pools.csv");
+    fs::write(
+        &csv,
+        "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+         4663,0xfa00000000000000000000000000000000000001,0x0000000000000000000000000000000000000000,0x1000000000000000000000000000000000000000,0x2000000000000000000000000000000000000000,3000,1000000,v3,,\n",
+    )
+    .unwrap();
+    // Venue validation precedes any RPC call, so this must fail fast offline.
+    let output = run(
+        &[
+            "quote-manifest",
+            "--a",
+            csv.to_str().unwrap(),
+            "--b",
+            csv.to_str().unwrap(),
+            "--profile-a",
+            "v1",
+            "--profile-b",
+            "v4",
+            "--rpc",
+            "https://example.test/rpc",
+            "--from",
+            "1",
+            "--to",
+            "2",
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("unsupported venue"));
 }

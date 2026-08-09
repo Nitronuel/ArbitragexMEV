@@ -16,6 +16,7 @@ serde_json.workspace = true
 shadow = { path = "../shadow" }
 signal-hook.workspace = true
 storage = { path = "../storage" }
+v2-math = { path = "../v2-math" }
 
 [dev-dependencies]
 tempfile.workspace = true

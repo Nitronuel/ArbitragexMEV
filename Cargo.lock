@@ -2537,6 +2537,7 @@ dependencies = [
  "signal-hook",
  "storage",
  "tempfile",
+ "v2-math",
 ]
 
 [[package]]

@@ -191,6 +191,9 @@ pub fn pair_key(a: Address, b: Address) -> ([u8; 20], [u8; 20]) {
 #[derive(Debug, Clone, Copy)]
 pub struct PoolPrice {
     pub sqrt: U256,
+    /// Post-swap in-range liquidity, carried so concentrated (v3/v4) pools can
+    /// be reduced to virtual constant-product reserves at the sampled price.
+    pub liquidity: U256,
     pub block: u64,
 }
 
@@ -274,7 +277,7 @@ where
             let Ok(envelope) = RawLogEnvelope::from_rpc_value(raw) else {
                 continue;
             };
-            let (key, sqrt): (Option<[u8; 32]>, Option<U256>) = if profile == *b"v4" {
+            let (key, parsed): (Option<[u8; 32]>, Option<(U256, U256)>) = if profile == *b"v4" {
                 if envelope.topics.len() < 2 {
                     (None, None)
                 } else {
@@ -282,7 +285,7 @@ where
                     if keep_ids.is_some_and(|m| m.contains(&id)) {
                         (
                             Some(id),
-                            decode_v4_swap(&envelope).map(|s| s.sqrt_price_x96),
+                            decode_v4_swap(&envelope).map(|s| (s.sqrt_price_x96, s.liquidity)),
                         )
                     } else {
                         (None, None)
@@ -292,13 +295,18 @@ where
                 let key = envelope.address.into_word().into();
                 (
                     Some(key),
-                    decode_v3_swap(&envelope).map(|s| s.sqrt_price_x96),
+                    decode_v3_swap(&envelope).map(|s| (s.sqrt_price_x96, s.liquidity)),
                 )
             };
-            if let (Some(key), Some(sqrt)) = (key, sqrt) {
-                let entry = latest.entry(key).or_insert(PoolPrice { sqrt, block: 0 });
+            if let (Some(key), Some((sqrt, liquidity))) = (key, parsed) {
+                let entry = latest.entry(key).or_insert(PoolPrice {
+                    sqrt,
+                    liquidity,
+                    block: 0,
+                });
                 if envelope.block_number >= entry.block {
                     entry.sqrt = sqrt;
+                    entry.liquidity = liquidity;
                     entry.block = envelope.block_number;
                 }
             }
@@ -559,6 +567,194 @@ pub fn gap_rankings(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     ranks
+}
+
+/// A single pair-level closed-form optimal quote over one cross-venue cycle:
+/// buy on the cheaper venue, sell on the dearer, sized so profit is maximal.
+#[derive(Debug, Clone, Copy)]
+pub struct PairQuote {
+    pub token_lo: Address,
+    pub token_hi: Address,
+    /// Optimal amount of `token_lo` to put in.
+    pub input: U256,
+    /// `token_lo` returned after the round trip.
+    pub output: U256,
+    /// `output - input` in `token_lo` units.
+    pub profit: U256,
+    /// Combined round-trip toll (fees) of the two used legs.
+    pub toll: f64,
+    /// Observed log2 price skew across the two legs.
+    pub log2_skew: f64,
+}
+
+/// Reduces a concentrated pool's sampled state to the virtual constant-product
+/// reserves at the sampled price, at which `x*y = L²` and `y/x = price` hold.
+/// `sqrt` is the `Q64.96` post-swap price, `liquidity` the in-range `L`.
+#[must_use]
+pub fn virtual_reserves(sqrt: U256, liquidity: U256) -> (U256, U256) {
+    const ONE: U256 = U256::from_limbs([1, 0, 0, 0]);
+    let two_96: U256 = ONE << 96;
+    let reserve0 = liquidity * two_96 / sqrt.max(U256::from(1));
+    let reserve1 = liquidity * sqrt / two_96;
+    (reserve0, reserve1)
+}
+
+/// Builds the 2-hop cycle for one cross-venue pair and solves the closed-form
+/// optimal input with the sampled virtual reserves. Picks the tighter
+/// (cheaper-fee) pool per venue for the legs.
+///
+/// # Errors
+///
+/// Returns a message describing malformed cycles or missing state.
+pub fn quote_pair(
+    a_entries: &[PoolEntry],
+    b_entries: &[PoolEntry],
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+) -> Result<Option<PairQuote>, String> {
+    use domain::{Cycle, CycleHop, CycleId, Fee, PoolId, PoolState, StateVersion};
+    use v2_math::{OptimalQuote, optimal_input};
+
+    let best_leg = |entries: &[PoolEntry],
+                    prices: &HashMap<[u8; 32], PoolPrice>|
+     -> Option<(PoolEntry, PoolPrice, f64)> {
+        let mut best: Option<(PoolEntry, PoolPrice, f64)> = None;
+        for entry in entries {
+            let Some(price) = prices.get(&pool_key(entry)) else {
+                continue;
+            };
+            let Some(toll) = leg_toll(entry.fee, entry.profile) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(_, _, t)| toll < *t) {
+                best = Some((*entry, *price, toll));
+            }
+        }
+        best
+    };
+    let (leg_a, leg_price_a, toll_a) =
+        best_leg(a_entries, prices_a).ok_or("venue A has no priced leg")?;
+    let (leg_b, leg_price_b, toll_b) =
+        best_leg(b_entries, prices_b).ok_or("venue B has no priced leg")?;
+
+    let pair = pair_key(leg_a.token0, leg_a.token1);
+    let anchor = Address::from_slice(&pair.0);
+    let other = Address::from_slice(&pair.1);
+
+    let make_cycle =
+        |first: PoolEntry, first_price: PoolPrice, second: PoolEntry, second_price: PoolPrice| {
+            let (r0a, r1a) = virtual_reserves(first_price.sqrt, first_price.liquidity);
+            let (r0b, r1b) = virtual_reserves(second_price.sqrt, second_price.liquidity);
+            let states = vec![
+                PoolState {
+                    reserve0: r0a,
+                    reserve1: r1a,
+                    block_number: first_price.block,
+                    transaction_index: 0,
+                    log_index: 0,
+                    version: StateVersion(first_price.block),
+                },
+                PoolState {
+                    reserve0: r0b,
+                    reserve1: r1b,
+                    block_number: second_price.block,
+                    transaction_index: 0,
+                    log_index: 0,
+                    version: StateVersion(second_price.block),
+                },
+            ];
+            // The manifest fee is the fraction *taken* (e.g. 3000/1_000_000);
+            // v2-math expects the fraction *retained* as its numerator.
+            let fee = |entry: PoolEntry| Fee {
+                numerator: entry.fee_denominator.saturating_sub(entry.fee),
+                denominator: entry.fee_denominator,
+            };
+            let cycle = Cycle {
+                id: CycleId(0),
+                anchor,
+                hops: vec![
+                    CycleHop {
+                        pool_id: PoolId(0),
+                        token_in: anchor,
+                        token_out: other,
+                        fee: fee(first),
+                        zero_for_one: first.token0 == anchor,
+                    },
+                    CycleHop {
+                        pool_id: PoolId(1),
+                        token_in: other,
+                        token_out: anchor,
+                        fee: fee(second),
+                        zero_for_one: second.token0 == other,
+                    },
+                ],
+            };
+            optimal_input(&cycle, &states)
+        };
+
+    let mut best: Option<(OptimalQuote, f64)> = make_cycle(leg_a, leg_price_a, leg_b, leg_price_b)
+        .map_err(|e| format!("optimal input failed: {e}"))?
+        .map(|quote| (quote, toll_a + toll_b));
+    if best.is_none() {
+        best = make_cycle(leg_b, leg_price_b, leg_a, leg_price_a)
+            .ok()
+            .flatten()
+            .map(|quote| (quote, toll_a + toll_b));
+    }
+    let Some((quote, toll)) = best else {
+        return Ok(None);
+    };
+    let skew = (price_out(leg_price_b.sqrt) / price_out(leg_price_a.sqrt).max(1e-30))
+        .max(1e-30)
+        .log2()
+        .abs();
+    Ok(Some(PairQuote {
+        token_lo: anchor,
+        token_hi: other,
+        input: quote.input,
+        output: quote.output,
+        profit: quote.profit,
+        toll,
+        log2_skew: skew,
+    }))
+}
+
+/// Quotes every cross-venue pair that has at least one priced leg on each
+/// venue and returns the captureable quotes (positive-profit round trips),
+/// sorted by profit in input-token units, largest first.
+type PoolByPair = HashMap<([u8; 20], [u8; 20]), (Vec<PoolEntry>, Vec<PoolEntry>)>;
+#[must_use]
+pub fn quote_manifest(
+    a: &[PoolEntry],
+    b: &[PoolEntry],
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+) -> Vec<PairQuote> {
+    let mut by_pair: PoolByPair = HashMap::new();
+    for entry in a {
+        by_pair
+            .entry(pair_key(entry.token0, entry.token1))
+            .or_default()
+            .0
+            .push(*entry);
+    }
+    for entry in b {
+        if let Some((_a_pools, b_pools)) = by_pair.get_mut(&pair_key(entry.token0, entry.token1)) {
+            b_pools.push(*entry);
+        }
+    }
+    let mut out: Vec<PairQuote> = Vec::new();
+    for (a_pools, b_pools) in by_pair.into_values() {
+        if a_pools.is_empty() || b_pools.is_empty() {
+            continue;
+        }
+        if let Ok(Some(quote)) = quote_pair(&a_pools, &b_pools, prices_a, prices_b) {
+            out.push(quote);
+        }
+    }
+    out.sort_by_key(|quote| quote.profit);
+    out.reverse();
+    out
 }
 
 /// Combines the latest per-pool prices and computes gap-vs-toll aggregate
@@ -890,7 +1086,8 @@ mod tests {
         pa.insert(
             key3,
             PoolPrice {
-                sqrt: U256::from(2u64.pow(48) << 1),
+                sqrt: U256::from(1u64) << 97,
+                liquidity: U256::from(1_000u64),
                 block: 1,
             },
         );
@@ -898,7 +1095,8 @@ mod tests {
         pb.insert(
             key4,
             PoolPrice {
-                sqrt: U256::from(2u64.pow(48) << 2),
+                sqrt: U256::from(1u64) << 98,
+                liquidity: U256::from(1_000u64),
                 block: 1,
             },
         );
@@ -956,6 +1154,7 @@ mod tests {
             key3,
             PoolPrice {
                 sqrt: U256::from(2u64.pow(48) << 1),
+                liquidity: U256::from(1_000u64),
                 block: 1,
             },
         );
@@ -967,6 +1166,7 @@ mod tests {
             key4,
             PoolPrice {
                 sqrt: U256::from(1u64 << 47),
+                liquidity: U256::from(1_000u64),
                 block: 1,
             },
         );
@@ -1084,5 +1284,264 @@ mod tests {
         // The zero-fee v4 row must be dropped; only the v3 leg survives.
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].profile, *b"v3");
+    }
+
+    #[test]
+    fn virtual_reserves_is_consistent_with_liquidity() {
+        // At Q64.96 sqrt == 2^96 the price is 1.0, so virtual reserves equal L.
+        let (r0, r1) = virtual_reserves(U256::from(1u64) << 96, U256::from(1_000_000u64));
+        assert_eq!(r0, U256::from(1_000_000u64));
+        assert_eq!(r1, U256::from(1_000_000u64));
+
+        // Doubling sqrt halves reserve0 and doubles reserve1 (price moves up).
+        let (r0b, r1b) = virtual_reserves(U256::from(1u64) << 97, U256::from(1_000_000u64));
+        assert_eq!(r0b, U256::from(500_000u64));
+        assert_eq!(r1b, U256::from(2_000_000u64));
+    }
+
+    #[test]
+    fn quote_pair_profits_when_skew_exceeds_toll() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let a = "0x1000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        let p3 = dir.path().join("v3.csv");
+        let p4 = dir.path().join("v4.csv");
+        {
+            let mut f = std::fs::File::create(&p3).unwrap();
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n"
+            )
+            .unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&p4).unwrap();
+            let id = "33".repeat(32);
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},2500,1000000,v4,0x{id},\n"
+            )
+            .unwrap();
+        }
+        let m3 = load_catalog(&p3).unwrap();
+        let m4 = load_catalog(&p4).unwrap();
+        let a_entries: Vec<_> = m3.into_values().collect();
+        let b_entries: Vec<_> = m4.into_values().collect();
+
+        let mut pa = HashMap::new();
+        pa.insert(
+            a_entries[0].venue.into_word().into(),
+            PoolPrice {
+                sqrt: U256::from(1u64) << 97,
+                liquidity: U256::from(1_000_000_000u64),
+                block: 1,
+            },
+        );
+        let mut pb = HashMap::new();
+        pb.insert(
+            b_entries[0].id,
+            PoolPrice {
+                sqrt: U256::from(1u64) << 98,
+                liquidity: U256::from(1_000_000_000u64),
+                block: 1,
+            },
+        );
+
+        let quote = quote_pair(&a_entries, &b_entries, &pa, &pb)
+            .unwrap()
+            .expect("profitable pair must produce a quote");
+        assert_eq!(quote.token_lo, a_entries[0].token0);
+        assert_eq!(quote.token_hi, a_entries[0].token1);
+        assert!(quote.profit > U256::ZERO);
+        assert!(quote.log2_skew >= 1.9); // ~2 as built above.
+        assert!(quote.toll > 0.0);
+    }
+
+    #[test]
+    fn quote_pair_requires_a_priced_leg_on_both_venues() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let a = "0x1000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        let p3 = dir.path().join("v3.csv");
+        let p4 = dir.path().join("v4.csv");
+        {
+            let mut f = std::fs::File::create(&p3).unwrap();
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n"
+            )
+            .unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&p4).unwrap();
+            let id = "33".repeat(32);
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},2500,1000000,v4,0x{id},\n"
+            )
+            .unwrap();
+        }
+        let m3 = load_catalog(&p3).unwrap();
+        let m4 = load_catalog(&p4).unwrap();
+        let a_entries: Vec<_> = m3.into_values().collect();
+        let b_entries: Vec<_> = m4.into_values().collect();
+
+        // No prices on either side -> no legs to quote.
+        let pa = HashMap::new();
+        let pb = HashMap::new();
+        assert!(quote_pair(&a_entries, &b_entries, &pa, &pb).is_err());
+
+        // Price only on one venue -> no cycle forms.
+        let mut pa = HashMap::new();
+        pa.insert(
+            a_entries[0].venue.into_word().into(),
+            PoolPrice {
+                sqrt: U256::from(1u64) << 97,
+                liquidity: U256::from(1_000_000u64),
+                block: 1,
+            },
+        );
+        assert!(quote_pair(&a_entries, &b_entries, &pa, &pb).is_err());
+    }
+
+    #[test]
+    fn quote_manifest_returns_only_captureable_pairs() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let a = "0x1000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        let red = "0x3000000000000000000000000000000000000000";
+        let p3 = dir.path().join("v3.csv");
+        let p4 = dir.path().join("v4.csv");
+        {
+            let mut f = std::fs::File::create(&p3).unwrap();
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n\
+                 4663,0xfb00000000000000000000000000000000000002,0x1111111111111111111111111111111111111111,{a},{red},3000,1000000,v3,,\n"
+            )
+            .unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&p4).unwrap();
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},2500,1000000,v4,0x{},\n"
+                , "11".repeat(32)
+            )
+            .unwrap();
+        }
+        let m3 = load_catalog(&p3).unwrap();
+        let m4 = load_catalog(&p4).unwrap();
+        let a_entries: Vec<_> = m3.into_values().collect();
+        let b_entries: Vec<_> = m4.into_values().collect();
+        assert!(a_entries.len() == 2 && b_entries.len() == 1);
+
+        let mut pa = HashMap::new();
+        for entry in &a_entries {
+            pa.insert(
+                entry.venue.into_word().into(),
+                PoolPrice {
+                    sqrt: U256::from(1u64) << 97,
+                    liquidity: U256::from(1_000_000_000u64),
+                    block: 1,
+                },
+            );
+        }
+        let mut pb = HashMap::new();
+        pb.insert(
+            b_entries[0].id,
+            PoolPrice {
+                sqrt: U256::from(1u64) << 98,
+                liquidity: U256::from(1_000_000_000u64),
+                block: 1,
+            },
+        );
+
+        let quotes = quote_manifest(&a_entries, &b_entries, &pa, &pb);
+        // Only the (a,b) pair has a leg on venue B, so only it can quote.
+        assert_eq!(quotes.len(), 1);
+        let a_addr: Address = a.parse().unwrap();
+        let b_addr: Address = b.parse().unwrap();
+        let wanted = pair_key(a_addr, b_addr);
+        assert_eq!(pair_key(quotes[0].token_lo, quotes[0].token_hi), wanted);
+        assert!(quotes[0].profit > U256::ZERO);
+    }
+
+    #[test]
+    fn quote_pair_skips_unpriced_legs_on_a_venue() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let a = "0x1000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        let p3 = dir.path().join("v3.csv");
+        let p4 = dir.path().join("v4.csv");
+        {
+            let mut f = std::fs::File::create(&p3).unwrap();
+            // Two v3 pools for the same pair; the first listed one will be
+            // left unpriced, the second carries the live price.
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n\
+                 4663,0xfb00000000000000000000000000000000000002,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n"
+            )
+            .unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&p4).unwrap();
+            let id = "33".repeat(32);
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},2500,1000000,v4,0x{id},\n"
+            )
+            .unwrap();
+        }
+        let m3 = load_catalog(&p3).unwrap();
+        let m4 = load_catalog(&p4).unwrap();
+        let a_entries: Vec<_> = m3.into_values().collect();
+        let b_entries: Vec<_> = m4.into_values().collect();
+        assert_eq!(a_entries.len(), 2);
+        assert_eq!(b_entries.len(), 1);
+
+        // Price only the second v3 pool (venue door `fb`).
+        let mut pa = HashMap::new();
+        pa.insert(
+            "0xfb00000000000000000000000000000000000002"
+                .parse::<Address>()
+                .unwrap()
+                .into_word()
+                .into(),
+            PoolPrice {
+                sqrt: U256::from(1u64) << 97,
+                liquidity: U256::from(1_000_000_000u64),
+                block: 1,
+            },
+        );
+        let mut pb = HashMap::new();
+        pb.insert(
+            b_entries[0].id,
+            PoolPrice {
+                sqrt: U256::from(1u64) << 98,
+                liquidity: U256::from(1_000_000_000u64),
+                block: 1,
+            },
+        );
+
+        // The unpriced leg must be skipped, not treated as "venue has no leg".
+        let quote = quote_pair(&a_entries, &b_entries, &pa, &pb)
+            .unwrap()
+            .expect("priced leg must be found despite an unpriced sibling");
+        assert_eq!(quote.token_lo, a_entries[0].token0);
+        assert!(quote.profit > U256::ZERO);
     }
 }
