@@ -346,7 +346,7 @@ fn build_manifest_expands_selection_offline() {
     };
     fs::write(
         &v3,
-        &format!(
+        format!(
             "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
              4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n"
         ),
@@ -355,7 +355,7 @@ fn build_manifest_expands_selection_offline() {
     let id = "22".repeat(32);
     fs::write(
         &v4,
-        &format!(
+        format!(
             "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
              4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},2500,1000000,v4,0x{id},\n"
         ),
@@ -363,11 +363,9 @@ fn build_manifest_expands_selection_offline() {
     .unwrap();
     fs::write(
         &selection,
-        &format!(
+        format!(
             "token_lo,token_hi,log2_skew,toll,margin\n\
          {lo},{hi},0.100000,0.005000,0.095000\n",
-            lo = lo,
-            hi = b,
         ),
     )
     .unwrap();

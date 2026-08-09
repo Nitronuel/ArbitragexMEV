@@ -23,6 +23,7 @@ use shadow::{
 use signal_hook::consts::{SIGINT, SIGTERM};
 use storage::Storage;
 
+mod dirty;
 mod enumerate;
 mod gaps;
 
@@ -841,13 +842,45 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let quotes = gaps::quote_manifest(&a_entries, &b_entries, &priced_a, &priced_b);
+
+    // Feed the sweep into the dirty-set evaluator: each swept price is applied
+    // as a local Swap event, marking only the pairs touched, then drained once
+    // and classified through the conservative economics gate.
+    let economics = Economics {
+        flash_fee_rate: U256::ZERO,
+        gas_cost_usd: U256::from(1_000),
+        expected_win_rate: U256::from(FIXED_POINT_SCALE),
+    };
+    let reference = CostSnapshot {
+        usd_per_token: U256::from(FIXED_POINT_SCALE),
+        gas_price_age_valid: true,
+        reference_price_valid: true,
+    };
+    let mut evaluator =
+        dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, quotes.len().max(1));
+    evaluator.set_reference(reference);
+    evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
+    evaluator.seed_prices(profile_bytes_b, &b_entries, &priced_b)?;
+    let dirty_depth = evaluator.queue_len();
+    let outcome = evaluator.run_once();
+
+    // Gate verdict on the single best quote, if any cleared the sweep.
+    let top_verdict = quotes
+        .first()
+        .and_then(|quote| evaluator.quote_pair(gaps::pair_key(quote.token_lo, quote.token_hi)))
+        .map(|(_, classification)| classification.reason);
+    let verdict = top_verdict.map_or_else(|| "none".to_owned(), |reason| format!("{reason:?}"));
+
     println!(
-        "quote-manifest: pools a={} b={} priced a={} b={} captureable={}",
+        "quote-manifest: pools a={} b={} priced a={} b={} captureable={} gated={} dirty={} best={}",
         a_entries.len(),
         b_entries.len(),
         priced_a.len(),
         priced_b.len(),
         quotes.len(),
+        outcome.interesting.len(),
+        dirty_depth,
+        verdict,
     );
     if let Some(path) = csv_path {
         let mut out =
