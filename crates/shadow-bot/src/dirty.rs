@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use alloy_primitives::{Address, U256};
 use shadow::{ClassificationReason, CostSnapshot, Economics};
 use v2_math::OptimalQuote;
 
@@ -78,6 +79,9 @@ pub struct PairDirtyEvaluator {
     profile_b: [u8; 2],
     prices_a: HashMap<[u8; 32], PoolPrice>,
     prices_b: HashMap<[u8; 32], PoolPrice>,
+    /// USD per whole token (fixed-point), keyed by normalized token address,
+    /// used to value each pair's anchor token instead of the `$1` fixture.
+    token_usd: HashMap<Address, U256>,
     queue: DirtyPairQueue,
     economics: Economics,
     reference: CostSnapshot,
@@ -145,6 +149,7 @@ impl PairDirtyEvaluator {
             profile_b: *b"v4",
             prices_a: HashMap::new(),
             prices_b: HashMap::new(),
+            token_usd: HashMap::new(),
             queue: DirtyPairQueue::new(queue_capacity),
             economics,
             reference: CostSnapshot::invalid(),
@@ -154,6 +159,30 @@ impl PairDirtyEvaluator {
     /// Sets the gas-price and reference-route inputs for classification.
     pub fn set_reference(&mut self, reference: CostSnapshot) {
         self.reference = reference;
+    }
+
+    /// Sets per-token USD prices (fixed-point) used to value each pair's
+    /// anchor token, replacing the `$1` fixture for known tokens. Unknown
+    /// tokens fall back to the reference's `usd_per_token`.
+    pub fn set_token_prices(&mut self, prices: HashMap<Address, U256>) {
+        self.token_usd = prices;
+    }
+
+    /// Classifies one pair's quote against the pair's anchor-token USD price.
+    fn classify_pair(&self, pair: PairKey, quote: &PairQuote) -> shadow::Classification {
+        let mut reference = self.reference;
+        let anchor = Address::from_slice(&pair.0);
+        if let Some(usd) = self.token_usd.get(&anchor)
+            && !usd.is_zero()
+        {
+            reference.usd_per_token = *usd;
+        }
+        let optimal = OptimalQuote {
+            input: quote.input,
+            output: quote.output,
+            profit: quote.profit,
+        };
+        self.economics.classify(&optimal, &reference)
     }
 
     /// Marks every pair indexed by the changed pool as dirty.
@@ -236,12 +265,7 @@ impl PairDirtyEvaluator {
             };
             outcome.evaluated.push(pair);
 
-            let optimal = OptimalQuote {
-                input: quote.input,
-                output: quote.output,
-                profit: quote.profit,
-            };
-            let classification = self.economics.classify(&optimal, &self.reference);
+            let classification = self.classify_pair(pair, &quote);
             if matches!(classification.reason, ClassificationReason::AboveThreshold) {
                 outcome.interesting.push(pair);
             }
@@ -255,13 +279,7 @@ impl PairDirtyEvaluator {
     pub fn quote_pair(&self, pair: PairKey) -> Option<(PairQuote, shadow::Classification)> {
         let (a_pools, b_pools) = self.by_pair.get(&pair)?;
         let quote = quote_pair(a_pools, b_pools, &self.prices_a, &self.prices_b).ok()??;
-        let optimal = OptimalQuote {
-            input: quote.input,
-            output: quote.output,
-            profit: quote.profit,
-        };
-        let classification = self.economics.classify(&optimal, &self.reference);
-        Some((quote, classification))
+        Some((quote, self.classify_pair(pair, &quote)))
     }
 }
 
@@ -498,5 +516,37 @@ mod tests {
             "profit must be positive: {quote:?}"
         );
         assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+    }
+
+    #[test]
+    fn token_price_can_collapse_a_fixture_gated_quote() {
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
+        );
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+
+        // At the $1 fixture the quote clears the gate; at a sub-cent anchor
+        // price the same gross profit is dust and falls below the floor.
+        let mut token_prices = HashMap::new();
+        token_prices.insert(token_a(), U256::from(1_000_000));
+        evaluator.set_token_prices(token_prices);
+        let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
+        assert_ne!(classification.reason, ClassificationReason::AboveThreshold);
+        // Same quote, lower anchor price: gross profit collapses proportionally.
+        assert!(
+            classification.gross_profit_usd < U256::from(FIXED_POINT_SCALE),
+            "sub-cent anchor must not clear the gate: {classification:?}"
+        );
     }
 }

@@ -175,6 +175,34 @@ pub fn load_catalog(path: &Path) -> Result<HashMap<[u8; 32], PoolEntry>, String>
     Ok(out)
 }
 
+/// Loads a token-price CSV mapping each token address to its USD price per
+/// whole token, fixed-point scaled by the economics scale. Rows are
+/// `token,usd_per_token`.
+///
+/// # Errors
+///
+/// Returns the parser's message on a malformed row.
+pub fn load_prices(path: &Path) -> Result<HashMap<Address, U256>, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut reader = csv::Reader::from_reader(file);
+    let mut out = HashMap::new();
+    for record in reader.records() {
+        let record = record.map_err(|e| e.to_string())?;
+        let token = record
+            .get(0)
+            .ok_or_else(|| "row lacks token".to_owned())?
+            .parse::<Address>()
+            .map_err(|_| "bad token".to_owned())?;
+        let usd: U256 = record
+            .get(1)
+            .ok_or_else(|| "row lacks usd_per_token".to_owned())?
+            .parse::<U256>()
+            .map_err(|_| "bad usd_per_token".to_owned())?;
+        out.insert(normalize_currency(token), usd);
+    }
+    Ok(out)
+}
+
 /// Loads a manifest-seed CSV and returns the pools split by venue profile —
 /// the two sweep sets for `quote-manifest`. Rows whose profile is neither
 /// `*a` nor `*b` are dropped.
@@ -961,6 +989,37 @@ mod tests {
             .parse()
             .unwrap();
         assert_ne!(pair_key(native, other), pair_key(native, third));
+    }
+
+    #[test]
+    fn load_prices_reads_token_price_csv_and_normalizes_native() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prices.csv");
+        let native: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+            .parse()
+            .unwrap();
+        let other: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            "token,usd_per_token\n{other},1800000000000000000\n0x0000000000000000000000000000000000000000,2900000000000000000\n"
+        )
+        .unwrap();
+        drop(f);
+        let map = load_prices(&path).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get(&other).copied(),
+            Some(U256::from(18) * U256::from(10u128.pow(17)))
+        );
+        // The v4 native sentinel normalizes onto the RHC native contract.
+        assert_eq!(
+            map.get(&native).copied(),
+            Some(U256::from(29) * U256::from(10u128.pow(17)))
+        );
     }
 
     #[test]

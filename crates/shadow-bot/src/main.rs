@@ -33,6 +33,12 @@ const CYCLE_LIMITS: CycleLimits = CycleLimits {
     max_cycles_per_pool: 10_000,
 };
 
+/// Conservative gas cost of one cross-venue attempt in USD fixed-point
+/// (~$0.03, per the project budget rules). At 18 fp digits this is 3e16.
+const GAS_COST_USD: U256 = U256::from_limbs([30_000_000_000_000_000, 0, 0, 0]);
+/// Expected win rate used for the submission-gate floor (10%).
+const EXPECTED_WIN_RATE: U256 = U256::from_limbs([100_000_000_000_000_000, 0, 0, 0]);
+
 /// Uniswap V4 `PoolManager` singleton on Base; emits all Swap logs with the
 /// pool id as topic1 (confirmed from the enumerated catalog).
 const V4_POOL_MANAGER: Address =
@@ -259,6 +265,10 @@ enum Command {
         /// Write one quote row per captureable pair to this path (overwrites).
         #[arg(long)]
         csv: Option<PathBuf>,
+        /// Token-price CSV (`token,usd_per_token`, fixed-point) for honest
+        /// USD gating instead of the `$1` fixture.
+        #[arg(long)]
+        prices: Option<PathBuf>,
     },
     /// Polls live Swap prices from the chain tip and re-checks only the
     /// cross-venue pairs touched by each changed pool, gating each re-quote
@@ -301,6 +311,16 @@ enum Command {
         /// Minimum poll delay between `eth_getLogs` requests.
         #[arg(long, default_value_t = 600)]
         delay_ms: u64,
+        /// Write one row per gated pair per poll to this path (appends;
+        /// headers written on first open). Columns: `token_lo,token_hi`,
+        /// `to_block,input,output,profit,log2_skew,gross_profit_usd`,
+        /// `net_profit_usd,threshold_usd`.
+        #[arg(long)]
+        csv: Option<PathBuf>,
+        /// Token-price CSV (`token,usd_per_token`, fixed-point) for honest
+        /// USD gating instead of the `$1` fixture.
+        #[arg(long)]
+        prices: Option<PathBuf>,
     },
 }
 
@@ -405,6 +425,7 @@ fn main() {
             window,
             delay_ms,
             csv,
+            prices,
         } => quote_manifest_command(&QuoteManifestArgs {
             a: &a,
             b: &b,
@@ -418,6 +439,7 @@ fn main() {
             window,
             delay_ms,
             csv: csv.as_deref(),
+            prices: prices.as_deref(),
         }),
         Command::RunPairs {
             a,
@@ -432,6 +454,8 @@ fn main() {
             max_swaps,
             window,
             delay_ms,
+            csv,
+            prices,
         } => run_pairs_command(&RunPairsArgs {
             a: &a,
             b: &b,
@@ -445,6 +469,8 @@ fn main() {
             max_swaps,
             window,
             delay_ms,
+            csv: csv.as_deref(),
+            prices: prices.as_deref(),
         }),
     };
     if let Err(error) = outcome {
@@ -698,6 +724,7 @@ struct QuoteManifestArgs<'a> {
     window: u64,
     delay_ms: u64,
     csv: Option<&'a std::path::Path>,
+    prices: Option<&'a std::path::Path>,
 }
 
 /// Samples live Swap prices across two catalogs and reports the skew-vs-toll
@@ -839,6 +866,7 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
     let window = args.window;
     let delay_ms = args.delay_ms;
     let csv_path = args.csv;
+    let prices_path = args.prices;
 
     let profile_bytes_a: [u8; 2] = profile_a
         .as_bytes()
@@ -917,8 +945,8 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
     // and classified through the conservative economics gate.
     let economics = Economics {
         flash_fee_rate: U256::ZERO,
-        gas_cost_usd: U256::from(1_000),
-        expected_win_rate: U256::from(FIXED_POINT_SCALE),
+        gas_cost_usd: GAS_COST_USD,
+        expected_win_rate: EXPECTED_WIN_RATE,
     };
     let reference = CostSnapshot {
         usd_per_token: U256::from(FIXED_POINT_SCALE),
@@ -928,6 +956,15 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
     let mut evaluator =
         dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, quotes.len().max(1));
     evaluator.set_reference(reference);
+    if let Some(path) = prices_path {
+        let prices = gaps::load_prices(path)?;
+        println!(
+            "loaded {} token prices from {}",
+            prices.len(),
+            path.display()
+        );
+        evaluator.set_token_prices(prices);
+    }
     evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
     evaluator.seed_prices(profile_bytes_b, &b_entries, &priced_b)?;
     let dirty_depth = evaluator.queue_len();
@@ -989,6 +1026,8 @@ struct RunPairsArgs<'a> {
     max_swaps: u64,
     window: u64,
     delay_ms: u64,
+    csv: Option<&'a std::path::Path>,
+    prices: Option<&'a std::path::Path>,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -997,6 +1036,8 @@ struct RunPairsArgs<'a> {
 /// locally from Swap logs, never `eth_call`ed per quote; nothing is submitted.
 #[allow(clippy::too_many_lines)]
 fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
+    use std::io::Write;
+
     let a_path: &std::path::Path = args.a;
     let b_path: &std::path::Path = args.b;
     let manifest_path = args.manifest;
@@ -1009,6 +1050,19 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let max_swaps = args.max_swaps;
     let window = args.window;
     let delay_ms = args.delay_ms;
+    let csv_path = args.csv;
+    let prices_path = args.prices;
+    let mut csv_out: Option<std::io::BufWriter<std::fs::File>> = None;
+    if let Some(path) = csv_path {
+        let mut out =
+            std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+        writeln!(
+            out,
+            "token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,threshold_usd,reason"
+        )
+        .map_err(|e| e.to_string())?;
+        csv_out = Some(out);
+    }
     let profile_bytes_a: [u8; 2] = profile_a
         .as_bytes()
         .try_into()
@@ -1059,8 +1113,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
 
     let economics = Economics {
         flash_fee_rate: U256::ZERO,
-        gas_cost_usd: U256::from(1_000),
-        expected_win_rate: U256::from(FIXED_POINT_SCALE),
+        gas_cost_usd: GAS_COST_USD,
+        expected_win_rate: EXPECTED_WIN_RATE,
     };
     let reference = CostSnapshot {
         usd_per_token: U256::from(FIXED_POINT_SCALE),
@@ -1071,6 +1125,15 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut evaluator =
         dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, queue_capacity);
     evaluator.set_reference(reference);
+    if let Some(path) = prices_path {
+        let prices = gaps::load_prices(path)?;
+        println!(
+            "loaded {} token prices from {}",
+            prices.len(),
+            path.display()
+        );
+        evaluator.set_token_prices(prices);
+    }
 
     let start = match from {
         Some(block) => block,
@@ -1130,6 +1193,30 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         evals += outcome.evaluated.len();
         interesting += outcome.interesting.len();
         not_evaluated += outcome.not_evaluated.len();
+        if let Some(out) = &mut csv_out {
+            for pair in &outcome.interesting {
+                if let Some((quote, classification)) = evaluator.quote_pair(*pair) {
+                    let lo = alloy_primitives::Address::from_slice(&pair.0);
+                    let hi = alloy_primitives::Address::from_slice(&pair.1);
+                    writeln!(
+                        out,
+                        "{},{},{},{},{},{},{:.6},{},{},{},{:?}",
+                        lo,
+                        hi,
+                        latest,
+                        quote.input,
+                        quote.output,
+                        quote.profit,
+                        quote.log2_skew,
+                        classification.gross_profit_usd,
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                        classification.reason,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+        }
         last_window = latest;
         high_water = latest;
         println!(
