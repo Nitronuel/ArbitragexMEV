@@ -231,6 +231,10 @@ enum Command {
         /// Enumerated catalog B (e.g. v4) CSV written by `enumerate-pools`.
         #[arg(long)]
         b: PathBuf,
+        /// Restrict the live sweep to the pools of this manifest CSV (the
+        /// selected-seed list), instead of the full catalogs in `--a`/`--b`.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
         /// Venue label for catalog A, one of `v3` or `v4`.
         #[arg(long, default_value = "v3")]
         profile_a: String,
@@ -348,6 +352,7 @@ fn main() {
         Command::QuoteManifest {
             a,
             b,
+            manifest,
             profile_a,
             profile_b,
             pool_manager,
@@ -360,6 +365,7 @@ fn main() {
         } => quote_manifest_command(&QuoteManifestArgs {
             a: &a,
             b: &b,
+            manifest: manifest.as_deref(),
             profile_a: &profile_a,
             profile_b: &profile_b,
             pool_manager,
@@ -612,6 +618,7 @@ struct GapVsTollArgs<'a> {
 struct QuoteManifestArgs<'a> {
     a: &'a PathBuf,
     b: &'a PathBuf,
+    manifest: Option<&'a std::path::Path>,
     profile_a: &'a str,
     profile_b: &'a str,
     pool_manager: Option<Address>,
@@ -747,11 +754,13 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
 
 /// Samples live prices over the enumerated pair overlap and emits the closed
 /// form optimal round trip per captureable pair (positive-profit cycles only).
+#[allow(clippy::too_many_lines)]
 fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
     use std::io::Write;
 
     let a_path: &std::path::Path = args.a;
     let b_path: &std::path::Path = args.b;
+    let manifest_path = args.manifest;
     let profile_a = args.profile_a;
     let profile_b = args.profile_b;
     let pool_manager = args.pool_manager;
@@ -790,13 +799,25 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
         ThreadSleeper,
         budget.clone(),
         retry,
-        8453,
+        4663,
     );
 
-    let catalog_a = gaps::load_catalog(a_path)?;
-    let catalog_b = gaps::load_catalog(b_path)?;
-    let a_entries: Vec<_> = catalog_a.into_values().collect();
-    let b_entries: Vec<_> = catalog_b.into_values().collect();
+    let (a_entries, b_entries) = if let Some(path) = manifest_path {
+        gaps::restrict_to_manifest(path, profile_bytes_a, profile_bytes_b)?
+    } else {
+        let catalog_a = gaps::load_catalog(a_path)?;
+        let catalog_b = gaps::load_catalog(b_path)?;
+        (
+            catalog_a.into_values().collect::<Vec<_>>(),
+            catalog_b.into_values().collect::<Vec<_>>(),
+        )
+    };
+    if a_entries.is_empty() || b_entries.is_empty() {
+        return Err(format!(
+            "no pools for profiles v{} on both venues",
+            profile_bytes_a[1]
+        ));
+    }
     let priced_a = gaps::sweep_swap_prices(
         &reader,
         profile_bytes_a,

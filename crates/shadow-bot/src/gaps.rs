@@ -175,6 +175,31 @@ pub fn load_catalog(path: &Path) -> Result<HashMap<[u8; 32], PoolEntry>, String>
     Ok(out)
 }
 
+/// Loads a manifest-seed CSV and returns the pools split by venue profile —
+/// the two sweep sets for `quote-manifest`. Rows whose profile is neither
+/// `*a` nor `*b` are dropped.
+///
+/// # Errors
+///
+/// Returns the parser's message on a malformed row.
+pub fn restrict_to_manifest(
+    path: &Path,
+    profile_a: [u8; 2],
+    profile_b: [u8; 2],
+) -> Result<(Vec<PoolEntry>, Vec<PoolEntry>), String> {
+    let catalog = load_catalog(path)?;
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for entry in catalog.into_values() {
+        if entry.profile == profile_a {
+            a.push(entry);
+        } else if entry.profile == profile_b {
+            b.push(entry);
+        }
+    }
+    Ok((a, b))
+}
+
 /// The canonical ordered pair for cross-venue matching: `(token0, token1)`
 /// sorted by normalized address, so both venues quote the same orientation.
 #[must_use]
@@ -1173,6 +1198,31 @@ mod tests {
         let summary = gap_distribution(&a_entries, &b_entries, &pa, &pb);
         assert_eq!(summary.observed_pairs, 1);
         assert!(summary.median_log2_skew < 1e-9);
+    }
+
+    #[test]
+    fn restrict_to_manifest_splits_by_profile() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.csv");
+        let a = "0x1000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n\
+                 4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},0,1000000,v4,0x{},\n",
+                "99".repeat(32)
+            )
+            .unwrap();
+        }
+        let (a_pools, b_pools) = restrict_to_manifest(&path, *b"v3", *b"v4").unwrap();
+        assert_eq!(a_pools.len(), 1);
+        assert_eq!(b_pools.len(), 1);
+        assert_eq!(a_pools[0].profile, *b"v3");
+        assert_eq!(b_pools[0].profile, *b"v4");
     }
 
     #[test]
