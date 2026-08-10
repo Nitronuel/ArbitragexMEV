@@ -14,7 +14,7 @@ use domain::ShadowConfig;
 use enumerate::{CrawlPace, Venue, sweep_venue};
 use provider::{
     ChainReader, LiveHttp, LiveHttpProbe, LiveRpc, LogStream, ProviderBudget, RedactedUrl,
-    RetryPolicy, SubscriptionFilter, ThreadSleeper,
+    RetryPolicy, SubscriptionFilter, ThreadSleeper, TransportError,
 };
 use shadow::{
     CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceReport, ServiceSnapshot, daily_report,
@@ -1351,13 +1351,21 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         if max_swaps != 0 && applied >= max_swaps {
             break;
         }
-        let latest = reader.current_block().map_err(|e| e.to_string())?;
+        let latest = match reader.current_block() {
+            Ok(block) => block,
+            Err(TransportError::Transient(message)) => {
+                eprintln!("run-pairs: transient error reading latest block; retrying: {message}");
+                std::thread::sleep(poll);
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         if latest <= high_water {
             std::thread::sleep(poll);
             continue;
         }
         let window_from = high_water + 1;
-        let priced_a = gaps::sweep_swap_prices(
+        let priced_a = match gaps::sweep_swap_prices(
             &reader,
             profile_bytes_a,
             pool_manager.unwrap_or(V4_POOL_MANAGER),
@@ -1366,9 +1374,16 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             latest,
             window,
             delay,
-        )
-        .map_err(|e| e.to_string())?;
-        let priced_b = gaps::sweep_swap_prices(
+        ) {
+            Ok(priced) => priced,
+            Err(TransportError::Transient(message)) => {
+                eprintln!("run-pairs: transient error sweeping profile A; retrying: {message}");
+                std::thread::sleep(poll);
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let priced_b = match gaps::sweep_swap_prices(
             &reader,
             profile_bytes_b,
             pool_manager.unwrap_or(V4_POOL_MANAGER),
@@ -1377,8 +1392,15 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             latest,
             window,
             delay,
-        )
-        .map_err(|e| e.to_string())?;
+        ) {
+            Ok(priced) => priced,
+            Err(TransportError::Transient(message)) => {
+                eprintln!("run-pairs: transient error sweeping profile B; retrying: {message}");
+                std::thread::sleep(poll);
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let applied_this = priced_a.len() + priced_b.len();
         applied = applied.saturating_add(applied_this as u64);
         evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;

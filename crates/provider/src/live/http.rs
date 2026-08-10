@@ -59,6 +59,11 @@ impl HttpBackend for LiveHttp {
         let value: Value =
             serde_json::from_str(&text).map_err(|_| TransportError::InvalidResponse)?;
         if let Some(error) = value.get("error") {
+            if is_transient_json_rpc_error(error) {
+                return Err(TransportError::Transient(format!(
+                    "JSON-RPC error: {error}"
+                )));
+            }
             return Err(TransportError::Permanent(format!(
                 "JSON-RPC error: {error}"
             )));
@@ -71,5 +76,51 @@ impl HttpBackend for LiveHttp {
             result,
             response_bytes,
         })
+    }
+}
+
+/// True when a JSON-RPC `error` object indicates a transient upstream
+/// condition that should be retried (a public gateway proxying to a busy or
+/// timed-out internal node), not a terminal application error.
+fn is_transient_json_rpc_error(error: &Value) -> bool {
+    let message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    message.contains("context deadline exceeded")
+        || message.contains("timeout")
+        || message.contains("timed out")
+        || message.contains("overloaded")
+        || message.contains("too many requests")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_json_rpc_error;
+    use serde_json::json;
+
+    #[test]
+    fn timeout_json_rpc_error_is_transient() {
+        assert!(is_transient_json_rpc_error(&json!({
+            "code": -32000,
+            "message": "Post \"http://10.31.61.37:8547/rpc\": context deadline exceeded"
+        })));
+        assert!(is_transient_json_rpc_error(&json!({
+            "code": -32000,
+            "message": "request timed out"
+        })));
+    }
+
+    #[test]
+    fn semantic_json_rpc_errors_are_permanent() {
+        assert!(!is_transient_json_rpc_error(&json!({
+            "code": -32601,
+            "message": "method not found"
+        })));
+        assert!(!is_transient_json_rpc_error(&json!({
+            "code": -32000,
+            "message": "missing trie node 0x1234"
+        })));
     }
 }
