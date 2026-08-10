@@ -21,6 +21,14 @@ pub const V4_DYNAMIC_FEE_FLAG: u32 = 0x0080_0000;
 pub const RHC_NATIVE: Address =
     alloy_primitives::address!("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73");
 
+/// USDG, the $1.00 base stablecoin anchor used to derive per-token USD prices
+/// from a direct `(USG, token)` leg. 6 decimals, 1:1 USD-backed by Paxos;
+/// re-verified 2026-08-06 from the catalog suppliers. The persistent cross
+/// pairs anchor on [`RHC_NATIVE`], so USD values derived against USDG are
+/// then revalued through the WETH/USDG legs where needed.
+pub const RHC_USDG: Address =
+    alloy_primitives::address!("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168");
+
 /// Derives the out ratio `amountOut / amountIn` from a pool's `sqrtPriceX96`.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
@@ -201,6 +209,158 @@ pub fn load_prices(path: &Path) -> Result<HashMap<Address, U256>, String> {
         out.insert(normalize_currency(token), usd);
     }
     Ok(out)
+}
+
+/// USDG base-10 decimals. Only the *anchor's* scale appears in the derived
+/// fixed-point price because the token side's decimals cancel in the `USD per
+/// whole token × 10^(36-dec)` conversion (see [`derive_usd_prices`]).
+pub const RHC_USDG_DECIMALS: u8 = 6;
+
+/// Keeps only the catalog pools that can price a token in USD terms: a direct
+/// `(USG, token)` leg, or a `(native WETH, token)` leg used to revalue a token
+/// that had no priced USG leg in the window. When `seeds` is present the
+/// non-anchor side must be one of the seed tokens.
+#[must_use]
+pub fn usd_legs_for(
+    a: &[PoolEntry],
+    b: &[PoolEntry],
+    seeds: Option<&HashSet<Address>>,
+) -> (Vec<PoolEntry>, Vec<PoolEntry>) {
+    let is_anchor = |t: Address| t == RHC_USDG || t == RHC_NATIVE;
+    let keep = |e: &PoolEntry| {
+        let anchored = is_anchor(e.token0) ^ is_anchor(e.token1);
+        if !anchored {
+            return false;
+        }
+        let other = if is_anchor(e.token0) {
+            e.token1
+        } else {
+            e.token0
+        };
+        seeds.is_none_or(|set| set.contains(&other)) && !other.is_zero()
+    };
+    let pick = |entries: &[PoolEntry]| {
+        entries
+            .iter()
+            .copied()
+            .filter(keep)
+            .collect::<Vec<PoolEntry>>()
+    };
+    (pick(a), pick(b))
+}
+
+/// `10^exp` as a `U256`.
+#[must_use]
+fn factor_ten(exp: usize) -> U256 {
+    let mut factor = U256::from(1_u8);
+    for _ in 0..exp {
+        factor *= U256::from(10_u8);
+    }
+    factor
+}
+
+/// `numerator × factor / denominator`, i.e. the USD per token when the
+/// numerator is the USDG-side reserve and the denominator the token-side one.
+#[must_use]
+fn scale_over(
+    numerator: U256,
+    denominator: U256,
+    factor: U256,
+    token: Address,
+) -> Option<(Address, U256)> {
+    if denominator.is_zero() {
+        return None;
+    }
+    numerator
+        .checked_mul(factor)
+        .and_then(|value| value.checked_div(denominator))
+        .map(|value| (token, value))
+}
+
+/// A fixed-point USD price per whole token for each token priced by a USG leg
+/// (or a native-leg revalue), matching the `load_prices`/economics scale.
+#[must_use]
+pub fn derive_usd_prices(
+    a: &[PoolEntry],
+    b: &[PoolEntry],
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+) -> HashMap<Address, U256> {
+    let usd_factor_exp = 36usize.saturating_sub(usize::from(RHC_USDG_DECIMALS));
+    let usd_factor = factor_ten(usd_factor_exp);
+    let mut usg_samples: HashMap<Address, Vec<U256>> = HashMap::new();
+    let mut weth_ratio: HashMap<Address, Vec<(U256, U256)>> = HashMap::new();
+    let mut accumulate = |entries: &[PoolEntry], prices: &HashMap<[u8; 32], PoolPrice>| {
+        for entry in entries {
+            let Some(price) = prices.get(&pool_key(entry)) else {
+                continue;
+            };
+            let (r0, r1) = virtual_reserves(price.sqrt, price.liquidity);
+            match (entry.token0, entry.token1) {
+                (RHC_USDG, token) => {
+                    if let Some((token, sample)) = scale_over(r0, r1, usd_factor, token) {
+                        usg_samples.entry(token).or_default().push(sample);
+                    }
+                }
+                (token, RHC_USDG) => {
+                    if let Some((token, sample)) = scale_over(r1, r0, usd_factor, token) {
+                        usg_samples.entry(token).or_default().push(sample);
+                    }
+                }
+                (RHC_NATIVE, token) if !r1.is_zero() => {
+                    // Ratio stored as (WETH side, token side) reserves and
+                    // only scaled once WETH's USD price is known; dividing
+                    // the raw ratio here truncates sub-1 values to zero.
+                    weth_ratio.entry(token).or_default().push((r0, r1));
+                }
+                (token, RHC_NATIVE) if !r0.is_zero() => {
+                    weth_ratio.entry(token).or_default().push((r1, r0));
+                }
+                _ => {}
+            }
+        }
+    };
+    accumulate(a, prices_a);
+    accumulate(b, prices_b);
+
+    let mut out: HashMap<Address, U256> = HashMap::new();
+    out.insert(RHC_USDG, usd_factor);
+
+    // WETH first: its USD price feeds every native-leg fallback below.
+    let weth_usd = usg_samples
+        .get(&RHC_NATIVE)
+        .and_then(|samples| median_u256(samples))
+        .unwrap_or_default();
+
+    for (token, samples) in &usg_samples {
+        if let Some(usd) = median_u256(samples) {
+            out.insert(*token, usd);
+        }
+    }
+    for (token, pairs) in &weth_ratio {
+        if out.contains_key(token) {
+            continue;
+        }
+        let samples = pairs
+            .iter()
+            .filter_map(|(num, den)| weth_usd.checked_mul(*num).and_then(|v| v.checked_div(*den)))
+            .collect::<Vec<U256>>();
+        if let Some(usd) = median_u256(&samples) {
+            out.insert(*token, usd);
+        }
+    }
+    out
+}
+
+/// Median of sorted fixed-point samples.
+#[must_use]
+fn median_u256(samples: &[U256]) -> Option<U256> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[sorted.len() / 2])
 }
 
 /// Loads a manifest-seed CSV and returns the pools split by venue profile —
@@ -1652,5 +1812,234 @@ mod tests {
             .expect("priced leg must be found despite an unpriced sibling");
         assert_eq!(quote.token_lo, a_entries[0].token0);
         assert!(quote.profit > U256::ZERO);
+    }
+
+    fn price_entry(venue: Address, token0: Address, token1: Address) -> PoolEntry {
+        PoolEntry {
+            profile: *b"v4",
+            venue,
+            id: venue.into_word().into(),
+            fee: 500,
+            token0,
+            token1,
+            fee_denominator: 1_000_000,
+            factory: Address::ZERO,
+            chain_id: 4663,
+        }
+    }
+
+    fn price_map(entry: &PoolEntry, sqrt: U256, liquidity: U256) -> HashMap<[u8; 32], PoolPrice> {
+        let mut prices = HashMap::new();
+        prices.insert(
+            pool_key(entry),
+            PoolPrice {
+                sqrt,
+                liquidity,
+                block: 1,
+            },
+        );
+        prices
+    }
+
+    #[test]
+    fn derive_usd_prices_prices_from_usg_leg() {
+        let usg: Address = RHC_USDG;
+        let token: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+
+        // At sqrt = 2^97 the virtual-reserve ratio (sqrt/2^96)^2 = 4, so
+        // reserve1 = 4×reserve0. For a (USG, token) pool, token1 is the token:
+        // usd_per_token = (r0/r1) × 10^30 = (1/4) × 1e30 = 2.5e29.
+        let sqrt = U256::from(1u64) << 97;
+        let liquidity = U256::from(1_000_000_000u64);
+        let entry = price_entry(Address::ZERO, usg, token);
+        let prices = price_map(&entry, sqrt, liquidity);
+        let out = derive_usd_prices(&[], &[entry], &HashMap::new(), &prices);
+        assert_eq!(
+            out[&token],
+            U256::from(250_000_000_000_000_000_000_000_000_000_u128)
+        );
+    }
+
+    #[test]
+    fn derive_usd_prices_inverts_opposite_orientation() {
+        let usg: Address = RHC_USDG;
+        let token: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+
+        // Reverse orientation: (token, USG), token0 = token. Then token1 is USG,
+        // so usd_per_token = (r1/r0) × 10^30 = 4 × 1e30 = 4e30.
+        let sqrt = U256::from(1u64) << 97;
+        let liquidity = U256::from(1_000_000_000u64);
+        let entry = price_entry(Address::ZERO, token, usg);
+        let prices = price_map(&entry, sqrt, liquidity);
+        let out = derive_usd_prices(&[], &[entry], &HashMap::new(), &prices);
+        assert_eq!(
+            out[&token],
+            U256::from(4_000_000_000_000_000_000_000_000_000_000_u128)
+        );
+    }
+
+    #[test]
+    fn derive_usd_prices_pins_usg_to_one_dollar_and_uses_median() {
+        let usg: Address = RHC_USDG;
+        let token: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let other: Address = "0x2000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        // Two distinct USG legs for the same token, same underlying ratio
+        // range: pool1 gives usd=(1/4)*1e30, pool2 gives usd=(1/4)*1e30 at the
+        // same sqrt but twice the liquidity (same price, more depth). The
+        // median must equal the single-leg value and USG is pinned at $1.00.
+        let e1 = price_entry(
+            "0x2000000000000000000000000000000000000001"
+                .parse()
+                .unwrap(),
+            usg,
+            token,
+        );
+        let e2 = price_entry(
+            "0x2000000000000000000000000000000000000002"
+                .parse()
+                .unwrap(),
+            usg,
+            token,
+        );
+        let mut priced = HashMap::new();
+        for (entry, liquidity) in [
+            (e1, U256::from(1_000_000_000u64)),
+            (e2, U256::from(2_000_000_000u64)),
+        ] {
+            priced.insert(
+                pool_key(&entry),
+                PoolPrice {
+                    sqrt: U256::from(1u64) << 97,
+                    liquidity,
+                    block: 1,
+                },
+            );
+        }
+        let out = derive_usd_prices(&[], &[e1, e2], &HashMap::new(), &priced);
+        assert_eq!(
+            out[&usg],
+            U256::from(1_000_000_000_000_000_000_000_000_000_000_u128)
+        );
+        assert_eq!(
+            out[&token],
+            U256::from(250_000_000_000_000_000_000_000_000_000_u128)
+        );
+        assert!(!out.contains_key(&other));
+    }
+
+    #[test]
+    fn derive_usd_prices_revalues_through_native_weth_leg() {
+        let usg: Address = RHC_USDG;
+        let token: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let native: Address = RHC_NATIVE;
+
+        // WETH priced via a USG leg at sqrt=2^97: reserve ratio (1/4), so
+        // weth_usd = (r0/r1) × 1e30 = 0.25e30 = 2.5e29.
+        let weth = price_entry(
+            "0x3000000000000000000000000000000000000001"
+                .parse()
+                .unwrap(),
+            usg,
+            native,
+        );
+        // Token priced only against WETH at sqrt=2^98: reserve_WETH/reserve_token
+        // = r0/r1 = (L/4)/(4L) = 1/16, so usd = 2.5e29 / 16.
+        let ratio = price_entry(
+            "0x3000000000000000000000000000000000000002"
+                .parse()
+                .unwrap(),
+            native,
+            token,
+        );
+
+        let mut priced = HashMap::new();
+        priced.insert(
+            pool_key(&weth),
+            PoolPrice {
+                sqrt: U256::from(1u64) << 97,
+                liquidity: U256::from(1_000_000_000u64),
+                block: 1,
+            },
+        );
+        priced.insert(
+            pool_key(&ratio),
+            PoolPrice {
+                sqrt: U256::from(1u64) << 98,
+                liquidity: U256::from(1_000_000_000u64),
+                block: 1,
+            },
+        );
+
+        let out = derive_usd_prices(&[], &[weth, ratio], &HashMap::new(), &priced);
+        assert_eq!(
+            out[&usg],
+            U256::from(1_000_000_000_000_000_000_000_000_000_000_u128)
+        );
+        assert_eq!(
+            out[&native],
+            U256::from(250_000_000_000_000_000_000_000_000_000_u128)
+        );
+        // 250e27 / 16 = 15.625e27.
+        assert_eq!(
+            out[&token],
+            U256::from(15_625_000_000_000_000_000_000_000_000_u128)
+        );
+    }
+
+    #[test]
+    fn usd_legs_for_restricts_by_seed_tokens() {
+        let usg: Address = RHC_USDG;
+        let native: Address = RHC_NATIVE;
+        let seed: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let stranger: Address = "0xDeaDDeaDDeaDDeaDDeaDDeaDDeaDDeaDDeaDDeaD"
+            .parse()
+            .unwrap();
+
+        let a = [
+            price_entry(
+                "0x1000000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+                usg,
+                seed,
+            ),
+            price_entry(
+                "0x1000000000000000000000000000000000000002"
+                    .parse()
+                    .unwrap(),
+                usg,
+                stranger,
+            ),
+            price_entry(
+                "0x1000000000000000000000000000000000000003"
+                    .parse()
+                    .unwrap(),
+                seed,
+                seed,
+            ),
+        ];
+        let seeds: HashSet<Address> = [seed, native].into_iter().collect();
+        let (legs, b) = usd_legs_for(&a, &[], Some(&seeds));
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].token0, usg);
+        assert_eq!(legs[0].token1, seed);
+        assert!(b.is_empty());
+
+        // Without a seed restriction both anchored legs survive.
+        let (all_legs, _) = usd_legs_for(&a, &[], None);
+        assert_eq!(all_legs.len(), 2);
     }
 }

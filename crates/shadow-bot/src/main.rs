@@ -270,6 +270,47 @@ enum Command {
         #[arg(long)]
         prices: Option<PathBuf>,
     },
+    /// Sweeps the USDG/WETH-anchored legs for the manifest's seed tokens and
+    /// derives a `token,usd_per_token` fixed-point price CSV from the median
+    /// reserve ratios (read-only). WETH is priced first via its USDG legs;
+    /// tokens without a priced USDG leg in the window fall back through their
+    /// native WETH legs.
+    DerivePrices {
+        /// Enumerated catalog A (e.g. v3) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        a: PathBuf,
+        /// Enumerated catalog B (e.g. v4) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        b: PathBuf,
+        /// Manifest CSV whose seed tokens define the USD legs to sweep
+        /// (the selected-seed list).
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Venue label for catalog A, one of `v3` or `v4`.
+        #[arg(long, default_value = "v3")]
+        profile_a: String,
+        /// Venue label for catalog B, one of `v3` or `v4`.
+        #[arg(long, default_value = "v4")]
+        profile_b: String,
+        /// v4 `PoolManager` contract address (only required when a profile is v4).
+        #[arg(long)]
+        pool_manager: Option<Address>,
+        /// Base chain endpoint URL.
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        from: u64,
+        #[arg(long)]
+        to: u64,
+        #[arg(long, default_value_t = 50_000)]
+        window: u64,
+        #[arg(long, default_value_t = 600)]
+        delay_ms: u64,
+        /// Write the derived prices to this `token,usd_per_token` CSV
+        /// (overwrites).
+        #[arg(value_name = "OUT")]
+        out: PathBuf,
+    },
     /// Polls live Swap prices from the chain tip and re-checks only the
     /// cross-venue pairs touched by each changed pool, gating each re-quote
     /// through the conservative economics floor (read-only).
@@ -440,6 +481,33 @@ fn main() {
             delay_ms,
             csv: csv.as_deref(),
             prices: prices.as_deref(),
+        }),
+        Command::DerivePrices {
+            a,
+            b,
+            manifest,
+            profile_a,
+            profile_b,
+            pool_manager,
+            rpc,
+            from,
+            to,
+            window,
+            delay_ms,
+            out,
+        } => derive_prices_command(&DerivePricesArgs {
+            a: &a,
+            b: &b,
+            manifest: &manifest,
+            profile_a: &profile_a,
+            profile_b: &profile_b,
+            pool_manager,
+            rpc: &rpc,
+            from,
+            to,
+            window,
+            delay_ms,
+            out: &out,
         }),
         Command::RunPairs {
             a,
@@ -727,6 +795,22 @@ struct QuoteManifestArgs<'a> {
     prices: Option<&'a std::path::Path>,
 }
 
+/// Arguments for [`derive_prices_command`].
+struct DerivePricesArgs<'a> {
+    a: &'a PathBuf,
+    b: &'a PathBuf,
+    manifest: &'a std::path::Path,
+    profile_a: &'a str,
+    profile_b: &'a str,
+    pool_manager: Option<Address>,
+    rpc: &'a str,
+    from: u64,
+    to: u64,
+    window: u64,
+    delay_ms: u64,
+    out: &'a PathBuf,
+}
+
 /// Samples live Swap prices across two catalogs and reports the skew-vs-toll
 /// distribution. Read-only; no signing or submission.
 #[allow(clippy::too_many_lines)]
@@ -1009,6 +1093,116 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
         }
         println!("wrote {} quotes -> {}", quotes.len(), path.display());
     }
+    Ok(())
+}
+
+/// Sweeps the USDG/WETH-anchored legs for the manifest's seed tokens and
+/// derives a `token,usd_per_token` fixed-point price CSV from the median
+/// reserve ratios. Read-only; no signing or submission.
+#[allow(clippy::too_many_lines)]
+fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
+    use std::io::Write;
+
+    let profile_bytes_a: [u8; 2] = args
+        .profile_a
+        .as_bytes()
+        .try_into()
+        .map_err(|_| format!("profile_a must be exactly 2 bytes, got {}", args.profile_a))?;
+    let profile_bytes_b: [u8; 2] = args
+        .profile_b
+        .as_bytes()
+        .try_into()
+        .map_err(|_| format!("profile_b must be exactly 2 bytes, got {}", args.profile_b))?;
+    for (label, profile) in [
+        (args.profile_a, &profile_bytes_a),
+        (args.profile_b, &profile_bytes_b),
+    ] {
+        if profile != b"v3" && profile != b"v4" {
+            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        }
+    }
+
+    let http_url: RedactedUrl = args
+        .rpc
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let budget = ProviderBudget::new(40_000, 1 << 24);
+    let retry = RetryPolicy {
+        max_retries: 8,
+        initial_delay: Duration::from_millis(600),
+        max_delay: Duration::from_secs(12),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url.clone()),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+        4663,
+    );
+
+    let catalog_a = gaps::load_catalog(args.a)?;
+    let catalog_b = gaps::load_catalog(args.b)?;
+    let (manifest_a, manifest_b) =
+        gaps::restrict_to_manifest(args.manifest, profile_bytes_a, profile_bytes_b)?;
+    if manifest_a.is_empty() || manifest_b.is_empty() {
+        return Err("no seed pools for both venues in the manifest".to_owned());
+    }
+
+    // The seed token set is the manifest's distinct tokens (normalized), so
+    // `usd_legs_for` only sweeps anchors touching our pairs.
+    let mut seeds: HashSet<Address> = HashSet::new();
+    for entry in manifest_a.iter().chain(manifest_b.iter()) {
+        seeds.insert(entry.token0);
+        seeds.insert(entry.token1);
+    }
+    let a_entries = catalog_a.into_values().collect::<Vec<_>>();
+    let b_entries = catalog_b.into_values().collect::<Vec<_>>();
+    let (legs_a, legs_b) = gaps::usd_legs_for(&a_entries, &b_entries, Some(&seeds));
+
+    let priced_a = gaps::sweep_swap_prices(
+        &reader,
+        profile_bytes_a,
+        args.pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &legs_a,
+        args.from,
+        args.to,
+        args.window,
+        Duration::from_millis(args.delay_ms),
+    )
+    .map_err(|e| e.to_string())?;
+    let priced_b = gaps::sweep_swap_prices(
+        &reader,
+        profile_bytes_b,
+        args.pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &legs_b,
+        args.from,
+        args.to,
+        args.window,
+        Duration::from_millis(args.delay_ms),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let prices = gaps::derive_usd_prices(&legs_a, &legs_b, &priced_a, &priced_b);
+    let mut out =
+        std::io::BufWriter::new(std::fs::File::create(args.out).map_err(|e| e.to_string())?);
+    writeln!(out, "token,usd_per_token").map_err(|e| e.to_string())?;
+    let mut rows = prices.iter().collect::<Vec<_>>();
+    rows.sort_by_key(|(token, _)| **token);
+    for (token, usd) in rows {
+        writeln!(out, "{token},{usd}").map_err(|e| e.to_string())?;
+    }
+    out.flush().map_err(|e| e.to_string())?;
+
+    println!(
+        "derive-prices: legs a={} b={} priced a={} b={} prices={} seeds={} -> {}",
+        legs_a.len(),
+        legs_b.len(),
+        priced_a.len(),
+        priced_b.len(),
+        prices.len(),
+        seeds.len(),
+        args.out.display(),
+    );
     Ok(())
 }
 
