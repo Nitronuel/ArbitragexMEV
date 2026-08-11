@@ -75,38 +75,56 @@ fn search_interval(
     states: &[PoolState],
     best: &mut Option<OptimalQuote>,
 ) -> Result<(), MathError> {
-    let best_profit = best.map_or(Wide::ZERO, |quote| widen(quote.profit));
-    if ideal_profit_bound(start, end, coefficients)? <= best_profit {
-        return Ok(());
-    }
-    if start == end {
-        return evaluate(start, cycle, states, best);
-    }
+    let (a, b, c) = coefficients;
+    let center = continuous_center(a, b, c)?;
+    let mut stack = vec![(start, end)];
+    let mut budget = MAX_INTERVAL_VISITS;
+    while let Some((start, end)) = stack.pop() {
+        if budget == 0 {
+            return Ok(());
+        }
+        budget -= 1;
 
-    let middle = start
-        .checked_add(end.checked_sub(start).ok_or(MathError::Overflow)? / Wide::from(2))
-        .ok_or(MathError::Overflow)?;
-    search_interval(start, middle, coefficients, cycle, states, best)?;
-    search_interval(
-        middle
-            .checked_add(Wide::from(1))
-            .ok_or(MathError::Overflow)?,
-        end,
-        coefficients,
-        cycle,
-        states,
-        best,
-    )
+        let best_profit = best.map_or(Wide::ZERO, |quote| widen(quote.profit));
+        if ideal_profit_bound(start, end, coefficients, center)? <= best_profit {
+            continue;
+        }
+        if start == end {
+            evaluate(start, cycle, states, best)?;
+            continue;
+        }
+
+        let middle = start
+            .checked_add(end.checked_sub(start).ok_or(MathError::Overflow)? / Wide::from(2))
+            .ok_or(MathError::Overflow)?;
+        let left = (start, middle);
+        let right = (
+            middle
+                .checked_add(Wide::from(1))
+                .ok_or(MathError::Overflow)?,
+            end,
+        );
+        if center <= middle {
+            stack.push(right);
+            stack.push(left);
+        } else {
+            stack.push(left);
+            stack.push(right);
+        }
+    }
+    Ok(())
 }
+
+const MAX_INTERVAL_VISITS: usize = 10_000;
 
 #[allow(clippy::large_types_passed_by_value)]
 fn ideal_profit_bound(
     start: Wide,
     end: Wide,
     coefficients: (Wide, Wide, Wide),
+    center: Wide,
 ) -> Result<Wide, MathError> {
     let (a, b, c) = coefficients;
-    let center = continuous_center(a, b, c)?;
     let next = center
         .checked_add(Wide::from(1))
         .ok_or(MathError::Overflow)?;
