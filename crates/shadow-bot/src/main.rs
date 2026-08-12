@@ -1274,7 +1274,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let http_url: RedactedUrl = rpc_url
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
-    let budget = ProviderBudget::new(40_000, 1 << 24);
+    let budget = ProviderBudget::new(24_000_000, 1 << 24);
     let retry = RetryPolicy {
         max_retries: 8,
         initial_delay: Duration::from_millis(600),
