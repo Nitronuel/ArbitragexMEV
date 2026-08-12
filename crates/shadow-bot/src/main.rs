@@ -346,6 +346,10 @@ enum Command {
         /// Drained swap events after which the loop stops (0 = unbounded).
         #[arg(long, default_value_t = 0)]
         max_swaps: u64,
+        /// Wall-clock seconds after which the loop stops (0 = unbounded). The
+        /// 24h canary uses this as its self-terminating bound.
+        #[arg(long, default_value_t = 0)]
+        duration_secs: u64,
         /// Width of each `eth_getLogs` window in blocks.
         #[arg(long, default_value_t = 50_000)]
         window: u64,
@@ -520,6 +524,7 @@ fn main() {
             from,
             poll_ms,
             max_swaps,
+            duration_secs,
             window,
             delay_ms,
             csv,
@@ -535,6 +540,7 @@ fn main() {
             from,
             poll_ms,
             max_swaps,
+            duration_secs,
             window,
             delay_ms,
             csv: csv.as_deref(),
@@ -1218,6 +1224,7 @@ struct RunPairsArgs<'a> {
     from: Option<u64>,
     poll_ms: u64,
     max_swaps: u64,
+    duration_secs: u64,
     window: u64,
     delay_ms: u64,
     csv: Option<&'a std::path::Path>,
@@ -1242,6 +1249,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let from = args.from;
     let poll_ms = args.poll_ms;
     let max_swaps = args.max_swaps;
+    let duration_secs = args.duration_secs;
     let window = args.window;
     let delay_ms = args.delay_ms;
     let csv_path = args.csv;
@@ -1349,6 +1357,10 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             break;
         }
         if max_swaps != 0 && applied >= max_swaps {
+            break;
+        }
+        if duration_secs != 0 && since.elapsed().as_secs() >= duration_secs {
+            eprintln!("run-pairs: duration reached after {duration_secs}s");
             break;
         }
         let latest = match reader.current_block() {

@@ -335,6 +335,7 @@ fn run_pairs_help_exposes_live_poll_flags() {
     let help = format!("{}\n{}", stdout(&output), stderr(&output));
     assert!(help.contains("--poll-ms"));
     assert!(help.contains("--max-swaps"));
+    assert!(help.contains("--duration-secs"));
     assert!(help.contains("--from"));
     assert!(help.contains("--manifest"));
 }
