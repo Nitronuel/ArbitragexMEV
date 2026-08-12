@@ -19,3 +19,7 @@ lib/
 
 cache/
 out/
+
+# Scratch canary artifacts (superseded by data/manifest-seed.csv)
+data/manifest-live.csv
+data/manifest-seed-old-backup.csv
