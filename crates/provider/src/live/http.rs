@@ -80,8 +80,8 @@ impl HttpBackend for LiveHttp {
 }
 
 /// True when a JSON-RPC `error` object indicates a transient upstream
-/// condition that should be retried (a public gateway proxying to a busy or
-/// timed-out internal node), not a terminal application error.
+/// condition that should be retried (a public gateway proxying to a busy,
+/// timed-out, or unreachable internal node), not a terminal application error.
 fn is_transient_json_rpc_error(error: &Value) -> bool {
     let message = error
         .get("message")
@@ -93,6 +93,10 @@ fn is_transient_json_rpc_error(error: &Value) -> bool {
         || message.contains("timed out")
         || message.contains("overloaded")
         || message.contains("too many requests")
+        || message.contains("connection refused")
+        || message.contains("connection reset")
+        || message.contains("dial tcp")
+        || message.contains("eof")
 }
 
 #[cfg(test)]
@@ -109,6 +113,25 @@ mod tests {
         assert!(is_transient_json_rpc_error(&json!({
             "code": -32000,
             "message": "request timed out"
+        })));
+    }
+
+    #[test]
+    fn unreachable_upstream_json_rpc_error_is_transient() {
+        // Regression: the public RHC gateway surfaces an unreachable internal
+        // node as a wrapped Go dial error, which canary5 took as fatal
+        // (classified Permanent) and aborted the 24h window.
+        assert!(is_transient_json_rpc_error(&json!({
+            "code": -32000,
+            "message": "Post \"http://10.31.14.59:8547/rpc\": dial tcp 10.31.14.59:8547: connect: connection refused"
+        })));
+        assert!(is_transient_json_rpc_error(&json!({
+            "code": -32000,
+            "message": "Post \"http://10.31.14.59:8547/rpc\": read: connection reset by peer"
+        })));
+        assert!(is_transient_json_rpc_error(&json!({
+            "code": -32000,
+            "message": "Post \"http://10.31.14.59:8547/rpc\": unexpected EOF"
         })));
     }
 
