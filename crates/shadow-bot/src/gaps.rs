@@ -35,6 +35,14 @@ pub const RHC_NATIVE: Address =
 pub const RHC_USDG: Address =
     alloy_primitives::address!("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168");
 
+/// Upper bound on a plausible `usd_per_token` price row (~$2.5M per whole
+/// token at 18 decimals). `derive-prices` output stays 3-4 orders below this;
+/// a hand-planted or corrupted row far above it (e.g. the 2.5e24 native row
+/// that silently gated every native pair) is rejected so a bad price can never
+/// flip quotes to `AboveThreshold`. The USDG anchor pin (`1e30`) exceeds this
+/// bound by construction and is exempted.
+pub const MAX_USD_PER_TOKEN: U256 = U256::from_limbs([0x1bce_cced_a100_0000, 0xd3c2, 0, 0]);
+
 /// Derives the out ratio `amountOut / amountIn` from a pool's `sqrtPriceX96`.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
@@ -216,7 +224,14 @@ pub fn load_prices(path: &Path) -> Result<HashMap<Address, U256>, String> {
             .ok_or_else(|| "row lacks usd_per_token".to_owned())?
             .parse::<U256>()
             .map_err(|_| "bad usd_per_token".to_owned())?;
-        out.insert(normalize_currency(token), usd);
+        let normalized = normalize_currency(token);
+        if !usd.is_zero() && normalized != RHC_USDG && usd > MAX_USD_PER_TOKEN {
+            return Err(format!(
+                "implausible usd_per_token {usd} for {token} (max {MAX_USD_PER_TOKEN}); \
+                 reject a hand-planted or mis-derived price that would over-gate quotes"
+            ));
+        }
+        out.insert(normalized, usd);
     }
     Ok(out)
 }
@@ -1407,6 +1422,52 @@ mod tests {
             map.get(&native).copied(),
             Some(U256::from(29) * U256::from(10u128.pow(17)))
         );
+    }
+
+    #[test]
+    fn load_prices_rejects_implausible_price_row() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-prices.csv");
+        let other: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        // The corrupted native row that silently gated every native pair
+        // (2.5e24 = ~$2.5M/token at 18 decimals) must be rejected.
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            "token,usd_per_token\n0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73,2500000000000000000000000\n{other},1800000000000000000\n"
+        )
+        .unwrap();
+        drop(f);
+        let error = load_prices(&path).unwrap_err();
+        assert!(
+            error.contains("implausible usd_per_token"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn load_prices_allows_usdg_anchor_pin() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prices.csv");
+        let usdg: Address = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+            .parse()
+            .unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        // USDG's 1e30 pin ($1 at 6 decimals) exceeds the general bound by
+        // construction and is the anchor, so it must stay accepted.
+        write!(
+            f,
+            "token,usd_per_token\n{usdg},1000000000000000000000000000000\n"
+        )
+        .unwrap();
+        drop(f);
+        let map = load_prices(&path).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&usdg).copied(), Some(U256::from(10u128.pow(30))));
     }
 
     #[test]
