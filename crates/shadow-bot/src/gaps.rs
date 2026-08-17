@@ -14,6 +14,12 @@ use provider::{
 /// unless their dynamic fee is observable.
 pub const V4_DYNAMIC_FEE_FLAG: u32 = 0x0080_0000;
 
+/// Legs charging more than half the output per swap are unquotable placeholders
+/// (honeypots, "rejected" high-fee pools, or catalog noise), never viable round
+/// trips. `leg_toll` yields `None` for them so selection, ranking, and quoting
+/// all exclude the dead tail instead of paying its toll inside `margin`.
+pub const MAX_QUOTABLE_FEE: f64 = 0.5;
+
 /// RHC encodes the wrapped native token in v2/v3 pool addresses with its real
 /// contract address, while v4 `PoolKey`s use the `0x0..0` sentinel for the
 /// native currency. Cross-venue matching must normalize the sentinel to the
@@ -40,7 +46,7 @@ pub fn price_out(sqrt_price_x96: U256) -> f64 {
 
 /// A bias-free `f64` decode of a `U256`, valid because the inputs are bounded
 /// by 32 bytes and we only ever compare prices in the same units.
-fn f64_of(v: U256) -> f64 {
+pub fn f64_of(v: U256) -> f64 {
     let mut out = 0.0f64;
     for byte in v.to_be_bytes::<32>() {
         out = out.mul_add(256.0, f64::from(byte));
@@ -63,7 +69,11 @@ pub fn leg_toll(fee: u32, profile: [u8; 2]) -> Option<f64> {
     if profile == *b"v4" && (fee == 0 || fee & V4_DYNAMIC_FEE_FLAG != 0) {
         return None;
     }
-    Some(f64::from(fee) / 1_000_000.0)
+    let toll = f64::from(fee) / 1_000_000.0;
+    if toll > MAX_QUOTABLE_FEE {
+        return None;
+    }
+    Some(toll)
 }
 
 /// One enumerated pool kept in a form the measurement can price and toll.
@@ -456,11 +466,20 @@ pub fn restrict_to_cross(
 /// `keys` must be the pools whose prices the caller wants (typically the
 /// [`restrict_to_cross`] subset).
 ///
+/// `chunk_window` bounds how many V3 address chunks are swept per block-window
+/// iteration this call: the full universe exceeds Alchemy's per-request filter
+/// limits, so a caller on a budget ring-swings through the universe over
+/// consecutive polls while V4 (a single singleton stream) is always swept
+/// complete. `None` sweeps the whole key set. The ring offset skips
+/// `start_chunk` chunks and wraps; the count is clamped to the chunk list so a
+/// single call never issues a duplicate request.
+///
 /// # Errors
 ///
 /// Returns a [`TransportError`] on an empty filter or a transport/budget
 /// failure.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub fn sweep_swap_prices<B, S>(
     reader: &ChainReader<B, S>,
     profile: [u8; 2],
@@ -470,6 +489,7 @@ pub fn sweep_swap_prices<B, S>(
     to: u64,
     window: u64,
     request_delay: Duration,
+    chunk_window: Option<(u64, u64)>,
 ) -> Result<HashMap<[u8; 32], PoolPrice>, TransportError>
 where
     B: HttpBackend,
@@ -527,39 +547,45 @@ where
     };
     loop {
         let end = start.saturating_add(window.saturating_sub(1)).min(to);
-        match &profile {
-            b"v4" => {
+        if profile == *b"v4" {
+            let logs = reader.get_logs_windowed(
+                &LogFilter {
+                    from_block: start,
+                    to_block: end,
+                    addresses: vec![pool_manager],
+                    topic0: topic,
+                },
+                window,
+            )?;
+            let ids: HashSet<[u8; 32]> = keys.iter().map(|e| e.id).collect();
+            ingest(&logs, Some(&ids));
+            if !request_delay.is_zero() {
+                std::thread::sleep(request_delay);
+            }
+        } else {
+            let chunks: Vec<&[PoolEntry]> = keys.chunks(MAX_ADDRESS_CHUNK).collect();
+            let chunk_count = chunks.len().max(1);
+            let (skip, take) = match chunk_window {
+                Some((start_chunk, count)) if count > 0 => (
+                    usize::try_from(start_chunk).map_or(0, |s| s % chunk_count),
+                    usize::try_from(count).map_or(chunks.len(), |c| c.min(chunks.len())),
+                ),
+                _ => (0, chunks.len()),
+            };
+            for chunk in chunks.into_iter().cycle().skip(skip).take(take) {
+                let addresses: Vec<Address> = chunk.iter().map(|e| e.venue).collect();
                 let logs = reader.get_logs_windowed(
                     &LogFilter {
                         from_block: start,
                         to_block: end,
-                        addresses: vec![pool_manager],
+                        addresses,
                         topic0: topic,
                     },
                     window,
                 )?;
-                let ids: HashSet<[u8; 32]> = keys.iter().map(|e| e.id).collect();
-                ingest(&logs, Some(&ids));
+                ingest(&logs, None);
                 if !request_delay.is_zero() {
                     std::thread::sleep(request_delay);
-                }
-            }
-            _ => {
-                for chunk in keys.chunks(MAX_ADDRESS_CHUNK) {
-                    let addresses: Vec<Address> = chunk.iter().map(|e| e.venue).collect();
-                    let logs = reader.get_logs_windowed(
-                        &LogFilter {
-                            from_block: start,
-                            to_block: end,
-                            addresses,
-                            topic0: topic,
-                        },
-                        window,
-                    )?;
-                    ingest(&logs, None);
-                    if !request_delay.is_zero() {
-                        std::thread::sleep(request_delay);
-                    }
                 }
             }
         }
@@ -968,6 +994,207 @@ pub fn quote_manifest(
     out.sort_by_key(|quote| quote.profit);
     out.reverse();
     out
+}
+
+/// A three-hop token cycle (triangle) over cross-venue pairs: every `(a,b)`,
+/// `(b,c)`, `(c,a)` edge is present on both venues, so a cyclic round trip
+/// through the three legs is affordable in principle.
+pub type TokenTriple = ([u8; 20], [u8; 20], [u8; 20]);
+
+/// Enumerates every cross-venue triangle whose three edges all carry a
+/// quotable leg on both venues (structural overlap only — independent of any
+/// observed prices). The triples are sorted (`lo <= mid <= hi` bytewise) and
+/// returned in deterministic order.
+///
+/// The caller pairs each edge with the cheapest priced leg (see
+/// [`best_leg_for_pair`]) to build a concrete three-hop cycle.
+#[must_use]
+pub fn enumerate_triangles(a: &[PoolEntry], b: &[PoolEntry]) -> Vec<TokenTriple> {
+    // A triangle edge must be a canonical token pair with a quotable leg on
+    // BOTH venues, so the cyclic round trip can actually cross venues.
+    let mut quotable_both: HashSet<([u8; 20], [u8; 20])> = HashSet::new();
+    let mut per_pair: HashMap<([u8; 20], [u8; 20]), u8> = HashMap::new();
+    let usable = |e: &PoolEntry| leg_toll(e.fee, e.profile).is_some();
+    for e in a.iter().filter(|e| usable(e)) {
+        let k = pair_key(e.token0, e.token1);
+        *per_pair.entry(k).or_default() |= 1;
+    }
+    for e in b.iter().filter(|e| usable(e)) {
+        let k = pair_key(e.token0, e.token1);
+        *per_pair.entry(k).or_default() |= 2;
+    }
+    for (k, mask) in &per_pair {
+        if *mask == 0b11 {
+            quotable_both.insert(*k);
+        }
+    }
+    let mut adj: HashMap<[u8; 20], Vec<[u8; 20]>> = HashMap::new();
+    for (lo, hi) in &quotable_both {
+        adj.entry(*lo).or_default().push(*hi);
+        adj.entry(*hi).or_default().push(*lo);
+    }
+    for v in adj.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    let mut keys: Vec<[u8; 20]> = adj.keys().copied().collect();
+    keys.sort_unstable();
+    let index: HashMap<[u8; 20], usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    let mut triples = Vec::new();
+    for (u_idx, u) in keys.iter().enumerate() {
+        let u_adj = &adj[u];
+        for v_neighbor in u_adj {
+            let v_idx = index[v_neighbor];
+            if v_idx <= u_idx {
+                continue;
+            }
+            let v_adj = &adj[v_neighbor];
+            let (small, large) = if u_adj.len() <= v_adj.len() {
+                (u_adj, v_adj)
+            } else {
+                (v_adj, u_adj)
+            };
+            for w in small {
+                if index.get(w).is_none_or(|i| *i <= v_idx) {
+                    continue;
+                }
+                if large.binary_search(w).is_ok() {
+                    triples.push((*u, *v_neighbor, *w));
+                }
+            }
+        }
+    }
+    triples
+}
+
+/// One leg of a cyclic quote: the concrete pool used.
+struct CycleLeg {
+    entry: PoolEntry,
+    price: PoolPrice,
+}
+
+/// Picks the cheapest-toll priced leg for a canonical token pair across both
+/// venues from pre-bucketed pool sets (the evaluator's `by_pair` index),
+/// orientated so the leg runs `from -> to`.
+fn cheapest_leg_in(
+    pair: ([u8; 20], [u8; 20]),
+    buckets: &PoolByPair,
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+) -> Option<CycleLeg> {
+    let (a_pools, b_pools) = buckets.get(&pair)?;
+    let mut best: Option<(CycleLeg, f64)> = None;
+    for (entries, prices) in [(a_pools, prices_a), (b_pools, prices_b)] {
+        for entry in entries {
+            let Some(toll) = leg_toll(entry.fee, entry.profile) else {
+                continue;
+            };
+            let Some(price) = prices.get(&pool_key(entry)) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(_, t)| toll < *t) {
+                best = Some((
+                    CycleLeg {
+                        entry: *entry,
+                        price: *price,
+                    },
+                    toll,
+                ));
+            }
+        }
+    }
+    best.map(|(leg, _)| leg)
+}
+
+/// Quotes a three-hop triangle cycle `p0 -> p1 -> p2 -> p0`, choosing the
+/// cheapest-toll priced leg per edge across both venues from pre-bucketed
+/// pools. Returns the closed-form `input`/`output`/`profit`, the compounded
+/// round-trip toll, and the observed log2 price drift.
+///
+/// # Errors
+///
+/// Returns a message describing malformed cycles or missing state.
+pub fn quote_triangle(
+    p0: Address,
+    p1: Address,
+    p2: Address,
+    buckets: &PoolByPair,
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+) -> Result<Option<PairQuote>, String> {
+    use domain::{Cycle, CycleHop, CycleId, Fee, PoolId, PoolState, StateVersion};
+    use v2_math::optimal_input;
+
+    let leg01 = cheapest_leg_in(pair_key(p0, p1), buckets, prices_a, prices_b)
+        .ok_or("triangle edge p0-p1 unpriced")?;
+    let leg12 = cheapest_leg_in(pair_key(p1, p2), buckets, prices_a, prices_b)
+        .ok_or("triangle edge p1-p2 unpriced")?;
+    let leg20 = cheapest_leg_in(pair_key(p2, p0), buckets, prices_a, prices_b)
+        .ok_or("triangle edge p2-p0 unpriced")?;
+
+    let states: Vec<PoolState> = [&leg01, &leg12, &leg20]
+        .into_iter()
+        .map(|leg| {
+            let (r0, r1) = virtual_reserves(leg.price.sqrt, leg.price.liquidity);
+            PoolState {
+                reserve0: r0,
+                reserve1: r1,
+                block_number: leg.price.block,
+                transaction_index: 0,
+                log_index: 0,
+                version: StateVersion(leg.price.block),
+            }
+        })
+        .collect();
+    let fee = |leg: &CycleLeg| Fee {
+        numerator: leg.entry.fee_denominator.saturating_sub(leg.entry.fee),
+        denominator: leg.entry.fee_denominator,
+    };
+    let cycle = Cycle {
+        id: CycleId(0),
+        anchor: p0,
+        hops: vec![
+            CycleHop {
+                pool_id: PoolId(0),
+                token_in: p0,
+                token_out: p1,
+                fee: fee(&leg01),
+                zero_for_one: leg01.entry.token0 == p0,
+            },
+            CycleHop {
+                pool_id: PoolId(1),
+                token_in: p1,
+                token_out: p2,
+                fee: fee(&leg12),
+                zero_for_one: leg12.entry.token0 == p1,
+            },
+            CycleHop {
+                pool_id: PoolId(2),
+                token_in: p2,
+                token_out: p0,
+                fee: fee(&leg20),
+                zero_for_one: leg20.entry.token0 == p2,
+            },
+        ],
+    };
+    let Some(quote) =
+        optimal_input(&cycle, &states).map_err(|e| format!("optimal input failed: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let keep = |leg: &CycleLeg| 1.0 - leg_toll(leg.entry.fee, leg.entry.profile).unwrap_or(0.0);
+    let toll = 1.0 - keep(&leg01) * keep(&leg12) * keep(&leg20);
+    let skew = (price_out(leg12.price.sqrt) * price_out(leg20.price.sqrt))
+        / price_out(leg01.price.sqrt).max(1e-30);
+    Ok(Some(PairQuote {
+        token_lo: p0,
+        token_hi: p2,
+        input: quote.input,
+        output: quote.output,
+        profit: quote.profit,
+        toll,
+        log2_skew: skew.abs().log2(),
+    }))
 }
 
 /// Combines the latest per-pool prices and computes gap-vs-toll aggregate

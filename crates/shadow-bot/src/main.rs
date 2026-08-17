@@ -366,6 +366,11 @@ enum Command {
         /// USD gating instead of the `$1` fixture.
         #[arg(long)]
         prices: Option<PathBuf>,
+        /// V3 catalog address-chunks swept per poll in the ring sweep. When
+        /// zero, the default covers the whole V3 universe within ~1h at the
+        /// configured `--poll-ms`.
+        #[arg(long, default_value_t = 0)]
+        v3_chunks_per_poll: u64,
     },
 }
 
@@ -529,6 +534,7 @@ fn main() {
             delay_ms,
             csv,
             prices,
+            v3_chunks_per_poll,
         } => run_pairs_command(&RunPairsArgs {
             a: &a,
             b: &b,
@@ -545,6 +551,7 @@ fn main() {
             delay_ms,
             csv: csv.as_deref(),
             prices: prices.as_deref(),
+            v3_chunks_per_poll,
         }),
     };
     if let Err(error) = outcome {
@@ -876,6 +883,7 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
         to,
         window,
         Duration::from_millis(delay_ms),
+        None,
     )
     .map_err(|e| e.to_string())?;
     let prices_b = gaps::sweep_swap_prices(
@@ -887,6 +895,7 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
         to,
         window,
         Duration::from_millis(delay_ms),
+        None,
     )
     .map_err(|e| e.to_string())?;
     let s = gaps::gap_distribution(&cross_a, &cross_b, &prices_a, &prices_b);
@@ -1015,6 +1024,7 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
         to,
         window,
         Duration::from_millis(delay_ms),
+        None,
     )
     .map_err(|e| e.to_string())?;
     let priced_b = gaps::sweep_swap_prices(
@@ -1026,6 +1036,7 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
         to,
         window,
         Duration::from_millis(delay_ms),
+        None,
     )
     .map_err(|e| e.to_string())?;
     let quotes = gaps::quote_manifest(&a_entries, &b_entries, &priced_a, &priced_b);
@@ -1174,6 +1185,7 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
         args.to,
         args.window,
         Duration::from_millis(args.delay_ms),
+        None,
     )
     .map_err(|e| e.to_string())?;
     let priced_b = gaps::sweep_swap_prices(
@@ -1185,6 +1197,7 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
         args.to,
         args.window,
         Duration::from_millis(args.delay_ms),
+        None,
     )
     .map_err(|e| e.to_string())?;
 
@@ -1212,6 +1225,21 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// `net_profit_usd / threshold_usd` as an f64 ratio (1.0 = at the submission
+/// floor; real values here are quotients of USD fixed-point so the division is
+/// exact). Returns `0.0` when the threshold is zero or empty.
+fn floor_ratio(net: alloy_primitives::U256, threshold: alloy_primitives::U256) -> f64 {
+    if threshold.is_zero() {
+        return 0.0;
+    }
+    let n = gaps::f64_of(net);
+    let t = gaps::f64_of(threshold);
+    if t == 0.0 {
+        return 0.0;
+    }
+    n / t
+}
+
 /// Arguments for [`run_pairs_command`].
 struct RunPairsArgs<'a> {
     a: &'a PathBuf,
@@ -1229,6 +1257,9 @@ struct RunPairsArgs<'a> {
     delay_ms: u64,
     csv: Option<&'a std::path::Path>,
     prices: Option<&'a std::path::Path>,
+    /// V3 address chunks swept per poll in the ring sweep; when zero the
+    /// default covers the whole V3 universe within ~1h.
+    v3_chunks_per_poll: u64,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -1260,7 +1291,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
         writeln!(
             out,
-            "token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,threshold_usd,reason"
+            "kind,token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,threshold_usd,floor_ratio,reason"
         )
         .map_err(|e| e.to_string())?;
         csv_out = Some(out);
@@ -1350,7 +1381,26 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut evals = 0usize;
     let mut interesting = 0usize;
     let mut not_evaluated = 0usize;
+    let mut triangle_evals = 0usize;
+    let mut triangle_interesting = 0usize;
+    let mut near_misses = 0usize;
     let mut last_window = 0u64;
+    let v3_chunks = (a_entries.chunks(999).count() * usize::from(profile_bytes_a == *b"v3"))
+        .max(b_entries.chunks(999).count() * usize::from(profile_bytes_b == *b"v3"))
+        .max(1);
+    // Default ring: sweep the whole V3 universe once per ~1h at the poll
+    // cadence (chunks-per-poll = chunks × poll_ms / 3_600_000), so detection
+    // latency stays under an hour while each poll burns one chunk of CU.
+    let v3_chunks_per_poll_eff = if args.v3_chunks_per_poll == 0 {
+        let per_hour = u64::try_from(v3_chunks)
+            .expect("v3 catalog chunk count must fit u64")
+            .saturating_mul(poll_ms)
+            .saturating_div(3_600_000);
+        per_hour.max(1)
+    } else {
+        args.v3_chunks_per_poll
+    };
+    let mut v3_ring_start = 0u64;
 
     loop {
         if stop.flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1377,6 +1427,11 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             continue;
         }
         let window_from = high_water + 1;
+        let v3_window = if profile_bytes_a == *b"v3" {
+            Some((v3_ring_start, v3_chunks_per_poll_eff))
+        } else {
+            None
+        };
         let priced_a = match gaps::sweep_swap_prices(
             &reader,
             profile_bytes_a,
@@ -1386,6 +1441,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             latest,
             window,
             delay,
+            v3_window,
         ) {
             Ok(priced) => priced,
             Err(TransportError::Transient(message)) => {
@@ -1394,6 +1450,11 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                 continue;
             }
             Err(error) => return Err(error.to_string()),
+        };
+        let v4_window = if profile_bytes_b == *b"v3" {
+            Some((v3_ring_start, v3_chunks_per_poll_eff))
+        } else {
+            None
         };
         let priced_b = match gaps::sweep_swap_prices(
             &reader,
@@ -1404,6 +1465,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             latest,
             window,
             delay,
+            v4_window,
         ) {
             Ok(priced) => priced,
             Err(TransportError::Transient(message)) => {
@@ -1413,6 +1475,9 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             }
             Err(error) => return Err(error.to_string()),
         };
+        // Advance the V3 ring cursor past the chunks swept this poll so every
+        // pool is re-priced once per full ring.
+        v3_ring_start = (v3_ring_start + v3_chunks_per_poll_eff) % v3_chunks as u64;
         let applied_this = priced_a.len() + priced_b.len();
         applied = applied.saturating_add(applied_this as u64);
         evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
@@ -1421,14 +1486,38 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         evals += outcome.evaluated.len();
         interesting += outcome.interesting.len();
         not_evaluated += outcome.not_evaluated.len();
+        triangle_evals += outcome.triangle_evaluated.len();
+        triangle_interesting += outcome.triangle_interesting.len();
+        for pair in &outcome.evaluated {
+            if let Some((_quote, classification)) = evaluator.quote_pair(*pair) {
+                let ratio = floor_ratio(
+                    classification.estimated_net_profit_usd,
+                    classification.threshold_usd,
+                );
+                if (0.5..1.0).contains(&ratio) {
+                    near_misses += 1;
+                }
+            }
+        }
+        for tri in &outcome.triangle_evaluated {
+            if let Some((_quote, classification)) = evaluator.quote_triangle(*tri) {
+                let ratio = floor_ratio(
+                    classification.estimated_net_profit_usd,
+                    classification.threshold_usd,
+                );
+                if (0.5..1.0).contains(&ratio) {
+                    near_misses += 1;
+                }
+            }
+        }
         if let Some(out) = &mut csv_out {
-            for pair in &outcome.interesting {
+            for pair in &outcome.evaluated {
                 if let Some((quote, classification)) = evaluator.quote_pair(*pair) {
                     let lo = alloy_primitives::Address::from_slice(&pair.0);
                     let hi = alloy_primitives::Address::from_slice(&pair.1);
                     writeln!(
                         out,
-                        "{},{},{},{},{},{},{:.6},{},{},{},{:?}",
+                        "pair,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?}",
                         lo,
                         hi,
                         latest,
@@ -1439,6 +1528,37 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                         classification.gross_profit_usd,
                         classification.estimated_net_profit_usd,
                         classification.threshold_usd,
+                        floor_ratio(
+                            classification.estimated_net_profit_usd,
+                            classification.threshold_usd
+                        ),
+                        classification.reason,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            for tri in &outcome.triangle_evaluated {
+                if let Some((quote, classification)) = evaluator.quote_triangle(*tri) {
+                    let t = evaluator.triangle(*tri);
+                    let lo = alloy_primitives::Address::from_slice(&t.0);
+                    let hi = alloy_primitives::Address::from_slice(&t.1);
+                    writeln!(
+                        out,
+                        "triangle,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?}",
+                        lo,
+                        hi,
+                        latest,
+                        quote.input,
+                        quote.output,
+                        quote.profit,
+                        quote.log2_skew,
+                        classification.gross_profit_usd,
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                        floor_ratio(
+                            classification.estimated_net_profit_usd,
+                            classification.threshold_usd
+                        ),
                         classification.reason,
                     )
                     .map_err(|e| e.to_string())?;
@@ -1448,13 +1568,15 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         last_window = latest;
         high_water = latest;
         println!(
-            "run-pairs: poll {}-{} priced a={} b={} evals={} gated={} dirty={}",
+            "run-pairs: poll {}-{} priced a={} b={} evals={} gated={} triangles={}/{} dirty={}",
             window_from,
             latest,
             priced_a.len(),
             priced_b.len(),
             outcome.evaluated.len(),
             outcome.interesting.len(),
+            outcome.triangle_interesting.len(),
+            outcome.triangle_evaluated.len(),
             outcome.not_evaluated.len(),
         );
         std::thread::sleep(poll);
@@ -1462,11 +1584,14 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
 
     let dirty_now = evaluator.queue_len();
     println!(
-        "run-pairs: done at block {} applied={} evals={} gated={} not_evaluated={} dirty={} elapsed_s={}",
+        "run-pairs: done at block {} applied={} evals={} gated={} triangles={}/{} near_miss={} not_evaluated={} dirty={} elapsed_s={}",
         last_window,
         applied,
         evals,
         interesting,
+        triangle_interesting,
+        triangle_evals,
+        near_misses,
         not_evaluated,
         dirty_now,
         since.elapsed().as_secs(),

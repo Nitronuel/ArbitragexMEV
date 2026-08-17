@@ -10,19 +10,25 @@ use crate::gaps::{PairQuote, PoolEntry, PoolPrice, pool_key, quote_pair};
 /// addresses, `lo <= hi` bytewise.
 pub type PairKey = ([u8; 20], [u8; 20]);
 
-/// Bounded dirty-pair set with deduplication and overload degradation.
+/// Bounded dirty-set with deduplication and overload degradation.
 ///
-/// A reserve update marks the pools it touched; the index expands each pool to
-/// its indexed pairs, coalesces duplicates, and reports overload instead of
-/// dropping state. A drained batch is returned in deterministic pair order.
+/// A reserve update marks the items it touched (pairs or triangle indexes); the
+/// index coalesces duplicates and reports overload instead of dropping state.
+/// A drained batch is returned in deterministic key order.
 #[derive(Debug)]
-struct DirtyPairQueue {
+struct DirtyQueue<T>
+where
+    T: std::cmp::Ord + std::hash::Hash + Copy,
+{
     capacity: usize,
-    pending: HashSet<PairKey>,
+    pending: HashSet<T>,
     degraded: bool,
 }
 
-impl DirtyPairQueue {
+impl<T> DirtyQueue<T>
+where
+    T: std::cmp::Ord + std::hash::Hash + Copy,
+{
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -31,8 +37,8 @@ impl DirtyPairQueue {
         }
     }
 
-    fn enqueue(&mut self, pair: PairKey) {
-        self.pending.insert(pair);
+    fn enqueue(&mut self, item: T) {
+        self.pending.insert(item);
         if self.pending.len() > self.capacity {
             self.degraded = true;
         }
@@ -45,12 +51,19 @@ impl DirtyPairQueue {
         degraded
     }
 
-    fn drain(&mut self) -> Vec<PairKey> {
+    fn drain(&mut self) -> Vec<T> {
         let mut keys: Vec<_> = self.pending.drain().collect();
         keys.sort_unstable();
         keys
     }
+
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
 }
+
+type DirtyPairQueue = DirtyQueue<PairKey>;
+type DirtyTriQueue = DirtyQueue<usize>;
 
 /// One drained dirty-pair evaluation batch.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -61,6 +74,13 @@ pub struct PairRunOutcome {
     pub interesting: Vec<PairKey>,
     /// Pairs whose quote failed or lacked a priced leg on either venue.
     pub not_evaluated: Vec<PairKey>,
+    /// Three-hop triangles (indexes into the evaluator's triangle list) that
+    /// produced a quote this batch.
+    pub triangle_evaluated: Vec<usize>,
+    /// Triangles whose quote cleared the submission-gate floor.
+    pub triangle_interesting: Vec<usize>,
+    /// Triangles whose quote failed or lacked a priced edge.
+    pub triangle_not_evaluated: Vec<usize>,
     /// The dirty queue exceeded its configured capacity this batch.
     pub degraded: bool,
 }
@@ -75,6 +95,10 @@ pub struct PairRunOutcome {
 pub struct PairDirtyEvaluator {
     by_pair: HashMap<PairKey, (Vec<PoolEntry>, Vec<PoolEntry>)>,
     by_pool: HashMap<([u8; 2], [u8; 32]), HashSet<PairKey>>,
+    /// Enumerated three-hop triangles; indexes shared by `by_pool_tri`.
+    triangles: Vec<crate::gaps::TokenTriple>,
+    /// `(profile, pool)` -> triangle indexes touching that pool.
+    by_pool_tri: HashMap<([u8; 2], [u8; 32]), HashSet<usize>>,
     profile_a: [u8; 2],
     profile_b: [u8; 2],
     prices_a: HashMap<[u8; 32], PoolPrice>,
@@ -83,6 +107,7 @@ pub struct PairDirtyEvaluator {
     /// used to value each pair's anchor token instead of the `$1` fixture.
     token_usd: HashMap<Address, U256>,
     queue: DirtyPairQueue,
+    tri_queue: DirtyTriQueue,
     economics: Economics,
     reference: CostSnapshot,
 }
@@ -118,7 +143,8 @@ impl PairDirtyEvaluator {
     }
 
     /// Builds the evaluator around an already-grouped pair map, keeping only
-    /// pairs with at least one pool per venue.
+    /// pairs with at least one pool per venue, and indexes the enumerated
+    /// three-hop triangles by their member pools.
     fn from_indexed_pairs(
         by_pair: HashMap<PairKey, (Vec<PoolEntry>, Vec<PoolEntry>)>,
         economics: Economics,
@@ -142,15 +168,52 @@ impl PairDirtyEvaluator {
             .into_iter()
             .filter(|(_, (a, b))| !a.is_empty() && !b.is_empty())
             .collect();
+        let triangles = crate::gaps::enumerate_triangles(
+            &by_pair
+                .values()
+                .flat_map(|(a, _)| a.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            &by_pair
+                .values()
+                .flat_map(|(_, b)| b.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        // Index each triangle by every pool that could serve one of its edges.
+        let mut by_pool_tri: HashMap<([u8; 2], [u8; 32]), HashSet<usize>> = HashMap::new();
+        for (index, (t0, t1, t2)) in triangles.iter().enumerate() {
+            let edges = [
+                crate::gaps::pair_key(Address::from_slice(t0), Address::from_slice(t1)),
+                crate::gaps::pair_key(Address::from_slice(t1), Address::from_slice(t2)),
+                crate::gaps::pair_key(Address::from_slice(t2), Address::from_slice(t0)),
+            ];
+            for edge in edges {
+                let Some((a_pools, b_pools)) = by_pair.get(&edge) else {
+                    continue;
+                };
+                for (profile, pools) in [(*b"v3", a_pools), (*b"v4", b_pools)] {
+                    for entry in pools {
+                        by_pool_tri
+                            .entry((profile, pool_key(entry)))
+                            .or_default()
+                            .insert(index);
+                    }
+                }
+            }
+        }
         Self {
             by_pair,
             by_pool,
+            triangles,
+            by_pool_tri,
             profile_a: *b"v3",
             profile_b: *b"v4",
             prices_a: HashMap::new(),
             prices_b: HashMap::new(),
             token_usd: HashMap::new(),
             queue: DirtyPairQueue::new(queue_capacity),
+            tri_queue: DirtyTriQueue::new(queue_capacity),
             economics,
             reference: CostSnapshot::invalid(),
         }
@@ -185,16 +248,22 @@ impl PairDirtyEvaluator {
         self.economics.classify(&optimal, &reference)
     }
 
-    /// Marks every pair indexed by the changed pool as dirty.
+    /// Marks every pair and triangle indexed by the changed pool as dirty.
     pub fn mark_pool(&mut self, profile: [u8; 2], pool: [u8; 32]) {
         if let Some(pairs) = self.by_pool.get(&(profile, pool)) {
             for &pair in pairs {
                 self.queue.enqueue(pair);
             }
         }
+        if let Some(tris) = self.by_pool_tri.get(&(profile, pool)) {
+            for &tri in tris {
+                self.tri_queue.enqueue(tri);
+            }
+        }
     }
 
-    /// Caches one pool price locally and marks the affected pairs dirty.
+    /// Caches one pool price locally and marks the affected pairs/triangles
+    /// dirty.
     ///
     /// This is the event hook for a `Sync`/`Swap`: the price is kept in
     /// process and only pairs whose pools changed are re-quoted.
@@ -207,10 +276,10 @@ impl PairDirtyEvaluator {
         self.mark_pool(profile, pool);
     }
 
-    /// Number of currently queued dirty pairs.
+    /// Number of currently queued dirty pairs and triangles.
     #[must_use]
     pub fn queue_len(&self) -> usize {
-        self.queue.pending.len()
+        self.queue.len() + self.tri_queue.len()
     }
 
     /// Seeds local prices from a sweep result, marking affected pairs dirty as
@@ -240,16 +309,16 @@ impl PairDirtyEvaluator {
         Ok(())
     }
 
-    /// Drains one dirty batch and classifies each affected pair against the
-    /// locally cached prices and the conservative economics gate.
+    /// Drains one dirty batch and classifies each affected pair and triangle
+    /// against the locally cached prices and the conservative economics gate.
     pub fn run_once(&mut self) -> PairRunOutcome {
-        let degraded = self.queue.take_degraded();
+        let degraded = self.queue.take_degraded() | self.tri_queue.take_degraded();
         let batch = self.queue.drain();
         let mut outcome = PairRunOutcome {
             degraded,
             ..PairRunOutcome::default()
         };
-        if batch.is_empty() {
+        if batch.is_empty() && self.tri_queue.pending.is_empty() {
             return outcome;
         }
 
@@ -270,7 +339,53 @@ impl PairDirtyEvaluator {
                 outcome.interesting.push(pair);
             }
         }
+
+        let tri_batch = self.tri_queue.drain();
+        for tri in tri_batch {
+            if tri >= self.triangles.len() {
+                outcome.triangle_not_evaluated.push(tri);
+                continue;
+            }
+            let (t0, t1, t2) = self.triangles[tri];
+            let t0 = Address::from_slice(&t0);
+            let t1 = Address::from_slice(&t1);
+            let t2 = Address::from_slice(&t2);
+            let Ok(Some(quote)) = crate::gaps::quote_triangle(
+                t0,
+                t1,
+                t2,
+                &self.by_pair,
+                &self.prices_a,
+                &self.prices_b,
+            ) else {
+                outcome.triangle_not_evaluated.push(tri);
+                continue;
+            };
+            outcome.triangle_evaluated.push(tri);
+
+            let classification = self.classify_anchor(t0, &quote);
+            if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+                outcome.triangle_interesting.push(tri);
+            }
+        }
         outcome
+    }
+
+    /// Classifies a quote against an anchor token's USD price (triangles use
+    /// their `p0` anchor).
+    fn classify_anchor(&self, anchor: Address, quote: &PairQuote) -> shadow::Classification {
+        let mut reference = self.reference;
+        if let Some(usd) = self.token_usd.get(&anchor)
+            && !usd.is_zero()
+        {
+            reference.usd_per_token = *usd;
+        }
+        let optimal = OptimalQuote {
+            input: quote.input,
+            output: quote.output,
+            profit: quote.profit,
+        };
+        self.economics.classify(&optimal, &reference)
     }
 
     /// Re-quotes one arbitrary pair from cached prices (used by tests and the
@@ -280,6 +395,25 @@ impl PairDirtyEvaluator {
         let (a_pools, b_pools) = self.by_pair.get(&pair)?;
         let quote = quote_pair(a_pools, b_pools, &self.prices_a, &self.prices_b).ok()??;
         Some((quote, self.classify_pair(pair, &quote)))
+    }
+
+    /// The enumerated triangle triple at `index`.
+    #[must_use]
+    pub fn triangle(&self, index: usize) -> ([u8; 20], [u8; 20], [u8; 20]) {
+        self.triangles[index]
+    }
+
+    /// Re-quotes one triangle (by index) from cached prices.
+    #[must_use]
+    pub fn quote_triangle(&self, tri: usize) -> Option<(PairQuote, shadow::Classification)> {
+        let (t0, t1, t2) = *self.triangles.get(tri)?;
+        let t0 = Address::from_slice(&t0);
+        let t1 = Address::from_slice(&t1);
+        let t2 = Address::from_slice(&t2);
+        let quote =
+            crate::gaps::quote_triangle(t0, t1, t2, &self.by_pair, &self.prices_a, &self.prices_b)
+                .ok()??;
+        Some((quote, self.classify_anchor(t0, &quote)))
     }
 }
 
@@ -548,5 +682,122 @@ mod tests {
             classification.gross_profit_usd < U256::from(FIXED_POINT_SCALE),
             "sub-cent anchor must not clear the gate: {classification:?}"
         );
+    }
+
+    /// Three cross-venue triangles on tokens `(a,b,c)`: each pool is a
+    /// different venue per edge so the cyclic round trip crosses venues.
+    fn triangle_fixture() -> (Vec<PoolEntry>, Vec<PoolEntry>, (Address, Address, Address)) {
+        let a = token_a();
+        let b = token_b();
+        let c: Address = "0xc000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let v3_pools = vec![
+            entry(
+                "0xf300000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+                a,
+                b,
+                3000,
+                *b"v3",
+                [0u8; 32],
+            ),
+            entry(
+                "0xf300000000000000000000000000000000000002"
+                    .parse()
+                    .unwrap(),
+                b,
+                c,
+                3000,
+                *b"v3",
+                [0u8; 32],
+            ),
+            entry(
+                "0xf300000000000000000000000000000000000003"
+                    .parse()
+                    .unwrap(),
+                c,
+                a,
+                3000,
+                *b"v3",
+                [0u8; 32],
+            ),
+        ];
+        let v4_pools = vec![
+            entry(
+                "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+                    .parse()
+                    .unwrap(),
+                a,
+                b,
+                2500,
+                *b"v4",
+                [0x01u8; 32],
+            ),
+            entry(
+                "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+                    .parse()
+                    .unwrap(),
+                b,
+                c,
+                2500,
+                *b"v4",
+                [0x02u8; 32],
+            ),
+            entry(
+                "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+                    .parse()
+                    .unwrap(),
+                c,
+                a,
+                2500,
+                *b"v4",
+                [0x03u8; 32],
+            ),
+        ];
+        (v3_pools, v4_pools, (a, b, c))
+    }
+
+    #[test]
+    fn swap_marks_touching_triangles_dirty_and_evaluates_them() {
+        let (v3_pools, v4_pools, (a, b, _c)) = triangle_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&v3_pools, &v4_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        assert_eq!(evaluator.triangles.len(), 1, "one triangle expected");
+        let tri = evaluator.triangles[0];
+        assert_eq!(
+            Address::from_slice(&tri.0),
+            a,
+            "triangle sorted by normalized address (token_a) is the anchor"
+        );
+        assert_eq!(Address::from_slice(&tri.1), b);
+
+        // Nothing priced -> the single triangle cannot be quoted.
+        assert!(evaluator.run_once().triangle_evaluated.is_empty());
+
+        // Price all three v3 legs; the cheapest cross-venue leg per edge now
+        // exists, so the triangle is quoted even on one venue alone.
+        for (i, pool) in v3_pools.iter().enumerate() {
+            let shift = u32::try_from(i).unwrap_or(0);
+            evaluator.apply_swap(
+                *b"v3",
+                pool.venue.into_word().into(),
+                price(
+                    U256::from(1u64) << (96 + shift),
+                    10_000_000_000_000_000_000_000,
+                    1,
+                ),
+            );
+        }
+        let outcome = evaluator.run_once();
+        assert_eq!(outcome.triangle_evaluated.len(), 1, "triangle quoted");
+
+        // Re-quote via the accessor; the closed-form optimal input returns a
+        // quote and classification is computed through the economics gate.
+        let (quote, classification) = evaluator.quote_triangle(0).expect("triangle re-quote");
+        assert!(quote.profit > U256::ZERO, "profitable drift expected");
+        assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
     }
 }
