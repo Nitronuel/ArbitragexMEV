@@ -110,6 +110,12 @@ pub struct PairDirtyEvaluator {
     tri_queue: DirtyTriQueue,
     economics: Economics,
     reference: CostSnapshot,
+    /// Maximum `|log2 skew|` a quote may carry and still be classified
+    /// normally. Larger gaps come from degenerate near-empty pools that are
+    /// not captureable; they are screened out of gating instead of surfacing as
+    /// `AboveThreshold` at absurd USD values (same bound as `gap-vs-toll
+    /// --max-skew`).
+    max_log2_skew: f64,
 }
 
 impl PairDirtyEvaluator {
@@ -216,12 +222,21 @@ impl PairDirtyEvaluator {
             tri_queue: DirtyTriQueue::new(queue_capacity),
             economics,
             reference: CostSnapshot::invalid(),
+            max_log2_skew: 0.5,
         }
     }
 
     /// Sets the gas-price and reference-route inputs for classification.
     pub fn set_reference(&mut self, reference: CostSnapshot) {
         self.reference = reference;
+    }
+
+    /// Bounds the `|log2 skew|` a quote may carry and still be classified
+    /// normally (default `0.5`, matching `gap-vs-toll --max-skew`). Quotes
+    /// above the cap are screened out of gating instead of surfacing as
+    /// `AboveThreshold` at degenerate empty-pool USD values.
+    pub fn set_max_log2_skew(&mut self, max_log2_skew: f64) {
+        self.max_log2_skew = max_log2_skew;
     }
 
     /// Sets per-token USD prices (fixed-point) used to value each pair's
@@ -233,6 +248,9 @@ impl PairDirtyEvaluator {
 
     /// Classifies one pair's quote against the pair's anchor-token USD price.
     fn classify_pair(&self, pair: PairKey, quote: &PairQuote) -> shadow::Classification {
+        if quote.log2_skew > self.max_log2_skew {
+            return self.skew_screened(quote);
+        }
         let mut reference = self.reference;
         let anchor = Address::from_slice(&pair.0);
         if let Some(usd) = self.token_usd.get(&anchor)
@@ -374,6 +392,9 @@ impl PairDirtyEvaluator {
     /// Classifies a quote against an anchor token's USD price (triangles use
     /// their `p0` anchor).
     fn classify_anchor(&self, anchor: Address, quote: &PairQuote) -> shadow::Classification {
+        if quote.log2_skew > self.max_log2_skew {
+            return self.skew_screened(quote);
+        }
         let mut reference = self.reference;
         if let Some(usd) = self.token_usd.get(&anchor)
             && !usd.is_zero()
@@ -386,6 +407,27 @@ impl PairDirtyEvaluator {
             profit: quote.profit,
         };
         self.economics.classify(&optimal, &reference)
+    }
+
+    /// Screens a quote whose `|log2 skew|` exceeds the captureable bound.
+    /// Degenerate near-empty-pool gaps are not tradeable, so they never reach
+    /// economic gating (which would otherwise label them `AboveThreshold` at
+    /// meaningless USD values).
+    fn skew_screened(&self, quote: &PairQuote) -> shadow::Classification {
+        shadow::Classification {
+            gross_profit: quote.profit,
+            gross_profit_usd: U256::ZERO,
+            flash_cost_usd: U256::ZERO,
+            gas_cost_usd: U256::ZERO,
+            estimated_net_profit_usd: U256::ZERO,
+            threshold_usd: U256::ZERO,
+            reason: shadow::ClassificationReason::NotEvaluated {
+                detail: format!(
+                    "skew {} exceeds max {:.2}",
+                    quote.log2_skew, self.max_log2_skew
+                ),
+            },
+        }
     }
 
     /// Re-quotes one arbitrary pair from cached prices (used by tests and the
@@ -520,6 +562,7 @@ mod tests {
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
 
         // No prices -> nothing evaluated on a run with no marks.
         assert!(evaluator.run_once().evaluated.is_empty());
@@ -554,6 +597,7 @@ mod tests {
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
         evaluator.apply_swap(
             *b"v3",
             key_a,
@@ -581,6 +625,7 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator = PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 0);
         evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
         evaluator.apply_swap(
             *b"v3",
             key_a,
@@ -603,6 +648,7 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_max_log2_skew(4.0);
         let mut reference = valid_reference();
         reference.gas_price_age_valid = false;
         evaluator.set_reference(reference);
@@ -629,6 +675,7 @@ mod tests {
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
         evaluator.apply_swap(
             *b"v3",
             key_a,
@@ -658,6 +705,7 @@ mod tests {
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
         evaluator.apply_swap(
             *b"v3",
             key_a,
@@ -682,6 +730,46 @@ mod tests {
             classification.gross_profit_usd < U256::from(FIXED_POINT_SCALE),
             "sub-cent anchor must not clear the gate: {classification:?}"
         );
+    }
+
+    #[test]
+    fn degenerate_skew_is_screened_before_economic_gating() {
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
+        );
+
+        // Default `max_log2_skew` is 0.5 but the 2x fixture skew is ~1.0, so
+        // the same quote that clears the gate above is screened out here.
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+        let (quote, classification) = evaluator.quote_pair(pair).expect("quote present");
+        assert!(
+            quote.log2_skew > evaluator.max_log2_skew,
+            "fixture must exceed the default bound for this test to mean anything"
+        );
+        assert!(
+            matches!(
+                &classification.reason,
+                ClassificationReason::NotEvaluated { detail }
+                    if detail.contains("skew") && detail.contains("max")
+            ),
+            "degenerate skew must be screened with a skew detail, not gated: {classification:?}"
+        );
+
+        // Raising the bound restores normal economic gating for the same quote.
+        evaluator.set_max_log2_skew(4.0);
+        let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
+        assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
     }
 
     /// Three cross-venue triangles on tokens `(a,b,c)`: each pool is a
@@ -765,6 +853,7 @@ mod tests {
         let mut evaluator =
             PairDirtyEvaluator::new(&v3_pools, &v4_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(200.0);
         assert_eq!(evaluator.triangles.len(), 1, "one triangle expected");
         let tri = evaluator.triangles[0];
         assert_eq!(

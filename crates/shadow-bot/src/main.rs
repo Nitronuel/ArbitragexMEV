@@ -269,6 +269,12 @@ enum Command {
         /// USD gating instead of the `$1` fixture.
         #[arg(long)]
         prices: Option<PathBuf>,
+        /// Maximum `|log2 skew|` a quote may carry and still be gated.
+        /// Larger gaps come from degenerate near-empty pools that are not
+        /// captureable; they are screened out instead of surfacing as
+        /// `AboveThreshold` at meaningless USD values.
+        #[arg(long, default_value_t = 0.5)]
+        max_skew: f64,
     },
     /// Sweeps the USDG/WETH-anchored legs for the manifest's seed tokens and
     /// derives a `token,usd_per_token` fixed-point price CSV from the median
@@ -371,6 +377,12 @@ enum Command {
         /// configured `--poll-ms`.
         #[arg(long, default_value_t = 0)]
         v3_chunks_per_poll: u64,
+        /// Maximum `|log2 skew|` a quote may carry and still be gated.
+        /// Larger gaps come from degenerate near-empty pools that are not
+        /// captureable; they are screened out instead of surfacing as
+        /// `AboveThreshold` at meaningless USD values.
+        #[arg(long, default_value_t = 0.5)]
+        max_skew: f64,
     },
 }
 
@@ -476,6 +488,7 @@ fn main() {
             delay_ms,
             csv,
             prices,
+            max_skew,
         } => quote_manifest_command(&QuoteManifestArgs {
             a: &a,
             b: &b,
@@ -490,6 +503,7 @@ fn main() {
             delay_ms,
             csv: csv.as_deref(),
             prices: prices.as_deref(),
+            max_skew,
         }),
         Command::DerivePrices {
             a,
@@ -535,6 +549,7 @@ fn main() {
             csv,
             prices,
             v3_chunks_per_poll,
+            max_skew,
         } => run_pairs_command(&RunPairsArgs {
             a: &a,
             b: &b,
@@ -552,6 +567,7 @@ fn main() {
             csv: csv.as_deref(),
             prices: prices.as_deref(),
             v3_chunks_per_poll,
+            max_skew,
         }),
     };
     if let Err(error) = outcome {
@@ -806,6 +822,9 @@ struct QuoteManifestArgs<'a> {
     delay_ms: u64,
     csv: Option<&'a std::path::Path>,
     prices: Option<&'a std::path::Path>,
+    /// Maximum `|log2 skew|` a quote may carry and still be gated; quotes
+    /// above it are screened out as uncaptureable.
+    max_skew: f64,
 }
 
 /// Arguments for [`derive_prices_command`].
@@ -1057,6 +1076,7 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
     let mut evaluator =
         dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, quotes.len().max(1));
     evaluator.set_reference(reference);
+    evaluator.set_max_log2_skew(args.max_skew);
     if let Some(path) = prices_path {
         let prices = gaps::load_prices(path)?;
         println!(
@@ -1260,6 +1280,9 @@ struct RunPairsArgs<'a> {
     /// V3 address chunks swept per poll in the ring sweep; when zero the
     /// default covers the whole V3 universe within ~1h.
     v3_chunks_per_poll: u64,
+    /// Maximum `|log2 skew|` a quote may carry and still be gated; quotes
+    /// above it are screened out as uncaptureable.
+    max_skew: f64,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -1358,6 +1381,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut evaluator =
         dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, queue_capacity);
     evaluator.set_reference(reference);
+    evaluator.set_max_log2_skew(args.max_skew);
     if let Some(path) = prices_path {
         let prices = gaps::load_prices(path)?;
         println!(
