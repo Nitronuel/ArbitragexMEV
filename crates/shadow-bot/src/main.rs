@@ -125,6 +125,13 @@ enum Command {
         /// lag analysis.
         #[arg(long)]
         raw_csv: Option<PathBuf>,
+        /// A/B harness: HTTP getLogs sidecar poll interval in ms (0 = off).
+        #[arg(long, default_value_t = 0)]
+        ab_http_ms: u64,
+        /// Optional A/B per-block comparison CSV (`block,ws_first_ms,
+        /// http_first_ms,delta_ms`).
+        #[arg(long)]
+        ab_csv: Option<PathBuf>,
     },
     /// Runs the observation pipeline. Use `--manifest` for a bounded live run,
     /// otherwise an offline snapshot fixture.
@@ -441,6 +448,8 @@ fn main() {
             request_cu,
             ws_bytes,
             raw_csv,
+            ab_http_ms,
+            ab_csv,
         } => run_ws_probe_command(
             &manifest,
             duration_secs,
@@ -448,7 +457,11 @@ fn main() {
             tip_interval_ms,
             request_cu,
             ws_bytes,
-            raw_csv.as_deref(),
+            ProbeOutputs {
+                raw_csv: raw_csv.as_deref(),
+                ab_http_ms,
+                ab_csv: ab_csv.as_deref(),
+            },
         ),
         Command::Run {
             config,
@@ -938,7 +951,7 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
         ThreadSleeper,
         budget.clone(),
         retry,
-        8453,
+        domain::ROBINHOOD_CHAIN_ID,
     );
     let (cross_a, cross_b) = gaps::restrict_to_cross(&catalog_a, &catalog_b);
     println!("cross pools: a={} b={}", cross_a.len(), cross_b.len());
@@ -1794,6 +1807,139 @@ fn open_raw_csv(path: &std::path::Path) -> Result<std::io::BufWriter<std::fs::Fi
     Ok(writer)
 }
 
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |d| {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// HTTP getLogs sidecar for the A/B harness: polls the same venue filters the
+/// WS subscriptions use and records each block's first HTTP visibility. Runs
+/// until either stop flag is raised.
+fn spawn_http_sidecar(
+    http_url: RedactedUrl,
+    budget: ProviderBudget,
+    filters: Vec<SubscriptionFilter>,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+    sidecar_stop: Arc<AtomicBool>,
+    log: std::sync::Arc<ws_probe::BlockLatencyLog>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("ab-http".to_owned())
+        .spawn(move || {
+            let retry = RetryPolicy {
+                max_retries: 3,
+                initial_delay: Duration::from_millis(250),
+                max_delay: Duration::from_secs(2),
+            };
+            let reader = ChainReader::new(
+                LiveHttp::new(http_url),
+                ThreadSleeper,
+                budget,
+                retry,
+                domain::ROBINHOOD_CHAIN_ID,
+            );
+            let Ok(mut high_water) = reader.current_block() else {
+                return;
+            };
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Relaxed)
+                    || sidecar_stop.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return;
+                }
+                std::thread::sleep(interval);
+                let Ok(latest) = reader.current_block() else {
+                    continue;
+                };
+                if latest <= high_water {
+                    continue;
+                }
+                for filter in &filters {
+                    let logs = reader.get_logs_windowed(
+                        &provider::LogFilter {
+                            from_block: high_water + 1,
+                            to_block: latest,
+                            addresses: filter.addresses.clone(),
+                            topic0: filter.topic0,
+                        },
+                        2_000,
+                    );
+                    if let Ok(logs) = logs {
+                        let seen_ms = now_unix_ms();
+                        for raw in &logs {
+                            if let Ok(envelope) = provider::RawLogEnvelope::from_rpc_value(raw) {
+                                log.observe(ws_probe::Source::Http, envelope.block_number, seen_ms);
+                            }
+                        }
+                    }
+                }
+                high_water = latest;
+            }
+        })
+        .expect("failed to spawn A/B HTTP sidecar thread")
+}
+
+/// Writes the per-block comparison CSV (when requested) and prints the
+/// signed delta summary over blocks both transports surfaced.
+fn finish_ab_latency(
+    ab_log: &std::sync::Arc<ws_probe::BlockLatencyLog>,
+    ab_csv: Option<&std::path::Path>,
+) -> Result<(), String> {
+    use std::io::Write;
+    let rows = ab_log.snapshot_rows();
+    if let Some(path) = ab_csv {
+        let mut writer =
+            std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+        writeln!(
+            writer,
+            "block_number,ws_first_unix_ms,http_first_unix_ms,delta_ms"
+        )
+        .map_err(|e| e.to_string())?;
+        for (block, ws, http) in &rows {
+            let delta = match (*ws, *http) {
+                (Some(w), Some(h)) => (h.cast_signed() - w.cast_signed()).to_string(),
+                _ => "-".to_owned(),
+            };
+            writeln!(
+                writer,
+                "{block},{},{},{delta}",
+                ws.map_or("-".to_owned(), |v| v.to_string()),
+                http.map_or("-".to_owned(), |v| v.to_string())
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        writer.flush().map_err(|e| e.to_string())?;
+    }
+    let mut deltas: Vec<i64> = rows
+        .iter()
+        .filter_map(|(_, ws, http)| match (*ws, *http) {
+            (Some(w), Some(h)) => Some(h.cast_signed() - w.cast_signed()),
+            _ => None,
+        })
+        .collect();
+    match ws_probe::summarize_ab(&mut deltas) {
+        Some(summary) => println!(
+            "ws-probe: ab-latency blocks={} delta_ms(http-ws) p25={:+} median={:+} p75={:+}",
+            summary.blocks, summary.p25_ms, summary.median_ms, summary.p75_ms
+        ),
+        None => println!("ws-probe: ab-latency no blocks observed by both transports"),
+    }
+    Ok(())
+}
+
+/// Optional probe outputs: raw per-event capture and the A/B harness config.
+#[derive(Debug, Clone, Copy, Default)]
+struct ProbeOutputs<'a> {
+    raw_csv: Option<&'a std::path::Path>,
+    ab_http_ms: u64,
+    ab_csv: Option<&'a std::path::Path>,
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_ws_probe_command(
     manifest_path: &std::path::Path,
     duration_secs: u64,
@@ -1801,7 +1947,7 @@ fn run_ws_probe_command(
     tip_interval_ms: u64,
     request_cu: u64,
     ws_bytes: u64,
-    raw_csv: Option<&std::path::Path>,
+    outputs: ProbeOutputs<'_>,
 ) -> Result<(), String> {
     let (ws_url, http_url) = resolve_probe_endpoints()?;
 
@@ -1823,7 +1969,7 @@ fn run_ws_probe_command(
         max_delay: Duration::from_secs(2),
     };
     let reader = ChainReader::new(
-        LiveHttp::new(http_url),
+        LiveHttp::new(http_url.clone()),
         ThreadSleeper,
         budget.clone(),
         retry,
@@ -1840,6 +1986,7 @@ fn run_ws_probe_command(
     let mut next_progress = Instant::now() + Duration::from_secs(10);
 
     let mut slots: Vec<WsProbeSlot> = subscriptions
+        .clone()
         .into_iter()
         .map(|subscription| WsProbeSlot {
             subscription,
@@ -1851,7 +1998,24 @@ fn run_ws_probe_command(
         })
         .collect();
     let mut total_events = 0u64;
-    let mut raw_csv = raw_csv.map(open_raw_csv).transpose()?;
+    let mut raw_csv = outputs.raw_csv.map(open_raw_csv).transpose()?;
+    let ab_log = std::sync::Arc::new(ws_probe::BlockLatencyLog::new());
+    let mut sidecar_handle = None;
+    if outputs.ab_http_ms > 0 {
+        sidecar_handle = Some(spawn_http_sidecar(
+            http_url.clone(),
+            budget.clone(),
+            subscriptions.iter().map(|s| s.filter.clone()).collect(),
+            Duration::from_millis(outputs.ab_http_ms.max(200)),
+            std::sync::Arc::clone(&stop.flag),
+            Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::clone(&ab_log),
+        ));
+        println!(
+            "ws-probe: A/B HTTP sidecar polling every {}ms",
+            outputs.ab_http_ms
+        );
+    }
 
     loop {
         if stop.flag.load(std::sync::atomic::Ordering::Relaxed)
@@ -1870,11 +2034,10 @@ fn run_ws_probe_command(
             if let Some((block, tx_index, log_index)) = slot.poll(&ws_url, &stream, poll_slice, tip)
             {
                 total_events += 1;
+                let recv_ms = now_unix_ms();
+                ab_log.observe(ws_probe::Source::Ws, block, recv_ms);
                 if let Some(writer) = raw_csv.as_mut() {
                     use std::io::Write;
-                    let recv_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0u128, |d| d.as_millis());
                     let _ = writeln!(writer, "{recv_ms},{block},{tx_index},{log_index}");
                 }
             }
@@ -1886,6 +2049,12 @@ fn run_ws_probe_command(
     }
 
     let window = merged_probe_stats(&slots);
+    if let Some(handle) = sidecar_handle {
+        handle
+            .join()
+            .map_err(|_| "A/B sidecar panicked".to_owned())?;
+    }
+    finish_ab_latency(&ab_log, outputs.ab_csv)?;
     let reason = if stop.flag.load(std::sync::atomic::Ordering::Relaxed) {
         "signal"
     } else if limit != 0 && total_events >= limit {

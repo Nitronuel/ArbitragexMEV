@@ -161,6 +161,99 @@ impl ProbeStats {
     }
 }
 
+/// Which transport first surfaced a block's swap logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Ws,
+    Http,
+}
+
+/// Earliest visibility of one block's swap logs per transport.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlockVisibility {
+    pub ws_ms: Option<u64>,
+    pub http_ms: Option<u64>,
+}
+
+/// Shared first-visibility log for the A/B harness: both transports report
+/// when they first surface each block's catalog swap logs; only the earliest
+/// sighting per transport is kept.
+#[derive(Default)]
+pub struct BlockLatencyLog {
+    inner: std::sync::Mutex<std::collections::HashMap<u64, BlockVisibility>>,
+}
+
+impl BlockLatencyLog {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a sighting; keeps the earliest per transport.
+    pub fn observe(&self, source: Source, block: u64, unix_ms: u64) {
+        let mut map = self.inner.lock().expect("latency log poisoned");
+        let entry = map.entry(block).or_default();
+        match source {
+            Source::Ws => {
+                if entry.ws_ms.is_none_or(|seen| unix_ms < seen) {
+                    entry.ws_ms = Some(unix_ms);
+                }
+            }
+            Source::Http => {
+                if entry.http_ms.is_none_or(|seen| unix_ms < seen) {
+                    entry.http_ms = Some(unix_ms);
+                }
+            }
+        }
+    }
+
+    /// Sorted `(block, ws_first_ms, http_first_ms)` rows.
+    #[must_use]
+    pub fn snapshot_rows(&self) -> Vec<(u64, Option<u64>, Option<u64>)> {
+        let map = self.inner.lock().expect("latency log poisoned");
+        let mut rows: Vec<(u64, Option<u64>, Option<u64>)> = map
+            .iter()
+            .map(|(&block, v)| (block, v.ws_ms, v.http_ms))
+            .collect();
+        rows.sort_by_key(|(block, _, _)| *block);
+        rows
+    }
+}
+
+/// Signed delta statistics over blocks observed by both transports:
+/// `http_first_ms - ws_first_ms` in milliseconds. Positive means HTTP
+/// surfaced the block later than WS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbSummary {
+    pub blocks: usize,
+    pub p25_ms: i64,
+    pub median_ms: i64,
+    pub p75_ms: i64,
+}
+
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub fn summarize_ab(deltas_ms: &mut [i64]) -> Option<AbSummary> {
+    if deltas_ms.is_empty() {
+        return None;
+    }
+    deltas_ms.sort_unstable();
+    let pick = |q: f64| -> i64 {
+        let idx = ((deltas_ms.len() - 1) as f64 * q).round() as usize;
+        deltas_ms[idx]
+    };
+    Some(AbSummary {
+        blocks: deltas_ms.len(),
+        p25_ms: pick(0.25),
+        median_ms: pick(0.5),
+        p75_ms: pick(0.75),
+    })
+}
+
 /// Reconnect backoff for a failed or closed subscription: doubles from
 /// 250 ms and caps at 2 s, matching the provider retry policy shape.
 #[must_use]
@@ -331,6 +424,38 @@ mod tests {
                 .is_some_and(|m| (m + 4.5).abs() < 1e-9)
         );
         assert_eq!(stats.events, 2);
+    }
+
+    #[test]
+    fn latency_log_keeps_earliest_sighting_per_transport() {
+        let log = BlockLatencyLog::new();
+        log.observe(Source::Ws, 100, 1_000);
+        log.observe(Source::Ws, 100, 900);
+        log.observe(Source::Http, 100, 1_500);
+        log.observe(Source::Http, 100, 2_000);
+        assert_eq!(log.snapshot_rows(), vec![(100, Some(900), Some(1_500))]);
+    }
+
+    #[test]
+    fn latency_log_rows_are_block_sorted_and_sparse() {
+        let log = BlockLatencyLog::new();
+        log.observe(Source::Http, 300, 5);
+        log.observe(Source::Ws, 100, 1);
+        let rows = log.snapshot_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (100, Some(1), None));
+        assert_eq!(rows[1], (300, None, Some(5)));
+    }
+
+    #[test]
+    fn summarize_ab_reports_quartiles_and_handles_empty() {
+        assert_eq!(summarize_ab(&mut []), None);
+        let mut deltas = vec![100, -50, 30, 10, 0];
+        let summary = summarize_ab(&mut deltas).expect("non-empty");
+        assert_eq!(summary.blocks, 5);
+        assert_eq!(summary.median_ms, 10);
+        assert_eq!(summary.p25_ms, 0);
+        assert_eq!(summary.p75_ms, 30);
     }
 
     #[test]
