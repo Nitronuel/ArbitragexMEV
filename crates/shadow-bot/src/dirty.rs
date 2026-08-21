@@ -116,6 +116,17 @@ pub struct PairDirtyEvaluator {
     /// `AboveThreshold` at absurd USD values (same bound as `gap-vs-toll
     /// --max-skew`).
     max_log2_skew: f64,
+    /// Highest block number the evaluator has been told about (the last poll's
+    /// chain tip). Every cached `PoolPrice.block` is compared against this to
+    /// decide whether a quote's reference leg is stale.
+    current_block: u64,
+    /// Maximum age in blocks (relative to [`Self::current_block`]) a quote's
+    /// oldest leg may carry and still be classified normally. A reference leg
+    /// that is refresh-starved — priced once and never re-priced by the ring
+    /// sweep — produces a pseudo-gap against the fresh other venue; quotes
+    /// older than this bound are screened out instead of gated. The default
+    /// (`0`) disables the screen.
+    max_price_age: u64,
 }
 
 impl PairDirtyEvaluator {
@@ -223,6 +234,8 @@ impl PairDirtyEvaluator {
             economics,
             reference: CostSnapshot::invalid(),
             max_log2_skew: 0.5,
+            current_block: 0,
+            max_price_age: 0,
         }
     }
 
@@ -239,6 +252,23 @@ impl PairDirtyEvaluator {
         self.max_log2_skew = max_log2_skew;
     }
 
+    /// Bounds how old (in blocks, vs the latest poll's tip) a quote's oldest
+    /// leg price may be and still be classified normally (default `0` =
+    /// disabled). A refresh-starved reference leg — priced once and never
+    /// re-priced by the V3 ring sweep — produces a pseudo-gap against the
+    /// continuously-priced V4 side, so such quotes are screened out instead of
+    /// surfacing as `AboveThreshold` at stale-leg USD values.
+    pub fn set_max_price_age(&mut self, max_price_blocks: u64) {
+        self.max_price_age = max_price_blocks;
+    }
+
+    /// Records the highest block number seen so far (the last poll's chain
+    /// tip) so price-age screening can compare each cached
+    /// `PoolPrice.block` against it.
+    pub fn set_current_block(&mut self, block: u64) {
+        self.current_block = block;
+    }
+
     /// Sets per-token USD prices (fixed-point) used to value each pair's
     /// anchor token, replacing the `$1` fixture for known tokens. Unknown
     /// tokens fall back to the reference's `usd_per_token`.
@@ -250,6 +280,9 @@ impl PairDirtyEvaluator {
     fn classify_pair(&self, pair: PairKey, quote: &PairQuote) -> shadow::Classification {
         if quote.log2_skew > self.max_log2_skew {
             return self.skew_screened(quote);
+        }
+        if self.is_stale(quote) {
+            return self.price_age_screened(quote);
         }
         let mut reference = self.reference;
         let anchor = Address::from_slice(&pair.0);
@@ -395,6 +428,9 @@ impl PairDirtyEvaluator {
         if quote.log2_skew > self.max_log2_skew {
             return self.skew_screened(quote);
         }
+        if self.is_stale(quote) {
+            return self.price_age_screened(quote);
+        }
         let mut reference = self.reference;
         if let Some(usd) = self.token_usd.get(&anchor)
             && !usd.is_zero()
@@ -425,6 +461,39 @@ impl PairDirtyEvaluator {
                 detail: format!(
                     "skew {} exceeds max {:.2}",
                     quote.log2_skew, self.max_log2_skew
+                ),
+            },
+        }
+    }
+
+    /// Whether a quote's oldest leg price is older than the configured
+    /// `max_price_age` bound (in blocks) relative to the current chain tip.
+    fn is_stale(&self, quote: &PairQuote) -> bool {
+        if self.max_price_age == 0 {
+            return false;
+        }
+        let age = self.current_block.saturating_sub(quote.oldest_leg_block);
+        age > self.max_price_age
+    }
+
+    /// Screens a quote whose oldest leg price is older than the configured
+    /// price-age bound. A refresh-starved reference leg (priced once, never
+    /// re-priced by the V3 ring sweep) produces a pseudo-gap against the
+    /// continuously-priced V4 side; such quotes never reach economic gating.
+    fn price_age_screened(&self, quote: &PairQuote) -> shadow::Classification {
+        shadow::Classification {
+            gross_profit: quote.profit,
+            gross_profit_usd: U256::ZERO,
+            flash_cost_usd: U256::ZERO,
+            gas_cost_usd: U256::ZERO,
+            estimated_net_profit_usd: U256::ZERO,
+            threshold_usd: U256::ZERO,
+            reason: shadow::ClassificationReason::NotEvaluated {
+                detail: format!(
+                    "price block {} is {} blocks older than max price age {}",
+                    quote.oldest_leg_block,
+                    self.current_block.saturating_sub(quote.oldest_leg_block),
+                    self.max_price_age,
                 ),
             },
         }
@@ -770,6 +839,170 @@ mod tests {
         evaluator.set_max_log2_skew(4.0);
         let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
         assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+    }
+
+    #[test]
+    fn stale_reference_leg_is_screened_before_economic_gating() {
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        // Legs priced early (blocks 1 and 2); the poll tip is far ahead, so a
+        // refreshed-V4-vs-stale-V3 pseudo-gap must not gate.
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
+        );
+        evaluator.set_current_block(1_000_000);
+        evaluator.set_max_price_age(50_000);
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+        let (quote, classification) = evaluator.quote_pair(pair).expect("quote present");
+        assert!(
+            quote.oldest_leg_block < 1_000_000,
+            "fixture legs must predate the tip for this test to mean anything"
+        );
+        assert!(
+            matches!(
+                &classification.reason,
+                ClassificationReason::NotEvaluated { detail }
+                    if detail.contains("price") && detail.contains("max price age")
+            ),
+            "a stale reference leg must be screened with a price-age detail, not gated: {classification:?}"
+        );
+
+        // Raising the bound past the leg age restores normal gating.
+        evaluator.set_max_price_age(1_000_000);
+        let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
+        assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+
+        // A disabled screen (default 0) also gates normally.
+        evaluator.set_max_price_age(0);
+        let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
+        assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+    }
+
+    #[test]
+    fn fresh_legs_are_not_screened_within_price_age_bound() {
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        let tip = 500;
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                tip - 3,
+            ),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, tip),
+        );
+        evaluator.set_current_block(tip);
+        evaluator.set_max_price_age(10);
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+        let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
+        assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+    }
+
+    #[test]
+    fn triple_hop_stale_leg_is_screened() {
+        // Cheapest leg per edge wins, so a stale lower-fee v3 leg is chosen
+        // over a fresh v4 leg with a higher toll — the exact artifact setup
+        // (refresh-starved V3 vs continuously-priced V4).
+        let cheap_v3 = |token0: Address, token1: Address, id: u8| {
+            entry(
+                "0xf300000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+                token0,
+                token1,
+                100,
+                *b"v3",
+                [id; 32],
+            )
+        };
+        let a = token_a();
+        let b = token_b();
+        let c: Address = "0xc000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let v3_pools = vec![
+            cheap_v3(a, b, 0x10),
+            cheap_v3(b, c, 0x11),
+            cheap_v3(c, a, 0x12),
+        ];
+        // Rebuild the v4 side on the same `(a,b,c)` tokens with higher toll.
+        let pricey_v4 = |token0: Address, token1: Address, id: u8| {
+            entry(
+                "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+                    .parse()
+                    .unwrap(),
+                token0,
+                token1,
+                2500,
+                *b"v4",
+                [id; 32],
+            )
+        };
+        let v4_pools = vec![
+            pricey_v4(a, b, 0x20),
+            pricey_v4(b, c, 0x21),
+            pricey_v4(c, a, 0x22),
+        ];
+        let mut evaluator =
+            PairDirtyEvaluator::new(&v3_pools, &v4_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(200.0);
+        let tip = 1_000_000u64;
+        for (i, pool) in v3_pools.iter().enumerate() {
+            let shift = u32::try_from(i).unwrap_or(0);
+            // Stale v3 legs (priced once early), fresh v4 legs at the tip.
+            evaluator.apply_swap(
+                *b"v3",
+                pool.venue.into_word().into(),
+                price(
+                    U256::from(1u64) << (96 + shift),
+                    10_000_000_000_000_000_000_000,
+                    tip - 999_000,
+                ),
+            );
+        }
+        for (i, pool) in v4_pools.iter().enumerate() {
+            let shift = u32::try_from(i).unwrap_or(0);
+            evaluator.apply_swap(
+                *b"v4",
+                pool.id,
+                price(
+                    U256::from(2u64) << (96 + shift),
+                    10_000_000_000_000_000_000_000,
+                    tip,
+                ),
+            );
+        }
+        evaluator.set_current_block(tip);
+        evaluator.set_max_price_age(50_000);
+        let (_, classification) = evaluator.quote_triangle(0).expect("triangle re-quote");
+        assert!(
+            matches!(
+                &classification.reason,
+                ClassificationReason::NotEvaluated { detail }
+                    if detail.contains("max price age")
+            ),
+            "a stale triangle leg must be screened: {classification:?}"
+        );
     }
 
     /// Three cross-venue triangles on tokens `(a,b,c)`: each pool is a

@@ -338,6 +338,7 @@ fn run_pairs_help_exposes_live_poll_flags() {
     assert!(help.contains("--duration-secs"));
     assert!(help.contains("--from"));
     assert!(help.contains("--manifest"));
+    assert!(help.contains("--max-price-age"));
 }
 
 #[test]

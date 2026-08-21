@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
     sync::atomic::AtomicBool,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::{Address, U256};
@@ -13,8 +13,9 @@ use clap::{Parser, Subcommand};
 use domain::ShadowConfig;
 use enumerate::{CrawlPace, Venue, sweep_venue};
 use provider::{
-    ChainReader, LiveHttp, LiveHttpProbe, LiveRpc, LogStream, ProviderBudget, RedactedUrl,
-    RetryPolicy, SubscriptionFilter, ThreadSleeper, TransportError,
+    ChainReader, LiveHttp, LiveHttpProbe, LiveRpc, LiveWsClient, LogStream, ProviderBudget,
+    RedactedUrl, RetryPolicy, StreamItem, SubscriptionFilter, ThreadSleeper, TransportError,
+    WsProbe,
 };
 use shadow::{
     CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceReport, ServiceSnapshot, daily_report,
@@ -26,6 +27,7 @@ use storage::Storage;
 mod dirty;
 mod enumerate;
 mod gaps;
+mod ws_probe;
 
 const QUEUE_CAPACITY: usize = 100_000;
 const CYCLE_LIMITS: CycleLimits = CycleLimits {
@@ -103,6 +105,22 @@ enum Command {
         limit: u64,
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
+    },
+    /// Probes a live WebSocket endpoint with per-venue filtered Swap-log
+    /// subscriptions and reports tip-lag and byte usage. Read-only.
+    WsProbe {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        duration_secs: u64,
+        #[arg(long, default_value_t = 0)]
+        limit: u64,
+        #[arg(long, default_value_t = 5000)]
+        tip_interval_ms: u64,
+        #[arg(long, default_value_t = 8_000_000)]
+        request_cu: u64,
+        #[arg(long, default_value_t = 268_435_456)]
+        ws_bytes: u64,
     },
     /// Runs the observation pipeline. Use `--manifest` for a bounded live run,
     /// otherwise an offline snapshot fixture.
@@ -383,6 +401,14 @@ enum Command {
         /// `AboveThreshold` at meaningless USD values.
         #[arg(long, default_value_t = 0.5)]
         max_skew: f64,
+        /// Maximum age in blocks (vs the poll tip) a quote's oldest leg price
+        /// may carry and still be gated. A refresh-starved reference leg —
+        /// priced once and never re-priced by the V3 ring sweep — produces a
+        /// pseudo-gap against the fresh V4 side; quotes older than this bound
+        /// are screened out instead of surfacing as `AboveThreshold`. `0`
+        /// disables the screen.
+        #[arg(long, default_value_t = 0)]
+        max_price_age: u64,
     },
 }
 
@@ -403,6 +429,21 @@ fn main() {
             limit,
             timeout_secs,
         } => run_smoke_command(&config, &manifest, block, limit, timeout_secs),
+        Command::WsProbe {
+            manifest,
+            duration_secs,
+            limit,
+            tip_interval_ms,
+            request_cu,
+            ws_bytes,
+        } => run_ws_probe_command(
+            &manifest,
+            duration_secs,
+            limit,
+            tip_interval_ms,
+            request_cu,
+            ws_bytes,
+        ),
         Command::Run {
             config,
             snapshot,
@@ -550,6 +591,7 @@ fn main() {
             prices,
             v3_chunks_per_poll,
             max_skew,
+            max_price_age,
         } => run_pairs_command(&RunPairsArgs {
             a: &a,
             b: &b,
@@ -568,6 +610,7 @@ fn main() {
             prices: prices.as_deref(),
             v3_chunks_per_poll,
             max_skew,
+            max_price_age,
         }),
     };
     if let Err(error) = outcome {
@@ -1283,6 +1326,9 @@ struct RunPairsArgs<'a> {
     /// Maximum `|log2 skew|` a quote may carry and still be gated; quotes
     /// above it are screened out as uncaptureable.
     max_skew: f64,
+    /// Maximum age in blocks (vs the poll tip) a quote's oldest leg price may
+    /// carry and still be gated; `0` disables the screen.
+    max_price_age: u64,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -1382,6 +1428,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, queue_capacity);
     evaluator.set_reference(reference);
     evaluator.set_max_log2_skew(args.max_skew);
+    evaluator.set_max_price_age(args.max_price_age);
     if let Some(path) = prices_path {
         let prices = gaps::load_prices(path)?;
         println!(
@@ -1506,6 +1553,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         applied = applied.saturating_add(applied_this as u64);
         evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
         evaluator.seed_prices(profile_bytes_b, &b_entries, &priced_b)?;
+        evaluator.set_current_block(latest);
         let outcome = evaluator.run_once();
         evals += outcome.evaluated.len();
         interesting += outcome.interesting.len();
@@ -1621,6 +1669,242 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         since.elapsed().as_secs(),
     );
     Ok(())
+}
+
+fn resolve_env_url(primary: &str, fallback: &str) -> Result<String, String> {
+    std::env::var(primary)
+        .or_else(|_| std::env::var(fallback))
+        .map_err(|_| format!("missing {primary} (or fallback {fallback})"))
+}
+
+/// One WebSocket subscription slot: the planned filter plus its live client,
+/// rolling stats, and reconnect backoff state.
+struct WsProbeSlot {
+    subscription: ws_probe::VenueSubscription,
+    client: Option<LiveWsClient>,
+    stats: ws_probe::ProbeStats,
+    attempts: u32,
+    retry_at: Option<Instant>,
+}
+
+impl WsProbeSlot {
+    fn ensure_connected(&mut self, ws_url: &RedactedUrl) {
+        if self.client.is_some() {
+            return;
+        }
+        if self
+            .retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            return;
+        }
+        match LiveWsClient::connect(ws_url.clone(), self.subscription.filter.clone()) {
+            Ok(client) => {
+                self.client = Some(client);
+                self.attempts = 0;
+            }
+            Err(_) => self.schedule_reconnect(),
+        }
+    }
+
+    fn schedule_reconnect(&mut self) {
+        self.client = None;
+        self.stats.reconnects += 1;
+        self.attempts += 1;
+        self.retry_at = Some(Instant::now() + ws_probe::backoff_delay(self.attempts));
+    }
+
+    /// Connects if needed, drains one bounded item, and returns how many new
+    /// events were counted.
+    fn poll(
+        &mut self,
+        ws_url: &RedactedUrl,
+        stream: &LogStream,
+        timeout: Duration,
+        tip: u64,
+    ) -> usize {
+        self.ensure_connected(ws_url);
+        let Some(client) = self.client.as_ref() else {
+            return 0;
+        };
+        match client.next(stream, timeout) {
+            Ok(Some(StreamItem::Log(envelope))) => {
+                if let Some(lag) = ws_probe::lag_or_skew(envelope.block_number, tip, 5) {
+                    self.stats.observe_lag(lag);
+                    1
+                } else {
+                    0
+                }
+            }
+            Ok(Some(StreamItem::Disconnected(_))) | Err(_) => {
+                self.schedule_reconnect();
+                0
+            }
+            Ok(None) => 0,
+        }
+    }
+}
+
+fn merged_probe_stats(slots: &[WsProbeSlot]) -> ws_probe::ProbeStats {
+    let mut window = ws_probe::ProbeStats::default();
+    for slot in slots {
+        window.merge(&slot.stats);
+    }
+    window
+}
+
+fn resolve_probe_endpoints() -> Result<(RedactedUrl, RedactedUrl), String> {
+    let ws_endpoint = resolve_env_url("ALCHEMY_RHC_WS_URL", "ROBINHOOD_WS_RPC_URL")?;
+    let http_endpoint = resolve_env_url("ALCHEMY_RHC_HTTP_URL", "ROBINHOOD_HTTP_RPC_URL")?;
+    let ws_url = ws_endpoint
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let http_url = http_endpoint
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    Ok((ws_url, http_url))
+}
+
+fn run_ws_probe_command(
+    manifest_path: &std::path::Path,
+    duration_secs: u64,
+    limit: u64,
+    tip_interval_ms: u64,
+    request_cu: u64,
+    ws_bytes: u64,
+) -> Result<(), String> {
+    let (ws_url, http_url) = resolve_probe_endpoints()?;
+
+    let (subscriptions, skipped) = ws_probe::build_subscriptions(
+        fs::File::open(manifest_path).map_err(|error| error.to_string())?,
+    )?;
+    println!(
+        "ws-probe: {} subscriptions ({} constant-product rows skipped), endpoint {}",
+        subscriptions.len(),
+        skipped,
+        ws_url,
+    );
+
+    let budget = ProviderBudget::new(request_cu, ws_bytes);
+    let stream = LogStream::new(budget.clone());
+    let retry = RetryPolicy {
+        max_retries: 3,
+        initial_delay: Duration::from_millis(250),
+        max_delay: Duration::from_secs(2),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+        domain::ROBINHOOD_CHAIN_ID,
+    );
+
+    let stop = StopOnSignal::install();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(duration_secs);
+    let tip_interval = Duration::from_millis(tip_interval_ms.max(1_000));
+    let poll_slice = Duration::from_millis(100);
+    let mut tip = reader.current_block().map_err(|error| error.to_string())?;
+    let mut last_tip_refresh = Instant::now();
+    let mut next_progress = Instant::now() + Duration::from_secs(10);
+
+    let mut slots: Vec<WsProbeSlot> = subscriptions
+        .into_iter()
+        .map(|subscription| WsProbeSlot {
+            subscription,
+            client: None,
+            stats: ws_probe::ProbeStats::default(),
+            attempts: 0,
+            retry_at: None,
+        })
+        .collect();
+    let mut total_events = 0u64;
+
+    loop {
+        if stop.flag.load(std::sync::atomic::Ordering::Relaxed)
+            || Instant::now() >= deadline
+            || (limit != 0 && total_events >= limit)
+        {
+            break;
+        }
+        if last_tip_refresh.elapsed() >= tip_interval {
+            if let Ok(block) = reader.current_block() {
+                tip = block;
+            }
+            last_tip_refresh = Instant::now();
+        }
+        for slot in &mut slots {
+            total_events +=
+                u64::try_from(slot.poll(&ws_url, &stream, poll_slice, tip)).unwrap_or(0);
+        }
+        if Instant::now() >= next_progress {
+            let parts: Vec<String> = slots
+                .iter()
+                .map(|slot| {
+                    format!(
+                        "{}:events={}+r{}+maxlag{}",
+                        slot.subscription.label,
+                        slot.stats.events,
+                        slot.stats.reconnects,
+                        slot.stats.lag_max_blocks()
+                    )
+                })
+                .collect();
+            println!(
+                "{} [{}]",
+                ws_probe::progress_line(
+                    started.elapsed().as_secs(),
+                    &merged_probe_stats(&slots),
+                    budget.snapshot().websocket_delivered_bytes,
+                    tip,
+                ),
+                parts.join(" ")
+            );
+            next_progress += Duration::from_secs(10);
+        }
+    }
+
+    let window = merged_probe_stats(&slots);
+    let reason = if stop.flag.load(std::sync::atomic::Ordering::Relaxed) {
+        "signal"
+    } else if limit != 0 && total_events >= limit {
+        "limit"
+    } else {
+        "duration"
+    };
+    print_probe_summary(started.elapsed().as_secs(), &window, reason, &budget);
+    Ok(())
+}
+
+fn print_probe_summary(
+    elapsed_secs: u64,
+    window: &ws_probe::ProbeStats,
+    reason: &str,
+    budget: &ProviderBudget,
+) {
+    println!(
+        "ws-probe: done elapsed_s={} events={} lag_blocks min/mean/max={}/{:.1}/{} reconnects={} reason={}",
+        elapsed_secs,
+        window.events,
+        window
+            .lag_min_blocks()
+            .map_or("-".to_owned(), |min| min.to_string()),
+        window
+            .lag_mean_blocks()
+            .map_or("-".to_owned(), |mean| format!("{mean:.1}")),
+        window.lag_max_blocks(),
+        window.reconnects,
+        reason,
+    );
+    let usage = budget.snapshot();
+    println!(
+        "ws-probe: usage websocket_delivered_bytes={} websocket_accounted_bytes={} request_cu={} http_response_bytes={}",
+        usage.websocket_delivered_bytes,
+        usage.websocket_accounted_bytes,
+        usage.request_cu,
+        usage.http_response_bytes
+    );
 }
 
 fn run_smoke_command(

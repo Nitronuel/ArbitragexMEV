@@ -839,6 +839,12 @@ pub struct PairQuote {
     pub toll: f64,
     /// Observed log2 price skew across the two legs.
     pub log2_skew: f64,
+    /// Block number of the oldest (`PoolPrice.block`) among the legs used by
+    /// this quote. A quote whose reference leg is refresh-starved — cached
+    /// once and never re-priced by the ring sweep — carries a stale price, so
+    /// its skew is not a live cross-venue gap. The evaluator screens quotes
+    /// older than its `max_price_age` bound instead of gating them.
+    pub oldest_leg_block: u64,
 }
 
 /// Reduces a concentrated pool's sampled state to the virtual constant-product
@@ -970,6 +976,7 @@ pub fn quote_pair(
         profit: quote.profit,
         toll,
         log2_skew: skew,
+        oldest_leg_block: leg_price_a.block.min(leg_price_b.block),
     }))
 }
 
@@ -1209,6 +1216,11 @@ pub fn quote_triangle(
         profit: quote.profit,
         toll,
         log2_skew: skew.abs().log2(),
+        oldest_leg_block: leg01
+            .price
+            .block
+            .min(leg12.price.block)
+            .min(leg20.price.block),
     }))
 }
 
