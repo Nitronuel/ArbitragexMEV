@@ -166,22 +166,31 @@ impl ProbeStats {
 pub enum Source {
     Ws,
     Http,
+    /// A second HTTP endpoint (provider comparison sidecar).
+    Bench,
 }
 
-/// Earliest visibility of one block's swap logs per transport.
+/// Earliest visibility of one block's swap logs per transport. Field names
+/// intentionally share the `seen_` prefix for readability.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BlockVisibility {
-    pub ws_ms: Option<u64>,
-    pub http_ms: Option<u64>,
+    pub seen_ws: Option<u64>,
+    pub seen_http: Option<u64>,
+    pub seen_bench: Option<u64>,
 }
 
-/// Shared first-visibility log for the A/B harness: both transports report
-/// when they first surface each block's catalog swap logs; only the earliest
+/// Shared first-visibility log for the A/B harness: transports report when
+/// they first surface each block's catalog swap logs; only the earliest
 /// sighting per transport is kept.
 #[derive(Default)]
 pub struct BlockLatencyLog {
     inner: std::sync::Mutex<std::collections::HashMap<u64, BlockVisibility>>,
 }
+
+/// Sorted per-block first-visibility rows:
+/// `(block, ws_first, http_first, bench_first)` in unix ms.
+pub type VisibilityRow = (u64, Option<u64>, Option<u64>, Option<u64>);
 
 impl BlockLatencyLog {
     #[must_use]
@@ -193,29 +202,25 @@ impl BlockLatencyLog {
     pub fn observe(&self, source: Source, block: u64, unix_ms: u64) {
         let mut map = self.inner.lock().expect("latency log poisoned");
         let entry = map.entry(block).or_default();
-        match source {
-            Source::Ws => {
-                if entry.ws_ms.is_none_or(|seen| unix_ms < seen) {
-                    entry.ws_ms = Some(unix_ms);
-                }
-            }
-            Source::Http => {
-                if entry.http_ms.is_none_or(|seen| unix_ms < seen) {
-                    entry.http_ms = Some(unix_ms);
-                }
-            }
+        let slot = match source {
+            Source::Ws => &mut entry.seen_ws,
+            Source::Http => &mut entry.seen_http,
+            Source::Bench => &mut entry.seen_bench,
+        };
+        if slot.is_none_or(|seen| unix_ms < seen) {
+            *slot = Some(unix_ms);
         }
     }
 
-    /// Sorted `(block, ws_first_ms, http_first_ms)` rows.
+    /// Sorted per-block first-visibility rows (see [`VisibilityRow`]).
     #[must_use]
-    pub fn snapshot_rows(&self) -> Vec<(u64, Option<u64>, Option<u64>)> {
+    pub fn snapshot_rows(&self) -> Vec<VisibilityRow> {
         let map = self.inner.lock().expect("latency log poisoned");
-        let mut rows: Vec<(u64, Option<u64>, Option<u64>)> = map
+        let mut rows: Vec<VisibilityRow> = map
             .iter()
-            .map(|(&block, v)| (block, v.ws_ms, v.http_ms))
+            .map(|(&block, v)| (block, v.seen_ws, v.seen_http, v.seen_bench))
             .collect();
-        rows.sort_by_key(|(block, _, _)| *block);
+        rows.sort_by_key(|(block, _, _, _)| *block);
         rows
     }
 }
@@ -433,18 +438,21 @@ mod tests {
         log.observe(Source::Ws, 100, 900);
         log.observe(Source::Http, 100, 1_500);
         log.observe(Source::Http, 100, 2_000);
-        assert_eq!(log.snapshot_rows(), vec![(100, Some(900), Some(1_500))]);
+        assert_eq!(
+            log.snapshot_rows(),
+            vec![(100, Some(900), Some(1_500), None)]
+        );
     }
 
     #[test]
     fn latency_log_rows_are_block_sorted_and_sparse() {
         let log = BlockLatencyLog::new();
-        log.observe(Source::Http, 300, 5);
+        log.observe(Source::Bench, 300, 5);
         log.observe(Source::Ws, 100, 1);
         let rows = log.snapshot_rows();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], (100, Some(1), None));
-        assert_eq!(rows[1], (300, None, Some(5)));
+        assert_eq!(rows[0], (100, Some(1), None, None));
+        assert_eq!(rows[1], (300, None, None, Some(5)));
     }
 
     #[test]

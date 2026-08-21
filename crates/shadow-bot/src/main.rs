@@ -132,6 +132,13 @@ enum Command {
         /// http_first_ms,delta_ms`).
         #[arg(long)]
         ab_csv: Option<PathBuf>,
+        /// Provider-comparison HTTP endpoint (URL or `env:VAR_NAME`) polled by
+        /// a second sidecar; deltas reported against the primary HTTP view.
+        #[arg(long)]
+        bench_url: Option<String>,
+        /// Bench sidecar poll interval in ms (0 = off).
+        #[arg(long, default_value_t = 0)]
+        bench_http_ms: u64,
     },
     /// Runs the observation pipeline. Use `--manifest` for a bounded live run,
     /// otherwise an offline snapshot fixture.
@@ -450,6 +457,8 @@ fn main() {
             raw_csv,
             ab_http_ms,
             ab_csv,
+            bench_url,
+            bench_http_ms,
         } => run_ws_probe_command(
             &manifest,
             duration_secs,
@@ -461,6 +470,8 @@ fn main() {
                 raw_csv: raw_csv.as_deref(),
                 ab_http_ms,
                 ab_csv: ab_csv.as_deref(),
+                bench_url: bench_url.as_deref(),
+                bench_http_ms,
             },
         ),
         Command::Run {
@@ -1815,9 +1826,10 @@ fn now_unix_ms() -> u64 {
         })
 }
 
-/// HTTP getLogs sidecar for the A/B harness: polls the same venue filters the
-/// WS subscriptions use and records each block's first HTTP visibility. Runs
-/// until either stop flag is raised.
+/// HTTP getLogs sidecar for the latency harness: polls the given filters and
+/// records each block's first visibility under `source`. Runs until either
+/// stop flag is raised.
+#[allow(clippy::too_many_arguments)]
 fn spawn_http_sidecar(
     http_url: RedactedUrl,
     budget: ProviderBudget,
@@ -1826,6 +1838,7 @@ fn spawn_http_sidecar(
     stop: Arc<AtomicBool>,
     sidecar_stop: Arc<AtomicBool>,
     log: std::sync::Arc<ws_probe::BlockLatencyLog>,
+    source: ws_probe::Source,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ab-http".to_owned())
@@ -1872,7 +1885,7 @@ fn spawn_http_sidecar(
                         let seen_ms = now_unix_ms();
                         for raw in &logs {
                             if let Ok(envelope) = provider::RawLogEnvelope::from_rpc_value(raw) {
-                                log.observe(ws_probe::Source::Http, envelope.block_number, seen_ms);
+                                log.observe(source, envelope.block_number, seen_ms);
                             }
                         }
                     }
@@ -1883,11 +1896,13 @@ fn spawn_http_sidecar(
         .expect("failed to spawn A/B HTTP sidecar thread")
 }
 
-/// Writes the per-block comparison CSV (when requested) and prints the
-/// signed delta summary over blocks both transports surfaced.
+/// Writes the per-block comparison CSV (when requested) and prints signed
+/// delta summaries: WS-vs-HTTP when a sidecar ran, and Bench-vs-HTTP when a
+/// bench endpoint ran.
 fn finish_ab_latency(
     ab_log: &std::sync::Arc<ws_probe::BlockLatencyLog>,
     ab_csv: Option<&std::path::Path>,
+    has_bench: bool,
 ) -> Result<(), String> {
     use std::io::Write;
     let rows = ab_log.snapshot_rows();
@@ -1896,37 +1911,57 @@ fn finish_ab_latency(
             std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
         writeln!(
             writer,
-            "block_number,ws_first_unix_ms,http_first_unix_ms,delta_ms"
+            "block_number,ws_first_unix_ms,http_first_unix_ms,bench_first_unix_ms,delta_http_ws_ms,delta_bench_http_ms"
         )
         .map_err(|e| e.to_string())?;
-        for (block, ws, http) in &rows {
-            let delta = match (*ws, *http) {
-                (Some(w), Some(h)) => (h.cast_signed() - w.cast_signed()).to_string(),
+        for (block, ws, http, bench) in &rows {
+            let delta = |a: Option<u64>, b: Option<u64>| match (a, b) {
+                (Some(x), Some(y)) => (y.cast_signed() - x.cast_signed()).to_string(),
                 _ => "-".to_owned(),
             };
             writeln!(
                 writer,
-                "{block},{},{},{delta}",
+                "{block},{},{},{},{},{}",
                 ws.map_or("-".to_owned(), |v| v.to_string()),
-                http.map_or("-".to_owned(), |v| v.to_string())
+                http.map_or("-".to_owned(), |v| v.to_string()),
+                bench.map_or("-".to_owned(), |v| v.to_string()),
+                delta(*ws, *http),
+                delta(*http, *bench),
             )
             .map_err(|e| e.to_string())?;
         }
         writer.flush().map_err(|e| e.to_string())?;
     }
-    let mut deltas: Vec<i64> = rows
+    let mut http_ws: Vec<i64> = rows
         .iter()
-        .filter_map(|(_, ws, http)| match (*ws, *http) {
+        .filter_map(|(_, ws, http, _)| match (*ws, *http) {
             (Some(w), Some(h)) => Some(h.cast_signed() - w.cast_signed()),
             _ => None,
         })
         .collect();
-    match ws_probe::summarize_ab(&mut deltas) {
-        Some(summary) => println!(
+    if let Some(summary) = ws_probe::summarize_ab(&mut http_ws) {
+        println!(
             "ws-probe: ab-latency blocks={} delta_ms(http-ws) p25={:+} median={:+} p75={:+}",
             summary.blocks, summary.p25_ms, summary.median_ms, summary.p75_ms
-        ),
-        None => println!("ws-probe: ab-latency no blocks observed by both transports"),
+        );
+    } else if !has_bench {
+        println!("ws-probe: ab-latency no blocks observed by both transports");
+    }
+    if has_bench {
+        let mut bench_http: Vec<i64> = rows
+            .iter()
+            .filter_map(|(_, _, http, bench)| match (*http, *bench) {
+                (Some(h), Some(b)) => Some(b.cast_signed() - h.cast_signed()),
+                _ => None,
+            })
+            .collect();
+        match ws_probe::summarize_ab(&mut bench_http) {
+            Some(summary) => println!(
+                "ws-probe: bench-latency blocks={} delta_ms(bench-http) p25={:+} median={:+} p75={:+}",
+                summary.blocks, summary.p25_ms, summary.median_ms, summary.p75_ms
+            ),
+            None => println!("ws-probe: bench-latency no blocks observed by both endpoints"),
+        }
     }
     Ok(())
 }
@@ -1937,6 +1972,8 @@ struct ProbeOutputs<'a> {
     raw_csv: Option<&'a std::path::Path>,
     ab_http_ms: u64,
     ab_csv: Option<&'a std::path::Path>,
+    bench_url: Option<&'a str>,
+    bench_http_ms: u64,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2000,23 +2037,56 @@ fn run_ws_probe_command(
     let mut total_events = 0u64;
     let mut raw_csv = outputs.raw_csv.map(open_raw_csv).transpose()?;
     let ab_log = std::sync::Arc::new(ws_probe::BlockLatencyLog::new());
-    let mut sidecar_handle = None;
+    let mut sidecar_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let mut sidecar_stops: Vec<std::sync::Arc<AtomicBool>> = Vec::new();
     if outputs.ab_http_ms > 0 {
-        sidecar_handle = Some(spawn_http_sidecar(
+        let sidecar_stop = Arc::new(AtomicBool::new(false));
+        sidecar_handles.push(spawn_http_sidecar(
             http_url.clone(),
             budget.clone(),
             subscriptions.iter().map(|s| s.filter.clone()).collect(),
             Duration::from_millis(outputs.ab_http_ms.max(200)),
             std::sync::Arc::clone(&stop.flag),
-            Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::clone(&sidecar_stop),
             std::sync::Arc::clone(&ab_log),
+            ws_probe::Source::Http,
         ));
+        sidecar_stops.push(sidecar_stop);
         println!(
             "ws-probe: A/B HTTP sidecar polling every {}ms",
             outputs.ab_http_ms
         );
     }
-
+    if outputs.bench_http_ms > 0 {
+        let bench_endpoint = outputs.bench_url.map_or_else(
+            || resolve_env_url("ROBINHOOD_HTTP_RPC_URL", "ROBINHOOD_HTTP_RPC_URL"),
+            |value| {
+                value.strip_prefix("env:").map_or_else(
+                    || Ok(value.to_owned()),
+                    |var| std::env::var(var).map_err(|_| format!("missing {var}")),
+                )
+            },
+        )?;
+        let bench_url: RedactedUrl = bench_endpoint
+            .parse::<RedactedUrl>()
+            .map_err(|error| error.to_string())?;
+        let bench_sidecar_stop = Arc::new(AtomicBool::new(false));
+        sidecar_handles.push(spawn_http_sidecar(
+            bench_url.clone(),
+            budget.clone(),
+            subscriptions.iter().map(|s| s.filter.clone()).collect(),
+            Duration::from_millis(outputs.bench_http_ms.max(200)),
+            std::sync::Arc::clone(&stop.flag),
+            std::sync::Arc::clone(&bench_sidecar_stop),
+            std::sync::Arc::clone(&ab_log),
+            ws_probe::Source::Bench,
+        ));
+        sidecar_stops.push(bench_sidecar_stop);
+        println!(
+            "ws-probe: bench HTTP sidecar ({}) polling every {}ms",
+            bench_url, outputs.bench_http_ms
+        );
+    }
     loop {
         if stop.flag.load(std::sync::atomic::Ordering::Relaxed)
             || Instant::now() >= deadline
@@ -2049,12 +2119,14 @@ fn run_ws_probe_command(
     }
 
     let window = merged_probe_stats(&slots);
-    if let Some(handle) = sidecar_handle {
-        handle
-            .join()
-            .map_err(|_| "A/B sidecar panicked".to_owned())?;
+    let has_bench = outputs.bench_http_ms > 0;
+    for stop_flag in &sidecar_stops {
+        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    finish_ab_latency(&ab_log, outputs.ab_csv)?;
+    for handle in sidecar_handles {
+        handle.join().map_err(|_| "sidecar panicked".to_owned())?;
+    }
+    finish_ab_latency(&ab_log, outputs.ab_csv, has_bench)?;
     let reason = if stop.flag.load(std::sync::atomic::Ordering::Relaxed) {
         "signal"
     } else if limit != 0 && total_events >= limit {
