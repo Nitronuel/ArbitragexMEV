@@ -121,6 +121,10 @@ enum Command {
         request_cu: u64,
         #[arg(long, default_value_t = 268_435_456)]
         ws_bytes: u64,
+        /// Optional raw capture CSV (`recv_unix_ms,block,tx,log`) for offline
+        /// lag analysis.
+        #[arg(long)]
+        raw_csv: Option<PathBuf>,
     },
     /// Runs the observation pipeline. Use `--manifest` for a bounded live run,
     /// otherwise an offline snapshot fixture.
@@ -436,6 +440,7 @@ fn main() {
             tip_interval_ms,
             request_cu,
             ws_bytes,
+            raw_csv,
         } => run_ws_probe_command(
             &manifest,
             duration_secs,
@@ -443,6 +448,7 @@ fn main() {
             tip_interval_ms,
             request_cu,
             ws_bytes,
+            raw_csv.as_deref(),
         ),
         Command::Run {
             config,
@@ -1683,6 +1689,7 @@ struct WsProbeSlot {
     subscription: ws_probe::VenueSubscription,
     client: Option<LiveWsClient>,
     stats: ws_probe::ProbeStats,
+    deduper: ws_probe::LogDeduper,
     attempts: u32,
     retry_at: Option<Instant>,
 }
@@ -1714,33 +1721,43 @@ impl WsProbeSlot {
         self.retry_at = Some(Instant::now() + ws_probe::backoff_delay(self.attempts));
     }
 
-    /// Connects if needed, drains one bounded item, and returns how many new
-    /// events were counted.
+    /// Connects if needed, drains one bounded item, and returns the log
+    /// identity `(block, transaction_index, log_index)` when a new unique
+    /// event was counted.
     fn poll(
         &mut self,
         ws_url: &RedactedUrl,
         stream: &LogStream,
         timeout: Duration,
         tip: u64,
-    ) -> usize {
+    ) -> Option<(u64, u64, u64)> {
         self.ensure_connected(ws_url);
-        let Some(client) = self.client.as_ref() else {
-            return 0;
-        };
+        let client = self.client.as_ref()?;
         match client.next(stream, timeout) {
             Ok(Some(StreamItem::Log(envelope))) => {
-                if let Some(lag) = ws_probe::lag_or_skew(envelope.block_number, tip, 5) {
-                    self.stats.observe_lag(lag);
-                    1
-                } else {
-                    0
+                if self.deduper.is_duplicate(&envelope) {
+                    self.stats.duplicates += 1;
+                    return None;
                 }
+                // Signed: negative means WS delivery is ahead of our HTTP
+                // tip view (separate endpoints, separate views).
+                let lag = i64::try_from(tip)
+                    .ok()
+                    .map(|tip| tip - i64::try_from(envelope.block_number).unwrap_or(i64::MAX));
+                if let Some(lag) = lag {
+                    self.stats.observe_lag(lag);
+                }
+                Some((
+                    envelope.block_number,
+                    envelope.transaction_index,
+                    envelope.log_index,
+                ))
             }
             Ok(Some(StreamItem::Disconnected(_))) | Err(_) => {
                 self.schedule_reconnect();
-                0
+                None
             }
-            Ok(None) => 0,
+            Ok(None) => None,
         }
     }
 }
@@ -1765,6 +1782,18 @@ fn resolve_probe_endpoints() -> Result<(RedactedUrl, RedactedUrl), String> {
     Ok((ws_url, http_url))
 }
 
+fn open_raw_csv(path: &std::path::Path) -> Result<std::io::BufWriter<std::fs::File>, String> {
+    use std::io::Write;
+    let mut writer =
+        std::io::BufWriter::new(std::fs::File::create(path).map_err(|error| error.to_string())?);
+    writeln!(
+        writer,
+        "recv_unix_ms,block_number,transaction_index,log_index"
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(writer)
+}
+
 fn run_ws_probe_command(
     manifest_path: &std::path::Path,
     duration_secs: u64,
@@ -1772,6 +1801,7 @@ fn run_ws_probe_command(
     tip_interval_ms: u64,
     request_cu: u64,
     ws_bytes: u64,
+    raw_csv: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let (ws_url, http_url) = resolve_probe_endpoints()?;
 
@@ -1815,11 +1845,13 @@ fn run_ws_probe_command(
             subscription,
             client: None,
             stats: ws_probe::ProbeStats::default(),
+            deduper: ws_probe::LogDeduper::new(),
             attempts: 0,
             retry_at: None,
         })
         .collect();
     let mut total_events = 0u64;
+    let mut raw_csv = raw_csv.map(open_raw_csv).transpose()?;
 
     loop {
         if stop.flag.load(std::sync::atomic::Ordering::Relaxed)
@@ -1835,32 +1867,20 @@ fn run_ws_probe_command(
             last_tip_refresh = Instant::now();
         }
         for slot in &mut slots {
-            total_events +=
-                u64::try_from(slot.poll(&ws_url, &stream, poll_slice, tip)).unwrap_or(0);
+            if let Some((block, tx_index, log_index)) = slot.poll(&ws_url, &stream, poll_slice, tip)
+            {
+                total_events += 1;
+                if let Some(writer) = raw_csv.as_mut() {
+                    use std::io::Write;
+                    let recv_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0u128, |d| d.as_millis());
+                    let _ = writeln!(writer, "{recv_ms},{block},{tx_index},{log_index}");
+                }
+            }
         }
         if Instant::now() >= next_progress {
-            let parts: Vec<String> = slots
-                .iter()
-                .map(|slot| {
-                    format!(
-                        "{}:events={}+r{}+maxlag{}",
-                        slot.subscription.label,
-                        slot.stats.events,
-                        slot.stats.reconnects,
-                        slot.stats.lag_max_blocks()
-                    )
-                })
-                .collect();
-            println!(
-                "{} [{}]",
-                ws_probe::progress_line(
-                    started.elapsed().as_secs(),
-                    &merged_probe_stats(&slots),
-                    budget.snapshot().websocket_delivered_bytes,
-                    tip,
-                ),
-                parts.join(" ")
-            );
+            print_probe_progress(&slots, started, budget.snapshot(), tip);
             next_progress += Duration::from_secs(10);
         }
     }
@@ -1877,6 +1897,37 @@ fn run_ws_probe_command(
     Ok(())
 }
 
+fn print_probe_progress(
+    slots: &[WsProbeSlot],
+    started: Instant,
+    usage: provider::UsageSnapshot,
+    tip: u64,
+) {
+    let parts: Vec<String> = slots
+        .iter()
+        .map(|slot| {
+            format!(
+                "{}:events={}+dupes={}+r{}+maxlag{}",
+                slot.subscription.label,
+                slot.stats.events,
+                slot.stats.duplicates,
+                slot.stats.reconnects,
+                slot.stats.lag_max_blocks()
+            )
+        })
+        .collect();
+    println!(
+        "{} [{}]",
+        ws_probe::progress_line(
+            started.elapsed().as_secs(),
+            &merged_probe_stats(slots),
+            usage.websocket_delivered_bytes,
+            tip,
+        ),
+        parts.join(" ")
+    );
+}
+
 fn print_probe_summary(
     elapsed_secs: u64,
     window: &ws_probe::ProbeStats,
@@ -1884,9 +1935,10 @@ fn print_probe_summary(
     budget: &ProviderBudget,
 ) {
     println!(
-        "ws-probe: done elapsed_s={} events={} lag_blocks min/mean/max={}/{:.1}/{} reconnects={} reason={}",
+        "ws-probe: done elapsed_s={} events={} dupes={} lag_blocks min/mean/max={}/{:.1}/{} reconnects={} reason={}",
         elapsed_secs,
         window.events,
+        window.duplicates,
         window
             .lag_min_blocks()
             .map_or("-".to_owned(), |min| min.to_string()),

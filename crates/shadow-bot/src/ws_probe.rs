@@ -75,18 +75,48 @@ pub fn build_subscriptions(reader: impl Read) -> Result<(Vec<VenueSubscription>,
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeStats {
     pub events: u64,
+    pub duplicates: u64,
     pub reconnects: u64,
-    lag_sum_blocks: u128,
-    lag_max_blocks: u64,
-    lag_min_blocks: Option<u64>,
+    lag_sum_blocks: i128,
+    lag_max_blocks: i64,
+    lag_min_blocks: Option<i64>,
     lag_samples: u64,
 }
 
+/// Detects repeated deliveries of one log identity
+/// `(block_number, transaction_index, log_index)`.
+#[derive(Debug, Default)]
+pub struct LogDeduper {
+    seen: std::collections::HashSet<(u64, u64, u64)>,
+}
+
+impl LogDeduper {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true when this exact log was delivered before.
+    ///
+    /// Subscription providers may redeliver historical ranges after internal
+    /// rebalancing; the dirty path must see each swap exactly once.
+    pub fn is_duplicate(&mut self, envelope: &provider::RawLogEnvelope) -> bool {
+        let key = (
+            envelope.block_number,
+            envelope.transaction_index,
+            envelope.log_index,
+        );
+        !self.seen.insert(key)
+    }
+}
+
 impl ProbeStats {
-    /// Records one delivered log observed `lag` blocks behind the chain tip.
-    pub fn observe_lag(&mut self, lag: u64) {
+    /// Records one delivered log's block lag against the tip observed at
+    /// arrival. Negative values mean the log is *ahead* of our HTTP tip view
+    /// (WS delivery leads the separate HTTP endpoint).
+    pub fn observe_lag(&mut self, lag: i64) {
         self.events += 1;
-        self.lag_sum_blocks += u128::from(lag);
+        self.lag_sum_blocks += i128::from(lag);
         self.lag_samples += 1;
         self.lag_max_blocks = self.lag_max_blocks.max(lag);
         self.lag_min_blocks = Some(match self.lag_min_blocks {
@@ -105,18 +135,19 @@ impl ProbeStats {
     }
 
     #[must_use]
-    pub const fn lag_min_blocks(&self) -> Option<u64> {
+    pub const fn lag_min_blocks(&self) -> Option<i64> {
         self.lag_min_blocks
     }
 
     #[must_use]
-    pub const fn lag_max_blocks(&self) -> u64 {
+    pub const fn lag_max_blocks(&self) -> i64 {
         self.lag_max_blocks
     }
 
     /// Merges another stats object into this one (window-level rollup).
     pub fn merge(&mut self, other: &ProbeStats) {
         self.events += other.events;
+        self.duplicates += other.duplicates;
         self.reconnects += other.reconnects;
         self.lag_sum_blocks += other.lag_sum_blocks;
         self.lag_samples += other.lag_samples;
@@ -153,9 +184,10 @@ pub fn progress_line(
         .lag_mean_blocks()
         .map_or("-".to_owned(), |mean| format!("{mean:.1}"));
     format!(
-        "ws-probe: elapsed_s={} events={} lag_blocks min/mean/max={}/{}/{} tip={} ws_bytes={} reconnects={}",
+        "ws-probe: elapsed_s={} events={} dupes={} lag_blocks min/mean/max={}/{}/{} tip={} ws_bytes={} reconnects={}",
         elapsed_secs,
         stats.events,
+        stats.duplicates,
         min_s,
         mean_s,
         stats.lag_max_blocks(),
@@ -163,16 +195,6 @@ pub fn progress_line(
         ws_bytes,
         stats.reconnects,
     )
-}
-
-/// Validates that a log envelope's block is not ahead of the observed tip by
-/// more than `max_ahead` blocks (clock/branch skew guard).
-#[must_use]
-pub fn lag_or_skew(block_number: u64, tip: u64, max_ahead: u64) -> Option<u64> {
-    if block_number > tip.saturating_add(max_ahead) {
-        return None;
-    }
-    Some(tip.saturating_sub(block_number))
 }
 
 #[cfg(test)]
@@ -297,10 +319,46 @@ mod tests {
     }
 
     #[test]
-    fn lag_or_skew_rejects_absurdly_future_blocks() {
-        assert_eq!(lag_or_skew(95, 100, 2), Some(5));
-        assert_eq!(lag_or_skew(101, 100, 2), Some(0));
-        assert_eq!(lag_or_skew(103, 100, 2), None);
+    fn stats_record_signed_lag_for_ws_leading_http_tip() {
+        let mut stats = ProbeStats::default();
+        stats.observe_lag(-12);
+        stats.observe_lag(3);
+        assert_eq!(stats.lag_min_blocks(), Some(-12));
+        assert_eq!(stats.lag_max_blocks(), 3);
+        assert!(
+            stats
+                .lag_mean_blocks()
+                .is_some_and(|m| (m + 4.5).abs() < 1e-9)
+        );
+        assert_eq!(stats.events, 2);
+    }
+
+    #[test]
+    fn deduper_flags_second_delivery_of_same_identity() {
+        let envelope = |block: u64, tx: u64, log: u64| provider::RawLogEnvelope {
+            address: Address::with_last_byte(0x10),
+            topics: vec![],
+            data: alloy_primitives::Bytes::default(),
+            block_number: block,
+            transaction_index: tx,
+            log_index: log,
+            removed: false,
+        };
+        let mut deduper = LogDeduper::new();
+        assert!(!deduper.is_duplicate(&envelope(100, 1, 2)));
+        assert!(deduper.is_duplicate(&envelope(100, 1, 2)));
+        assert!(!deduper.is_duplicate(&envelope(100, 1, 3)));
+        assert!(!deduper.is_duplicate(&envelope(101, 1, 2)));
+    }
+
+    #[test]
+    fn stats_merge_duplicates() {
+        let mut a = ProbeStats::default();
+        a.duplicates = 2;
+        let mut b = ProbeStats::default();
+        b.duplicates = 3;
+        a.merge(&b);
+        assert_eq!(a.duplicates, 5);
     }
 
     #[test]
