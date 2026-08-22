@@ -38,6 +38,8 @@ pub enum ManifestError {
     ZeroAddress { row: usize, field: &'static str },
     #[error("row {row} uses the same address for token0 and token1")]
     EqualTokens { row: usize },
+    #[error("row {row} has token0 > token1 (Uniswap canonical ordering violated)")]
+    UnsortedTokens { row: usize },
     #[error("row {row} has unsupported fee {numerator}/{denominator}")]
     UnsupportedFee {
         row: usize,
@@ -110,6 +112,13 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
                 numerator: row.fee_numerator,
                 denominator: row.fee_denominator,
             });
+        }
+        // The orientation of every downstream price/skew computation assumes
+        // the Uniswap canonical ordering (`token0` = lower address, enforced
+        // by V3 factories and the V4 PoolManager). Fail fast on catalogs that
+        // violate it.
+        if token0 > token1 {
+            return Err(ManifestError::UnsortedTokens { row: row_number });
         }
         let source = row.source.trim().to_owned();
         if source.is_empty() {

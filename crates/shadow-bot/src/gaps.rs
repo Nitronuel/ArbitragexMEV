@@ -20,6 +20,9 @@ pub const V4_DYNAMIC_FEE_FLAG: u32 = 0x0080_0000;
 /// all exclude the dead tail instead of paying its toll inside `margin`.
 pub const MAX_QUOTABLE_FEE: f64 = 0.5;
 
+/// The sqrtPriceX96 convention factor in [`price_out`]: raw wei price × K.
+const SQRT_PRICE_CONVENTION_K: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+
 /// RHC encodes the wrapped native token in v2/v3 pool addresses with its real
 /// contract address, while v4 `PoolKey`s use the `0x0..0` sentinel for the
 /// native currency. Cross-venue matching must normalize the sentinel to the
@@ -73,11 +76,14 @@ pub fn normalize_currency(token: Address) -> Address {
 /// Returns `None` for V4 rows whose fee is a dynamic sentinel or an
 /// "uninitialized" zero, where the quoted scalar is not the charged fee.
 #[must_use]
-pub fn leg_toll(fee: u32, profile: [u8; 2]) -> Option<f64> {
+pub fn leg_toll(fee: u32, fee_denominator: u32, profile: [u8; 2]) -> Option<f64> {
     if profile == *b"v4" && (fee == 0 || fee & V4_DYNAMIC_FEE_FLAG != 0) {
         return None;
     }
-    let toll = f64::from(fee) / 1_000_000.0;
+    if fee_denominator == 0 {
+        return None;
+    }
+    let toll = f64::from(fee) / f64::from(fee_denominator);
     if toll > MAX_QUOTABLE_FEE {
         return None;
     }
@@ -726,7 +732,7 @@ pub fn expand_manifest_catalog(
             }
             if entry.fee == 0
                 || entry.fee > entry.fee_denominator
-                || leg_toll(entry.fee, entry.profile).is_none()
+                || leg_toll(entry.fee, entry.fee_denominator, entry.profile).is_none()
             {
                 continue;
             }
@@ -767,7 +773,7 @@ pub fn gap_rankings(
                     continue;
                 };
                 let k = pair_key(entry.token0, entry.token1);
-                let Some(toll) = leg_toll(entry.fee, entry.profile) else {
+                let Some(toll) = leg_toll(entry.fee, entry.fee_denominator, entry.profile) else {
                     continue;
                 };
                 // Orient each pool's price into the canonical pair direction
@@ -875,6 +881,40 @@ pub fn virtual_reserves(sqrt: U256, liquidity: U256) -> (U256, U256) {
 /// # Errors
 ///
 /// Returns a message describing malformed cycles or missing state.
+/// Oriented cross-venue skew for a pair: `|log2(q_b / q_a)|`, where each
+/// venue's pool price is first re-expressed as the canonical-direction
+/// (`hi per lo`) wei ratio scaled by the 2^96 sqrtPriceX96 convention.
+///
+/// V4 native pools carry the zero address as currency0; after normalization
+/// to the wrapped native the two venues can list the same pair in opposite
+/// orders. Comparing raw prices directly makes the ratio — and therefore the
+/// skew screen — meaningless for exactly the most liquid native pairs.
+#[must_use]
+pub fn oriented_pair_skew(
+    entry_a: &PoolEntry,
+    price_a: &PoolPrice,
+    entry_b: &PoolEntry,
+    price_b: &PoolPrice,
+    canonical_lo: Address,
+) -> f64 {
+    // `price_out` = raw_price × K with K = 2^96 and raw_price = t1/t0.
+    // A pool listing the canonical-lo token as token1 inverts the ratio;
+    // invert it back while keeping the K scaling so the convention cancels
+    // between venues.
+    let orient = |entry: &PoolEntry, price: &PoolPrice| -> f64 {
+        let raw_conventioned = price_out(price.sqrt);
+        if entry.token0 == canonical_lo {
+            raw_conventioned
+        } else {
+            SQRT_PRICE_CONVENTION_K * SQRT_PRICE_CONVENTION_K
+                / raw_conventioned.max(f64::MIN_POSITIVE)
+        }
+    };
+    let qa = orient(entry_a, price_a);
+    let qb = orient(entry_b, price_b);
+    (qb / qa).log2().abs()
+}
+
 pub fn quote_pair(
     a_entries: &[PoolEntry],
     b_entries: &[PoolEntry],
@@ -892,7 +932,7 @@ pub fn quote_pair(
             let Some(price) = prices.get(&pool_key(entry)) else {
                 continue;
             };
-            let Some(toll) = leg_toll(entry.fee, entry.profile) else {
+            let Some(toll) = leg_toll(entry.fee, entry.fee_denominator, entry.profile) else {
                 continue;
             };
             if best.as_ref().is_none_or(|(_, _, t)| toll < *t) {
@@ -973,10 +1013,9 @@ pub fn quote_pair(
     let Some((quote, toll)) = best else {
         return Ok(None);
     };
-    let skew = (price_out(leg_price_b.sqrt) / price_out(leg_price_a.sqrt).max(1e-30))
-        .max(1e-30)
-        .log2()
-        .abs();
+    // See `oriented_pair_skew`: raw pool prices must be re-expressed in the
+    // canonical pair direction before comparing venues.
+    let skew = oriented_pair_skew(&leg_a, &leg_price_a, &leg_b, &leg_price_b, anchor);
     Ok(Some(PairQuote {
         token_lo: anchor,
         token_hi: other,
@@ -1045,7 +1084,7 @@ pub fn enumerate_triangles(a: &[PoolEntry], b: &[PoolEntry]) -> Vec<TokenTriple>
     // BOTH venues, so the cyclic round trip can actually cross venues.
     let mut quotable_both: HashSet<([u8; 20], [u8; 20])> = HashSet::new();
     let mut per_pair: HashMap<([u8; 20], [u8; 20]), u8> = HashMap::new();
-    let usable = |e: &PoolEntry| leg_toll(e.fee, e.profile).is_some();
+    let usable = |e: &PoolEntry| leg_toll(e.fee, e.fee_denominator, e.profile).is_some();
     for e in a.iter().filter(|e| usable(e)) {
         let k = pair_key(e.token0, e.token1);
         *per_pair.entry(k).or_default() |= 1;
@@ -1117,7 +1156,7 @@ fn cheapest_leg_in(
     let mut best: Option<(CycleLeg, f64)> = None;
     for (entries, prices) in [(a_pools, prices_a), (b_pools, prices_b)] {
         for entry in entries {
-            let Some(toll) = leg_toll(entry.fee, entry.profile) else {
+            let Some(toll) = leg_toll(entry.fee, entry.fee_denominator, entry.profile) else {
                 continue;
             };
             let Some(price) = prices.get(&pool_key(entry)) else {
@@ -1213,10 +1252,32 @@ pub fn quote_triangle(
     else {
         return Ok(None);
     };
-    let keep = |leg: &CycleLeg| 1.0 - leg_toll(leg.entry.fee, leg.entry.profile).unwrap_or(0.0);
+    let keep = |leg: &CycleLeg| {
+        1.0 - leg_toll(leg.entry.fee, leg.entry.fee_denominator, leg.entry.profile).unwrap_or(0.0)
+    };
     let toll = 1.0 - keep(&leg01) * keep(&leg12) * keep(&leg20);
-    let skew = (price_out(leg12.price.sqrt) * price_out(leg20.price.sqrt))
-        / price_out(leg01.price.sqrt).max(1e-30);
+    // Orient each leg into its cycle direction (`token_out per token_in`,
+    // convention-scaled) so the product is 2^288 at parity regardless of
+    // each pool's internal token ordering; the baseline is subtracted below.
+    let oriented_cycle_price = |leg: &CycleLeg, token_in: Address| -> f64 {
+        let raw_conventioned = price_out(leg.price.sqrt);
+        if leg.entry.token0 == token_in {
+            raw_conventioned
+        } else {
+            SQRT_PRICE_CONVENTION_K * SQRT_PRICE_CONVENTION_K
+                / raw_conventioned.max(f64::MIN_POSITIVE)
+        }
+    };
+    let cycle_product = oriented_cycle_price(&leg01, p0)
+        * oriented_cycle_price(&leg12, p1)
+        * oriented_cycle_price(&leg20, p2);
+    // Each `price_out` carries the ×2^96 sqrtPriceX96 convention factor
+    // (price_out = raw-wei price × 2^96). Raw-wei prices telescope to 1 at
+    // economic parity around a closed cycle (decimal exponents cancel), so
+    // the expected product is 2^(96·3); subtract that baseline before taking
+    // the magnitude, or every triangle is screened by a decimals-driven
+    // constant instead of real dislocation.
+    let log2_skew = (cycle_product.log2() - 288.0).abs();
     Ok(Some(PairQuote {
         token_lo: p0,
         token_hi: p2,
@@ -1224,7 +1285,7 @@ pub fn quote_triangle(
         output: quote.output,
         profit: quote.profit,
         toll,
-        log2_skew: skew.abs().log2(),
+        log2_skew,
         oldest_leg_block: leg01
             .price
             .block
@@ -1301,7 +1362,7 @@ pub fn cross_measure(
     let mut feed = |entries: &HashMap<[u8; 32], PoolEntry>, bit: u8| {
         for entry in entries.values() {
             let k = pair_key(entry.token0, entry.token1);
-            let quoted_toll = leg_toll(entry.fee, entry.profile).is_some();
+            let quoted_toll = leg_toll(entry.fee, entry.fee_denominator, entry.profile).is_some();
             let set = per_pair.entry(k).or_insert((0, false));
             set.0 |= bit;
             set.1 |= quoted_toll;
@@ -1382,14 +1443,86 @@ mod tests {
 
     #[test]
     fn leg_toll_handles_dynamic_sentinels() {
-        assert_eq!(leg_toll(10_000, *b"v3"), Some(0.01));
-        assert_eq!(leg_toll(50, *b"v3"), Some(0.00005));
-        assert_eq!(leg_toll(0, *b"v4"), None);
-        assert_eq!(leg_toll(V4_DYNAMIC_FEE_FLAG, *b"v4"), None);
-        assert_eq!(leg_toll(10_000, *b"v4"), Some(0.01));
+        assert_eq!(leg_toll(10_000, 1_000_000, *b"v3"), Some(0.01));
+        assert_eq!(leg_toll(50, 1_000_000, *b"v3"), Some(0.00005));
+        assert_eq!(leg_toll(0, 1_000_000, *b"v4"), None);
+        assert_eq!(leg_toll(V4_DYNAMIC_FEE_FLAG, 1_000_000, *b"v4"), None);
+        assert_eq!(leg_toll(10_000, 1_000_000, *b"v4"), Some(0.01));
     }
 
     #[test]
+    fn oriented_pair_skew_handles_opposite_token_orders() {
+        // Parity price in both venues: sqrt = 2^96 (price_out = 2^96).
+        let parity = U256::from(1u64) << 96;
+        let price = |sqrt: U256| PoolPrice {
+            sqrt,
+            liquidity: U256::from(1_000_000_u64),
+            block: 1,
+        };
+        let lo: Address = "0x1000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let hi: Address = "0x2000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let venue_a = price_entry(
+            "0xaa00000000000000000000000000000000000001"
+                .parse()
+                .unwrap(),
+            lo,
+            hi,
+        );
+        let venue_b_sorted = price_entry(
+            "0xaa00000000000000000000000000000000000002"
+                .parse()
+                .unwrap(),
+            lo,
+            hi,
+        );
+        // Same pair, opposite internal order (as normalized V4 native pools).
+        let venue_b_reversed = price_entry(
+            "0xaa00000000000000000000000000000000000003"
+                .parse()
+                .unwrap(),
+            hi,
+            lo,
+        );
+
+        // Sorted-vs-sorted at parity: zero skew.
+        assert_eq!(
+            oriented_pair_skew(
+                &venue_a,
+                &price(parity),
+                &venue_b_sorted,
+                &price(parity),
+                lo
+            ),
+            0.0
+        );
+        // Opposite order at parity must ALSO be zero — the old raw-ratio
+        // skew reported ~192 here and screened every native pair.
+        assert!(
+            (oriented_pair_skew(
+                &venue_a,
+                &price(parity),
+                &venue_b_reversed,
+                &price(parity),
+                lo
+            ) - 0.0)
+                .abs()
+                < 1e-9
+        );
+        // A genuine 4× dislocation reads as log2(4) = 2 regardless of order
+        // (price_out scales with sqrt²).
+        let moved = U256::from(1u64) << 98;
+        assert!(
+            (oriented_pair_skew(&venue_a, &price(parity), &venue_b_sorted, &price(moved), lo)
+                - 4.0)
+                .abs()
+                < 1e-6
+        );
+    }
+
     fn price_out_derives_xyk_ratio() {
         let sqrt = U256::from(1u64 << 48);
         assert!((price_out(sqrt) - 1.0).abs() < 1e-9);
@@ -1518,7 +1651,7 @@ mod tests {
         assert_eq!(entry.token0, RHC_NATIVE);
         assert_eq!(entry.token1, token);
         assert_eq!(entry.fee, V4_DYNAMIC_FEE_FLAG);
-        assert!(leg_toll(entry.fee, entry.profile).is_none());
+        assert!(leg_toll(entry.fee, entry.fee_denominator, entry.profile).is_none());
         assert_eq!(entry.venue, pool);
     }
 
