@@ -90,6 +90,11 @@ pub struct LogDeduper {
     seen: std::collections::HashSet<(u64, u64, u64)>,
 }
 
+/// Memory bound: at ~1M identities the set is cleared rather than growing
+/// without limit. A cleared window only weakens redelivery detection for a
+/// probe tool; production ingestion must dedup at the transport layer.
+const DEDUPER_CAP: usize = 1_000_000;
+
 impl LogDeduper {
     #[must_use]
     pub fn new() -> Self {
@@ -101,6 +106,9 @@ impl LogDeduper {
     /// Subscription providers may redeliver historical ranges after internal
     /// rebalancing; the dirty path must see each swap exactly once.
     pub fn is_duplicate(&mut self, envelope: &provider::RawLogEnvelope) -> bool {
+        if self.seen.len() >= DEDUPER_CAP {
+            self.seen.clear();
+        }
         let key = (
             envelope.block_number,
             envelope.transaction_index,

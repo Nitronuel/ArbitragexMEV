@@ -1369,6 +1369,9 @@ struct RunPairsArgs<'a> {
 fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     use std::io::Write;
 
+    if args.window == 0 {
+        return Err("--window must be at least 1 block".to_owned());
+    }
     let a_path: &std::path::Path = args.a;
     let b_path: &std::path::Path = args.b;
     let manifest_path = args.manifest;
@@ -1612,59 +1615,66 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                 }
             }
         }
-        if let Some(out) = &mut csv_out {
-            for pair in &outcome.evaluated {
-                if let Some((quote, classification)) = evaluator.quote_pair(*pair) {
-                    let lo = alloy_primitives::Address::from_slice(&pair.0);
-                    let hi = alloy_primitives::Address::from_slice(&pair.1);
-                    writeln!(
-                        out,
-                        "pair,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?}",
-                        lo,
-                        hi,
-                        latest,
-                        quote.input,
-                        quote.output,
-                        quote.profit,
-                        quote.log2_skew,
-                        classification.gross_profit_usd,
-                        classification.estimated_net_profit_usd,
-                        classification.threshold_usd,
-                        floor_ratio(
+        if let Some(out) = csv_out.as_mut() {
+            // A CSV I/O failure must not kill the whole 24h window: log it
+            // once and disable further CSV output, keeping the poller alive.
+            let mut write_all = || -> std::io::Result<()> {
+                for pair in &outcome.evaluated {
+                    if let Some((quote, classification)) = evaluator.quote_pair(*pair) {
+                        let lo = alloy_primitives::Address::from_slice(&pair.0);
+                        let hi = alloy_primitives::Address::from_slice(&pair.1);
+                        writeln!(
+                            out,
+                            "pair,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?}",
+                            lo,
+                            hi,
+                            latest,
+                            quote.input,
+                            quote.output,
+                            quote.profit,
+                            quote.log2_skew,
+                            classification.gross_profit_usd,
                             classification.estimated_net_profit_usd,
-                            classification.threshold_usd
-                        ),
-                        classification.reason,
-                    )
-                    .map_err(|e| e.to_string())?;
+                            classification.threshold_usd,
+                            floor_ratio(
+                                classification.estimated_net_profit_usd,
+                                classification.threshold_usd
+                            ),
+                            classification.reason,
+                        )?;
+                    }
                 }
-            }
-            for tri in &outcome.triangle_evaluated {
-                if let Some((quote, classification)) = evaluator.quote_triangle(*tri) {
-                    let t = evaluator.triangle(*tri);
-                    let lo = alloy_primitives::Address::from_slice(&t.0);
-                    let hi = alloy_primitives::Address::from_slice(&t.1);
-                    writeln!(
-                        out,
-                        "triangle,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?}",
-                        lo,
-                        hi,
-                        latest,
-                        quote.input,
-                        quote.output,
-                        quote.profit,
-                        quote.log2_skew,
-                        classification.gross_profit_usd,
-                        classification.estimated_net_profit_usd,
-                        classification.threshold_usd,
-                        floor_ratio(
+                for tri in &outcome.triangle_evaluated {
+                    if let Some((quote, classification)) = evaluator.quote_triangle(*tri) {
+                        let t = evaluator.triangle(*tri);
+                        let lo = alloy_primitives::Address::from_slice(&t.0);
+                        let hi = alloy_primitives::Address::from_slice(&t.1);
+                        writeln!(
+                            out,
+                            "triangle,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?}",
+                            lo,
+                            hi,
+                            latest,
+                            quote.input,
+                            quote.output,
+                            quote.profit,
+                            quote.log2_skew,
+                            classification.gross_profit_usd,
                             classification.estimated_net_profit_usd,
-                            classification.threshold_usd
-                        ),
-                        classification.reason,
-                    )
-                    .map_err(|e| e.to_string())?;
+                            classification.threshold_usd,
+                            floor_ratio(
+                                classification.estimated_net_profit_usd,
+                                classification.threshold_usd
+                            ),
+                            classification.reason,
+                        )?;
+                    }
                 }
+                Ok(())
+            };
+            if let Err(error) = write_all() {
+                eprintln!("run-pairs: CSV output disabled after write error: {error}");
+                csv_out = None;
             }
         }
         last_window = latest;
@@ -2059,7 +2069,10 @@ fn run_ws_probe_command(
     }
     if outputs.bench_http_ms > 0 {
         let bench_endpoint = outputs.bench_url.map_or_else(
-            || resolve_env_url("ROBINHOOD_HTTP_RPC_URL", "ROBINHOOD_HTTP_RPC_URL"),
+            || {
+                std::env::var("ROBINHOOD_HTTP_RPC_URL")
+                    .map_err(|_| "missing ROBINHOOD_HTTP_RPC_URL (bench fallback)".to_owned())
+            },
             |value| {
                 value.strip_prefix("env:").map_or_else(
                     || Ok(value.to_owned()),

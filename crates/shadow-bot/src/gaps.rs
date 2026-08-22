@@ -852,11 +852,20 @@ pub struct PairQuote {
 /// `sqrt` is the `Q64.96` post-swap price, `liquidity` the in-range `L`.
 #[must_use]
 pub fn virtual_reserves(sqrt: U256, liquidity: U256) -> (U256, U256) {
+    use ruint::{Uint, UintTryFrom};
     const ONE: U256 = U256::from_limbs([1, 0, 0, 0]);
     let two_96: U256 = ONE << 96;
-    let reserve0 = liquidity * two_96 / sqrt.max(U256::from(1));
-    let reserve1 = liquidity * sqrt / two_96;
-    (reserve0, reserve1)
+    // Provider-controlled values (sqrtPriceX96 up to ~2^250, liquidity up to
+    // 2^128) can overflow 256-bit products on extreme-ratio longtail pools.
+    // Widen to 512 bits and saturate: a saturated reserve only makes the leg
+    // look deeper, never panics or wraps.
+    let wide_sqrt = Uint::<512, 8>::from(sqrt);
+    let wide_liquidity = Uint::<512, 8>::from(liquidity);
+    let wide_two_96 = Uint::<512, 8>::from(two_96);
+    let saturate = |value: Uint<512, 8>| U256::uint_try_from(value).unwrap_or(U256::MAX);
+    let reserve0 = wide_liquidity * wide_two_96 / wide_sqrt.max(Uint::<512, 8>::from(1));
+    let reserve1 = wide_liquidity * wide_sqrt / wide_two_96;
+    (saturate(reserve0), saturate(reserve1))
 }
 
 /// Builds the 2-hop cycle for one cross-venue pair and solves the closed-form
@@ -1853,6 +1862,25 @@ mod tests {
         // The zero-fee v4 row must be dropped; only the v3 leg survives.
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].profile, *b"v3");
+    }
+
+    #[test]
+    fn virtual_reserves_saturates_instead_of_panicking_on_extreme_inputs() {
+        use alloy_primitives::U256;
+        // Near-max sqrtPriceX96 with maximal liquidity: the old 256-bit
+        // `liquidity * sqrt` product overflowed (panic in debug builds).
+        let sqrt = U256::MAX >> 8;
+        let liquidity = U256::MAX;
+        let (r0, r1) = super::virtual_reserves(sqrt, liquidity);
+        assert!(r0 > U256::ZERO);
+        assert!(r1 > U256::ZERO);
+        // realistic values must remain exact
+        let sqrt_r = U256::from(1_000_000_000_000_000_000_u64);
+        let liq = U256::from(1_000_000_000_000_u64);
+        let two_96 = U256::from(1) << 96;
+        let (r0, r1) = super::virtual_reserves(sqrt_r, liq);
+        assert_eq!(r0, liq * two_96 / sqrt_r);
+        assert_eq!(r1, liq * sqrt_r / two_96);
     }
 
     #[test]

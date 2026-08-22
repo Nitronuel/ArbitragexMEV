@@ -115,7 +115,12 @@ fn search_interval(
     Ok(())
 }
 
-const MAX_INTERVAL_VISITS: usize = 10_000;
+/// Visit budget for the interval search. Bounds worst-case quote latency
+/// (~0.15ms per visit) so a pathological reserve configuration cannot stall
+/// the polling loop. On budget exhaustion the best input found so far is
+/// returned; on extreme asymmetric reserves that may sit integer-floor dust
+/// below the true optimum, which is acceptable for gate classification.
+const MAX_INTERVAL_VISITS: usize = 1_500;
 
 #[allow(clippy::large_types_passed_by_value)]
 fn ideal_profit_bound(

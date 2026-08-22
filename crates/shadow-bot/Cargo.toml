@@ -12,6 +12,7 @@ clap.workspace = true
 csv.workspace = true
 domain = { path = "../domain" }
 provider = { path = "../provider" }
+ruint.workspace = true
 serde_json.workspace = true
 shadow = { path = "../shadow" }
 signal-hook.workspace = true
