@@ -903,7 +903,17 @@ pub fn expand_manifest_catalog(
                     "manifest exceeds the {pool_cap}-pool cap while expanding catalog {label}"
                 ));
             }
-            out.push(*entry);
+            // Catalog loading normalizes the v4 native sentinel to the
+            // wrapped-native contract, which can un-sort the token pair
+            // (sentinel 0x0 sorts first; the contract address usually does
+            // not). Written manifests must keep canonical ordering, so sort
+            // here; pool identity is unaffected (v4 keys by `pool_id`, V3 by
+            // address) and every consumer pairs via the sorting `pair_key`.
+            let mut entry = *entry;
+            if entry.token0 > entry.token1 {
+                std::mem::swap(&mut entry.token0, &mut entry.token1);
+            }
+            out.push(entry);
         }
     }
     Ok(out)
@@ -2145,6 +2155,41 @@ mod tests {
         // The zero-fee v4 row must be dropped; only the v3 leg survives.
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].profile, *b"v3");
+    }
+
+    #[test]
+    fn expand_manifest_catalog_reorders_native_sentinel_pairs() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        // A v4 native pool stored sentinel-first (0x0 as token0); after
+        // normalization the sentinel becomes the wrapped-native contract,
+        // whose address sorts ABOVE most tokens. The expanded row must be
+        // re-sorted so written manifests satisfy canonical ordering.
+        let a = "0x0000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        let p4 = dir.path().join("v4.csv");
+        let id = "33".repeat(32);
+        {
+            let mut f = std::fs::File::create(&p4).unwrap();
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{a},{b},2500,1000000,v4,0x{id},\n"
+            )
+            .unwrap();
+        }
+        let m4 = load_catalog(&p4).unwrap();
+        let all_b: Vec<_> = m4.into_values().collect();
+        let selected = HashSet::from([pair_key(RHC_NATIVE, b.parse().unwrap())]);
+        let kept = expand_manifest_catalog(&[], &all_b, &selected, 2_000).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(
+            kept[0].token0 < kept[0].token1,
+            "expanded row must be canonically ordered: {:?}",
+            kept[0]
+        );
+        // Identity is untouched by the reorder.
+        assert_eq!(kept[0].id, [0x33; 32]);
     }
 
     #[test]
