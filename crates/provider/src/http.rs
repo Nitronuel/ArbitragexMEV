@@ -176,6 +176,92 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
         result_bytes(&response.result).map(Bytes::from)
     }
 
+    /// Reads one storage slot of an account at a block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response failures.
+    pub fn storage_at(
+        &self,
+        address: Address,
+        index: alloy_primitives::U256,
+        block: u64,
+    ) -> Result<alloy_primitives::U256, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_getStorageAt".to_owned(),
+            params: json!([
+                address_hex(address),
+                format!("0x{:064x}", index),
+                hex_block(block)
+            ]),
+        })?;
+        let raw = result_bytes(&response.result)?;
+        if raw.len() > 32 {
+            return Err(TransportError::Permanent(
+                "storage value exceeds 32 bytes".to_owned(),
+            ));
+        }
+        Ok(alloy_primitives::U256::from_be_slice(&raw))
+    }
+
+    /// Reads an account's native balance at a block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response failures.
+    pub fn balance(
+        &self,
+        address: Address,
+        block: u64,
+    ) -> Result<alloy_primitives::U256, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_getBalance".to_owned(),
+            params: json!([address_hex(address), hex_block(block)]),
+        })?;
+        let raw = result_bytes(&response.result)?;
+        Ok(alloy_primitives::U256::from_be_slice(&raw))
+    }
+
+    /// Reads an account's transaction count (nonce) at a block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response failures.
+    pub fn transaction_count(&self, address: Address, block: u64) -> Result<u64, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_getTransactionCount".to_owned(),
+            params: json!([address_hex(address), hex_block(block)]),
+        })?;
+        quantity(&response.result)
+    }
+
+    /// Reads one historical block hash by number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response failures,
+    /// or [`TransportError::InvalidResponse`] when the provider does not know
+    /// the block.
+    pub fn block_hash(&self, number: u64) -> Result<[u8; 32], TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_getBlockByNumber".to_owned(),
+            params: json!([hex_block(number), false]),
+        })?;
+        if response.result.is_null() {
+            return Err(TransportError::InvalidResponse);
+        }
+        let raw = response
+            .result
+            .get("hash")
+            .and_then(|h| h.as_str())
+            .ok_or(TransportError::InvalidResponse)?;
+        let bytes = alloy_primitives::hex::decode(raw.trim_start_matches("0x"))
+            .map_err(|_| TransportError::InvalidResponse)?;
+        bytes
+            .try_into()
+            .map_err(|_| TransportError::InvalidResponse)
+    }
+
     /// Fetches explicitly filtered logs in provider-safe chunks of at most ten
     /// inclusive blocks.
     ///

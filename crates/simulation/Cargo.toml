@@ -7,7 +7,11 @@ version.workspace = true
 
 [dependencies]
 alloy-primitives.workspace = true
+provider = { path = "../provider" }
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [dependencies.revm]
 version = "42"

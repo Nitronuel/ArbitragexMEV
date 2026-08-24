@@ -17,12 +17,15 @@ use revm::context::journal::Journal;
 use revm::context::{BlockEnv, CfgEnv, Context, TxEnv};
 use revm::context_interface::result::ExecutionResult;
 use revm::database::CacheDB;
-use revm::database_interface::EmptyDB;
+use revm::database_interface::{Database, DatabaseCommit, EmptyDB};
 use revm::handler::{ExecuteCommitEvm, MainBuilder};
 use revm::primitives::hardfork::SpecId;
 use std::collections::BTreeMap;
-/// The concrete revm-42 `Context` shape the fixture replay uses.
-type SimContext = Context<BlockEnv, TxEnv, CfgEnv, CacheDB<EmptyDB>, Journal<CacheDB<EmptyDB>>, ()>;
+
+/// The revm `Context` shape for a replay over any database the journal can
+/// wrap: `CacheDB<EmptyDB>` for offline fixtures, `CacheDB<ForkDb>` for
+/// real-state forks.
+pub(crate) type SimContext<D> = Context<BlockEnv, TxEnv, CfgEnv, D, Journal<D>, ()>;
 
 /// Fixed-point scale for [`RoundTripSim::new`]'s `flash_fee_rate`, matching
 /// `shadow::FIXED_POINT_SCALE` (1e18 = 100%).
@@ -176,12 +179,15 @@ pub(crate) fn encode_transfer_from(from: Address, to: Address, amount: U256) -> 
 
 /// Runs one committed revm transaction; returns the committed database with
 /// the execution outcome.
-pub(crate) fn run_tx(
-    db: CacheDB<EmptyDB>,
+pub(crate) fn run_tx<D>(
+    db: D,
     caller: Address,
     to: Address,
     data: Bytes,
-) -> (Result<ExecutionResult, String>, CacheDB<EmptyDB>) {
+) -> (Result<ExecutionResult, String>, D)
+where
+    D: Database + DatabaseCommit + 'static,
+{
     let tx = TxEnv::builder()
         .caller(caller)
         .kind(TxKind::Call(to))
@@ -189,7 +195,7 @@ pub(crate) fn run_tx(
         .gas_limit(500_000)
         .build()
         .expect("static transaction fields");
-    let mut evm = <SimContext>::new(db, SpecId::PRAGUE)
+    let mut evm = <SimContext<D>>::new(db, SpecId::PRAGUE)
         .modify_cfg_chained(|cfg| cfg.disable_nonce_check = true)
         .build_mainnet();
     let outcome = evm.transact_commit(tx);
@@ -209,8 +215,8 @@ pub(crate) fn run_tx(
 /// legs, and must repay `input + fee` at the end. This mirrors production —
 /// capital is always borrowed, never held — and catches routes that only look
 /// profitable when free capital is assumed.
-pub struct RoundTripSim {
-    db: CacheDB<EmptyDB>,
+pub struct RoundTripSim<D = CacheDB<EmptyDB>> {
+    db: D,
     executor: Address,
     leg0: Reserves,
     leg1: Reserves,
@@ -243,16 +249,49 @@ impl RoundTripSim {
         final_out: U256,
         flash_fee_rate: U256,
     ) -> Self {
+        let tokens = [leg0.token_in, leg0.token_out, leg1.token_in, leg1.token_out];
+        let mut db = build_cache(leg0, leg1, &tokens, seed, code, executor);
+        // The lender holds enough of the input token to serve the borrow.
+        let _ = db.insert_account_storage(leg0.token_in, balance_slot(LENDER_ADDRESS), input);
+        Self::over_db(
+            db,
+            leg0,
+            leg1,
+            executor,
+            input,
+            mid_out,
+            final_out,
+            flash_fee_rate,
+        )
+    }
+
+    /// Builds the six steps over a caller-provided database — fixtures use
+    /// [`Self::new`]; forked replays pass `CacheDB<ForkDb>` preloaded with
+    /// real bytecode and seeded balances. Seeding lender balances is the
+    /// caller's job (`CacheDB::insert_account_storage`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the repay amount computation overflows `U256`, which
+    /// requires an absurd fee rate far beyond any protocol's.
+    #[allow(clippy::too_many_arguments)] // one argument per route quantity
+    #[must_use]
+    pub fn over_db<D>(
+        db: D,
+        leg0: Reserves,
+        leg1: Reserves,
+        executor: Address,
+        input: U256,
+        mid_out: U256,
+        final_out: U256,
+        flash_fee_rate: U256,
+    ) -> RoundTripSim<D> {
         let repay = input
             .checked_mul(flash_fee_rate)
             .and_then(|fee| fee.checked_div(U256::from(FLASH_FEE_SCALE)))
             .and_then(|fee| fee.checked_add(input))
             .expect("repay amount overflow");
-        let tokens = [leg0.token_in, leg0.token_out, leg1.token_in, leg1.token_out];
-        let mut db = build_cache(leg0, leg1, &tokens, seed, code, executor);
-        // The lender holds enough of the input token to serve the borrow.
-        let _ = db.insert_account_storage(leg0.token_in, balance_slot(LENDER_ADDRESS), input);
-        Self {
+        RoundTripSim {
             db,
             executor,
             leg0,

@@ -26,6 +26,7 @@
 
 mod db;
 mod engine;
+mod fork;
 mod tokens;
 
 #[cfg(test)]
@@ -36,4 +37,5 @@ pub use engine::{
     FLASH_FEE_SCALE, LENDER_ADDRESS, LegResult, Outcome, RoundTripSim, SimError, Step,
     round_trip_steps,
 };
+pub use fork::ForkDb;
 pub use tokens::{TokenKind, TokenSpec, token_bytecode};
