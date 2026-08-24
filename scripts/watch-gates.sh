@@ -17,15 +17,15 @@ tip() {
   local r
   r=$(curl -s -X POST -H 'Content-Type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
-    "$rpc_url")
-  printf '%d' "${r#*\"result\":\"0x}"
+    "$rpc_url" | sed 's/.*"result":"\([0-9a-fx]*\)".*/\1/')
+  printf '%d' "$r"
 }
 
 echo "watch-gates: tailing $log"
 tail -n 0 -F "$log" | while read -r line; do
   case "$line" in
-    *"gated=0"*|*"gated=") ;;
-    *) continue ;;
+    *gated=*) : ;;          # a poll line — fall through to extraction
+    *) continue ;;          # anything else
   esac
   gated=$(printf '%s' "$line" | grep -oE 'gated=[0-9]+' | head -1 | cut -d= -f2)
   [ "${gated:-0}" -gt 0 ] || continue
