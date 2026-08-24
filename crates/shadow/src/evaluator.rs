@@ -197,7 +197,9 @@ impl DirtyEvaluator {
             match classification.reason {
                 ClassificationReason::AboveThreshold => outcome.interesting.push(cycle_id),
                 ClassificationReason::NotEvaluated { .. } => outcome.not_evaluated.push(cycle_id),
-                ClassificationReason::NotProfitable | ClassificationReason::BelowThreshold => {}
+                ClassificationReason::NotProfitable
+                | ClassificationReason::BelowThreshold
+                | ClassificationReason::Provisional { .. } => {}
             }
         }
         outcome

@@ -69,6 +69,11 @@ pub enum ClassificationReason {
     BelowThreshold,
     /// Positive net profit strictly above the submission-gate floor.
     AboveThreshold,
+    /// Gate passed, but at the `$1` fixture valuation because the anchor
+    /// token has no USD price. Recorded for visibility and never counted as
+    /// an honest candidate; the same quote with a priced anchor would have
+    /// classified `AboveThreshold`/`BelowThreshold`.
+    Provisional { detail: String },
 }
 
 impl Economics {

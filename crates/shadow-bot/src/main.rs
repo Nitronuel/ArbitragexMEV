@@ -18,8 +18,8 @@ use provider::{
     WsProbe,
 };
 use shadow::{
-    CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceReport, ServiceSnapshot, daily_report,
-    observe_snapshot, replay_observation, run_live, run_smoke,
+    ClassificationReason, CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceReport,
+    ServiceSnapshot, daily_report, observe_snapshot, replay_observation, run_live, run_smoke,
 };
 use signal_hook::consts::{SIGINT, SIGTERM};
 use storage::Storage;
@@ -38,8 +38,14 @@ const CYCLE_LIMITS: CycleLimits = CycleLimits {
 /// Conservative gas cost of one cross-venue attempt in USD fixed-point
 /// (~$0.03, per the project budget rules). At 18 fp digits this is 3e16.
 const GAS_COST_USD: U256 = U256::from_limbs([30_000_000_000_000_000, 0, 0, 0]);
-/// Expected win rate used for the submission-gate floor (10%).
-const EXPECTED_WIN_RATE: U256 = U256::from_limbs([100_000_000_000_000_000, 0, 0, 0]);
+/// Expected win rate used for the submission-gate floor (15%).
+///
+/// Operator decision 2026-08-22: raised from the original 10% to loosen the
+/// gate floor from $0.30 ($0.03/0.10) to **$0.20** ($0.03/0.15). Trade-off
+/// to remember: if the true win rate stays at 10%, each accepted submission
+/// has expected value ≈ −$0.01 instead of breakeven — acceptable for
+/// shadow-mode measurement, must be revisited before any live submission.
+const EXPECTED_WIN_RATE: U256 = U256::from_limbs([150_000_000_000_000_000, 0, 0, 0]);
 
 /// Uniswap V4 `PoolManager` singleton on Base; emits all Swap logs with the
 /// pool id as topic1 (confirmed from the enumerated catalog).
@@ -90,8 +96,6 @@ enum Command {
         manifest: Option<PathBuf>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
-        offline: bool,
     },
     /// Runs a bounded live-provider smoke test (chain, pinned catalog, Sync).
     SmokeTest {
@@ -246,6 +250,42 @@ enum Command {
         #[arg(long)]
         csv: Option<PathBuf>,
     },
+    /// Ranks cross-venue pairs by observed Swap activity over a block window
+    /// and writes a selection CSV consumable by `build-manifest` (read-only).
+    RankActivity {
+        /// Enumerated catalog A (e.g. v3) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        a: PathBuf,
+        /// Enumerated catalog B (e.g. v4) CSV written by `enumerate-pools`.
+        #[arg(long)]
+        b: PathBuf,
+        /// Venue label for catalog A, one of `v3` or `v4`.
+        #[arg(long, default_value = "v3")]
+        profile_a: String,
+        /// Venue label for catalog B, one of `v3` or `v4`.
+        #[arg(long, default_value = "v4")]
+        profile_b: String,
+        /// v4 `PoolManager` contract address (only required when a profile is v4).
+        #[arg(long)]
+        pool_manager: Option<Address>,
+        /// Chain endpoint URL.
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        from: u64,
+        #[arg(long)]
+        to: u64,
+        #[arg(long, default_value_t = 50_000)]
+        window: u64,
+        #[arg(long, default_value_t = 600)]
+        delay_ms: u64,
+        /// Write the top N pairs ranked by two-sided swap activity.
+        #[arg(long, default_value_t = 1000)]
+        top: usize,
+        /// Write each selected pair as one CSV row to this path (overwrites).
+        #[arg(long)]
+        csv: PathBuf,
+    },
     /// Expands a selected-pairs CSV into a concrete-pool manifest, merging the
     /// pools from two enumerated catalogs that carry the selected pairs
     /// (read-only, offline).
@@ -398,10 +438,14 @@ enum Command {
         /// Minimum poll delay between `eth_getLogs` requests.
         #[arg(long, default_value_t = 600)]
         delay_ms: u64,
-        /// Write one row per gated pair per poll to this path (appends;
-        /// headers written on first open). Columns: `token_lo,token_hi`,
-        /// `to_block,input,output,profit,log2_skew,gross_profit_usd`,
-        /// `net_profit_usd,threshold_usd`.
+        /// Write one row per evaluated pair/triangle per poll to this path
+        /// (appends; headers written on first open). Columns:
+        /// `kind,token_lo,token_hi,to_block,input,output,profit,log2_skew`,
+        /// `gross_profit_usd,net_profit_usd,threshold_usd,floor_ratio,reason`,
+        /// `anchor_priced`. `anchor_priced=false` marks rows whose USD value
+        /// came from the `$1` fixture because the anchor token was absent
+        /// (or zero) in the `--prices` table; a gate pass on such a row is
+        /// classified `Provisional`, never counted as an honest candidate.
         #[arg(long)]
         csv: Option<PathBuf>,
         /// Token-price CSV (`token,usd_per_token`, fixed-point) for honest
@@ -419,14 +463,18 @@ enum Command {
         /// `AboveThreshold` at meaningless USD values.
         #[arg(long, default_value_t = 0.5)]
         max_skew: f64,
-        /// Maximum age in blocks (vs the poll tip) a quote's oldest leg price
-        /// may carry and still be gated. A refresh-starved reference leg —
-        /// priced once and never re-priced by the V3 ring sweep — produces a
-        /// pseudo-gap against the fresh V4 side; quotes older than this bound
-        /// are screened out instead of surfacing as `AboveThreshold`. `0`
-        /// disables the screen.
-        #[arg(long, default_value_t = 0)]
-        max_price_age: u64,
+        /// Flash-loan source for gating costs: `none` (legacy zero-fee
+        /// assumption), a provider name (`balancer-v2`, `uniswap-v4`,
+        /// `aave-v3`), or `auto` to pick the cheapest supporting provider per
+        /// anchor token from `--flash-support`. In `auto` mode an anchor with
+        /// no supporting provider is screened out instead of gated.
+        #[arg(long, default_value = "none")]
+        flash_provider: String,
+        /// Support CSV (`token,provider`) mapping each anchor token to the
+        /// flash-loan providers that can serve it. Required by
+        /// `--flash-provider auto`.
+        #[arg(long)]
+        flash_support: Option<PathBuf>,
     },
 }
 
@@ -435,11 +483,7 @@ fn main() {
     let cli = Cli::parse();
     let outcome = match cli.command {
         Command::ValidateConfig { config } => validate_config(&config),
-        Command::VerifyCatalog {
-            manifest,
-            config,
-            offline: _,
-        } => verify_catalog_command(manifest, config),
+        Command::VerifyCatalog { manifest, config } => verify_catalog_command(manifest, config),
         Command::SmokeTest {
             config,
             manifest,
@@ -538,6 +582,33 @@ fn main() {
             max_skew,
             csv: csv.as_deref(),
         }),
+        Command::RankActivity {
+            a,
+            b,
+            profile_a,
+            profile_b,
+            pool_manager,
+            rpc,
+            from,
+            to,
+            window,
+            delay_ms,
+            top,
+            csv,
+        } => rank_activity_command(&RankActivityArgs {
+            a: &a,
+            b: &b,
+            profile_a: &profile_a,
+            profile_b: &profile_b,
+            pool_manager,
+            rpc: &rpc,
+            from,
+            to,
+            window,
+            delay_ms,
+            top,
+            csv: &csv,
+        }),
         Command::BuildManifest {
             a,
             b,
@@ -621,7 +692,8 @@ fn main() {
             prices,
             v3_chunks_per_poll,
             max_skew,
-            max_price_age,
+            flash_provider,
+            flash_support,
         } => run_pairs_command(&RunPairsArgs {
             a: &a,
             b: &b,
@@ -640,7 +712,8 @@ fn main() {
             prices: prices.as_deref(),
             v3_chunks_per_poll,
             max_skew,
-            max_price_age,
+            flash_provider: &flash_provider,
+            flash_support: flash_support.as_deref(),
         }),
     };
     if let Err(error) = outcome {
@@ -669,7 +742,7 @@ fn verify_catalog(path: &std::path::Path) -> Result<(), String> {
 }
 
 /// Resolves the manifest from `--manifest` or `--config`, then validates it
-/// statically. The offline flag is a paranoia marker: no RPC calls are made.
+/// statically. No RPC calls are made.
 fn verify_catalog_command(
     manifest: Option<PathBuf>,
     config: Option<PathBuf>,
@@ -918,6 +991,10 @@ struct DerivePricesArgs<'a> {
 
 /// Samples live Swap prices across two catalogs and reports the skew-vs-toll
 /// distribution. Read-only; no signing or submission.
+///
+/// Offline ranking tool: applies its own `--max-skew` bound but bypasses the
+/// dirty evaluator's price-age screen, so its rows may carry refresh-starved
+/// legs — unlike `run-pairs`, its output is not gate evidence.
 #[allow(clippy::too_many_lines)]
 fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
     let a_path: &std::path::Path = args.a;
@@ -1037,6 +1114,141 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+/// Arguments for [`rank_activity_command`].
+struct RankActivityArgs<'a> {
+    a: &'a PathBuf,
+    b: &'a PathBuf,
+    profile_a: &'a str,
+    profile_b: &'a str,
+    pool_manager: Option<Address>,
+    rpc: &'a str,
+    from: u64,
+    to: u64,
+    window: u64,
+    delay_ms: u64,
+    top: usize,
+    csv: &'a std::path::Path,
+}
+
+/// Ranks cross-venue pairs by observed Swap activity over a block window and
+/// writes a `build-manifest`-consumable selection CSV. Read-only; no signing
+/// or submission.
+///
+/// Selection by two-sided activity (`min` of the per-venue counts) maximizes
+/// how often the live poller can actually evaluate each pair, since a pair is
+/// only quotable while both venues carry a swap-priced leg.
+#[allow(clippy::too_many_lines)]
+fn rank_activity_command(args: &RankActivityArgs<'_>) -> Result<(), String> {
+    use std::io::Write;
+
+    let profile_bytes_a: [u8; 2] = args
+        .profile_a
+        .as_bytes()
+        .try_into()
+        .map_err(|_| format!("profile_a must be exactly 2 bytes, got {}", args.profile_a))?;
+    let profile_bytes_b: [u8; 2] = args
+        .profile_b
+        .as_bytes()
+        .try_into()
+        .map_err(|_| format!("profile_b must be exactly 2 bytes, got {}", args.profile_b))?;
+    for (label, profile) in [
+        (args.profile_a, &profile_bytes_a),
+        (args.profile_b, &profile_bytes_b),
+    ] {
+        if profile != b"v3" && profile != b"v4" {
+            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        }
+    }
+    if args.from > args.to {
+        return Err("--from must not exceed --to".to_owned());
+    }
+
+    let catalog_a = gaps::load_catalog(args.a)?;
+    let catalog_b = gaps::load_catalog(args.b)?;
+    let (cross_a, cross_b) = gaps::restrict_to_cross(&catalog_a, &catalog_b);
+    println!(
+        "rank-activity: catalogs a={} b={} cross a={} b={}",
+        catalog_a.len(),
+        catalog_b.len(),
+        cross_a.len(),
+        cross_b.len()
+    );
+
+    let http_url: RedactedUrl = args
+        .rpc
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let budget = ProviderBudget::new(2_000_000, 1 << 24);
+    let retry = RetryPolicy {
+        max_retries: 8,
+        initial_delay: Duration::from_millis(600),
+        max_delay: Duration::from_secs(12),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url.clone()),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+        domain::ROBINHOOD_CHAIN_ID,
+    );
+
+    let activity_a = gaps::sweep_swap_activity(
+        &reader,
+        profile_bytes_a,
+        args.pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &cross_a,
+        args.from,
+        args.to,
+        args.window,
+        Duration::from_millis(args.delay_ms),
+    )
+    .map_err(|e| e.to_string())?;
+    let activity_b = gaps::sweep_swap_activity(
+        &reader,
+        profile_bytes_b,
+        args.pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &cross_b,
+        args.from,
+        args.to,
+        args.window,
+        Duration::from_millis(args.delay_ms),
+    )
+    .map_err(|e| e.to_string())?;
+    let active_a = activity_a.len();
+    let active_b = activity_b.len();
+    let rankings = gaps::pair_activity_rankings(&cross_a, &cross_b, &activity_a, &activity_b);
+    let two_sided_pairs = rankings.len();
+    let selected: Vec<_> = rankings.into_iter().take(args.top).collect();
+    if selected.is_empty() {
+        return Err(
+            "no cross-venue pair saw swaps on both venues in the window; \
+             widen --from/--to"
+                .to_owned(),
+        );
+    }
+
+    let mut out =
+        std::io::BufWriter::new(std::fs::File::create(args.csv).map_err(|e| e.to_string())?);
+    writeln!(out, "token_lo,token_hi,swaps_a,swaps_b,score").map_err(|e| e.to_string())?;
+    for ranking in &selected {
+        writeln!(
+            out,
+            "{},{},{},{},{}",
+            ranking.token_lo, ranking.token_hi, ranking.swaps_a, ranking.swaps_b, ranking.score
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    println!(
+        "rank-activity: active pools a={} b={} pairs_two_sided={} wrote_top_{} -> {}",
+        active_a,
+        active_b,
+        two_sided_pairs,
+        selected.len(),
+        args.csv.display()
+    );
     Ok(())
 }
 
@@ -1333,6 +1545,61 @@ fn floor_ratio(net: alloy_primitives::U256, threshold: alloy_primitives::U256) -
     n / t
 }
 
+/// Builds the flash-loan cost selection from CLI arguments.
+///
+/// `auto` reads the support CSV (`token,provider` rows) and fails closed at
+/// startup if it is missing — without support data nothing can be gated.
+fn build_flash_selection(
+    mode: &str,
+    support: Option<&std::path::Path>,
+) -> Result<shadow::flash_loan::FlashSelection, String> {
+    use shadow::flash_loan::{FlashLoanProvider, FlashSelection};
+    match mode {
+        "none" => Ok(FlashSelection::None),
+        "auto" => {
+            let Some(path) = support else {
+                return Err(
+                    "--flash-provider auto requires --flash-support <token,provider CSV>".to_owned(),
+                );
+            };
+            let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            let mut reader = csv::Reader::from_reader(file);
+            let mut rows = Vec::new();
+            for record in reader.records() {
+                let record = record.map_err(|e| e.to_string())?;
+                let token = record
+                    .get(0)
+                    .ok_or_else(|| "support row lacks token".to_owned())?
+                    .parse::<Address>()
+                    .map_err(|_| "bad token in support row".to_owned())?;
+                let provider = record
+                    .get(1)
+                    .ok_or_else(|| "support row lacks provider".to_owned())?;
+                if FlashLoanProvider::parse(provider).is_none() {
+                    return Err(format!(
+                        "unknown flash provider {provider:?} in support row (expected one of: {})",
+                        FlashLoanProvider::ALL
+                            .iter()
+                            .map(|p| p.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                rows.push((token, provider.to_owned()));
+            }
+            println!(
+                "flash-support: {} rows from {}",
+                rows.len(),
+                path.display()
+            );
+            Ok(FlashSelection::auto_from_rows(&rows))
+        }
+        other => FlashLoanProvider::parse(other)
+            .map(FlashSelection::Fixed)
+            .ok_or_else(|| format!("unknown --flash-provider {other:?} (expected none, auto, balancer-v2, uniswap-v4, aave-v3)")),
+    }
+}
+
 /// Arguments for [`run_pairs_command`].
 struct RunPairsArgs<'a> {
     a: &'a PathBuf,
@@ -1356,9 +1623,10 @@ struct RunPairsArgs<'a> {
     /// Maximum `|log2 skew|` a quote may carry and still be gated; quotes
     /// above it are screened out as uncaptureable.
     max_skew: f64,
-    /// Maximum age in blocks (vs the poll tip) a quote's oldest leg price may
-    /// carry and still be gated; `0` disables the screen.
-    max_price_age: u64,
+    /// Flash-loan cost mode for gating (`none`, a provider name, or `auto`).
+    flash_provider: &'a str,
+    /// Support CSV backing `flash_provider = auto`.
+    flash_support: Option<&'a std::path::Path>,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -1393,7 +1661,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
         writeln!(
             out,
-            "kind,token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,threshold_usd,floor_ratio,reason"
+            "kind,token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,threshold_usd,floor_ratio,reason,anchor_priced"
         )
         .map_err(|e| e.to_string())?;
         csv_out = Some(out);
@@ -1461,7 +1729,16 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, queue_capacity);
     evaluator.set_reference(reference);
     evaluator.set_max_log2_skew(args.max_skew);
-    evaluator.set_max_price_age(args.max_price_age);
+    let flash_selection = build_flash_selection(args.flash_provider, args.flash_support)?;
+    if matches!(flash_selection, shadow::flash_loan::FlashSelection::None)
+        && args.flash_provider == "none"
+    {
+        eprintln!(
+            "run-pairs: WARNING --flash-provider none assumes free capital; \
+             gating ignores borrow fees (measurement mode only)"
+        );
+    }
+    evaluator.set_flash_selection(flash_selection);
     if let Some(path) = prices_path {
         let prices = gaps::load_prices(path)?;
         println!(
@@ -1488,6 +1765,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut triangle_evals = 0usize;
     let mut triangle_interesting = 0usize;
     let mut near_misses = 0usize;
+    let mut provisionals = 0usize;
     let mut last_window = 0u64;
     let v3_chunks = (a_entries.chunks(999).count() * usize::from(profile_bytes_a == *b"v3"))
         .max(b_entries.chunks(999).count() * usize::from(profile_bytes_b == *b"v3"))
@@ -1586,89 +1864,98 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         applied = applied.saturating_add(applied_this as u64);
         evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
         evaluator.seed_prices(profile_bytes_b, &b_entries, &priced_b)?;
-        evaluator.set_current_block(latest);
         let outcome = evaluator.run_once();
+        if outcome.degraded {
+            eprintln!(
+                "run-pairs: dirty queue exceeded capacity; some pairs were dropped this batch"
+            );
+        }
         evals += outcome.evaluated.len();
         interesting += outcome.interesting.len();
         not_evaluated += outcome.not_evaluated.len();
         triangle_evals += outcome.triangle_evaluated.len();
         triangle_interesting += outcome.triangle_interesting.len();
-        for pair in &outcome.evaluated {
-            if let Some((_quote, classification)) = evaluator.quote_pair(*pair) {
+        near_misses += outcome
+            .pair_results
+            .iter()
+            .chain(&outcome.triangle_results)
+            .filter(|(_, classification)| {
                 let ratio = floor_ratio(
                     classification.estimated_net_profit_usd,
                     classification.threshold_usd,
                 );
-                if (0.5..1.0).contains(&ratio) {
-                    near_misses += 1;
-                }
-            }
-        }
-        for tri in &outcome.triangle_evaluated {
-            if let Some((_quote, classification)) = evaluator.quote_triangle(*tri) {
-                let ratio = floor_ratio(
-                    classification.estimated_net_profit_usd,
-                    classification.threshold_usd,
-                );
-                if (0.5..1.0).contains(&ratio) {
-                    near_misses += 1;
-                }
-            }
-        }
+                (0.5..1.0).contains(&ratio)
+            })
+            .count();
+        provisionals += outcome
+            .pair_results
+            .iter()
+            .chain(&outcome.triangle_results)
+            .filter(|(_, classification)| {
+                matches!(
+                    classification.reason,
+                    ClassificationReason::Provisional { .. }
+                )
+            })
+            .count();
         if let Some(out) = csv_out.as_mut() {
             // A CSV I/O failure must not kill the whole 24h window: log it
             // once and disable further CSV output, keeping the poller alive.
             let mut write_all = || -> std::io::Result<()> {
-                for pair in &outcome.evaluated {
-                    if let Some((quote, classification)) = evaluator.quote_pair(*pair) {
-                        let lo = alloy_primitives::Address::from_slice(&pair.0);
-                        let hi = alloy_primitives::Address::from_slice(&pair.1);
-                        writeln!(
-                            out,
-                            "pair,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?}",
-                            lo,
-                            hi,
-                            latest,
-                            quote.input,
-                            quote.output,
-                            quote.profit,
-                            quote.log2_skew,
-                            classification.gross_profit_usd,
+                for (pair, (quote, classification)) in
+                    outcome.evaluated.iter().zip(&outcome.pair_results)
+                {
+                    let lo = alloy_primitives::Address::from_slice(&pair.0);
+                    let hi = alloy_primitives::Address::from_slice(&pair.1);
+                    writeln!(
+                        out,
+                        "pair,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?},{}",
+                        lo,
+                        hi,
+                        latest,
+                        quote.input,
+                        quote.output,
+                        quote.profit,
+                        quote.log2_skew,
+                        classification.gross_profit_usd,
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                        floor_ratio(
                             classification.estimated_net_profit_usd,
-                            classification.threshold_usd,
-                            floor_ratio(
-                                classification.estimated_net_profit_usd,
-                                classification.threshold_usd
-                            ),
-                            classification.reason,
-                        )?;
-                    }
+                            classification.threshold_usd
+                        ),
+                        classification.reason,
+                        evaluator.token_is_priced(lo),
+                    )?;
                 }
-                for tri in &outcome.triangle_evaluated {
-                    if let Some((quote, classification)) = evaluator.quote_triangle(*tri) {
-                        let t = evaluator.triangle(*tri);
-                        let lo = alloy_primitives::Address::from_slice(&t.0);
-                        let hi = alloy_primitives::Address::from_slice(&t.1);
-                        writeln!(
-                            out,
-                            "triangle,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?}",
-                            lo,
-                            hi,
-                            latest,
-                            quote.input,
-                            quote.output,
-                            quote.profit,
-                            quote.log2_skew,
-                            classification.gross_profit_usd,
+                for (tri, (quote, classification)) in outcome
+                    .triangle_evaluated
+                    .iter()
+                    .zip(&outcome.triangle_results)
+                {
+                    let t = evaluator.triangle(*tri);
+                    let lo = alloy_primitives::Address::from_slice(&t.0);
+                    let hi = alloy_primitives::Address::from_slice(&t.1);
+                    writeln!(
+                        out,
+                        "triangle,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?},{}",
+                        lo,
+                        hi,
+                        latest,
+                        quote.input,
+                        quote.output,
+                        quote.profit,
+                        quote.log2_skew,
+                        classification.gross_profit_usd,
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                        floor_ratio(
                             classification.estimated_net_profit_usd,
-                            classification.threshold_usd,
-                            floor_ratio(
-                                classification.estimated_net_profit_usd,
-                                classification.threshold_usd
-                            ),
-                            classification.reason,
-                        )?;
-                    }
+                            classification.threshold_usd
+                        ),
+                        classification.reason,
+                        evaluator.token_is_priced(lo),
+                    )?;
                 }
                 Ok(())
             };
@@ -1696,7 +1983,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
 
     let dirty_now = evaluator.queue_len();
     println!(
-        "run-pairs: done at block {} applied={} evals={} gated={} triangles={}/{} near_miss={} not_evaluated={} dirty={} elapsed_s={}",
+        "run-pairs: done at block {} applied={} evals={} gated={} triangles={}/{} near_miss={} provisional={} not_evaluated={} dirty={} elapsed_s={}",
         last_window,
         applied,
         evals,
@@ -1704,6 +1991,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         triangle_interesting,
         triangle_evals,
         near_misses,
+        provisionals,
         not_evaluated,
         dirty_now,
         since.elapsed().as_secs(),

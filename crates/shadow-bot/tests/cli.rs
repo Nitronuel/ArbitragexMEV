@@ -297,6 +297,88 @@ fn gap_vs_toll_help_exposes_selection_filters() {
 }
 
 #[test]
+fn rank_activity_rejects_unknown_venue_without_rpc_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let csv = directory.path().join("pools.csv");
+    fs::write(
+        &csv,
+        "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+         4663,0xfa00000000000000000000000000000000000001,0x0000000000000000000000000000000000000000,0x1000000000000000000000000000000000000000,0x2000000000000000000000000000000000000000,3000,1000000,v3,,\n",
+    )
+    .unwrap();
+    // An unknown venue label is rejected after catalog load but before any RPC
+    // call, so this must fail fast with a clear message and no traffic.
+    let output = run(
+        &[
+            "rank-activity",
+            "--a",
+            csv.to_str().unwrap(),
+            "--b",
+            csv.to_str().unwrap(),
+            "--profile-a",
+            "v1",
+            "--profile-b",
+            "v4",
+            "--rpc",
+            "https://example.test/rpc",
+            "--from",
+            "1",
+            "--to",
+            "2",
+            "--csv",
+            directory.path().join("selection.csv").to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("unsupported venue"));
+}
+
+#[test]
+fn rank_activity_rejects_inverted_block_range_before_rpc_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let csv = directory.path().join("pools.csv");
+    fs::write(
+        &csv,
+        "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+         4663,0xfa00000000000000000000000000000000000001,0x0000000000000000000000000000000000000000,0x1000000000000000000000000000000000000000,0x2000000000000000000000000000000000000000,3000,1000000,v3,,\n",
+    )
+    .unwrap();
+    let output = run(
+        &[
+            "rank-activity",
+            "--a",
+            csv.to_str().unwrap(),
+            "--b",
+            csv.to_str().unwrap(),
+            "--rpc",
+            "https://example.test/rpc",
+            "--from",
+            "10",
+            "--to",
+            "5",
+            "--csv",
+            directory.path().join("selection.csv").to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--from must not exceed --to"));
+}
+
+#[test]
+fn rank_activity_help_exposes_ranking_flags() {
+    let output = run(&["rank-activity", "--help"], &[]);
+    assert!(output.status.success());
+    let help = format!("{}\n{}", stdout(&output), stderr(&output));
+    assert!(help.contains("--from"));
+    assert!(help.contains("--to"));
+    assert!(help.contains("--top"));
+    assert!(help.contains("--window"));
+    assert!(help.contains("--delay-ms"));
+}
+
+#[test]
 fn run_pairs_rejects_unknown_venue_without_rpc_access() {
     let directory = tempfile::tempdir().unwrap();
     let csv = directory.path().join("pools.csv");
@@ -338,7 +420,7 @@ fn run_pairs_help_exposes_live_poll_flags() {
     assert!(help.contains("--duration-secs"));
     assert!(help.contains("--from"));
     assert!(help.contains("--manifest"));
-    assert!(help.contains("--max-price-age"));
+    assert!(!help.contains("--max-price-age"));
 }
 
 #[test]

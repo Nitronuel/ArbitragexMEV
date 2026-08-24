@@ -66,10 +66,13 @@ type DirtyPairQueue = DirtyQueue<PairKey>;
 type DirtyTriQueue = DirtyQueue<usize>;
 
 /// One drained dirty-pair evaluation batch.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct PairRunOutcome {
     /// Pairs that produced a quote this batch (any classification).
     pub evaluated: Vec<PairKey>,
+    /// Quotes and classifications parallel to [`Self::evaluated`] (same
+    /// order), so callers never re-quote to inspect or log a result.
+    pub pair_results: Vec<(crate::gaps::PairQuote, shadow::Classification)>,
     /// Quoted pairs classified strictly above the submission-gate floor.
     pub interesting: Vec<PairKey>,
     /// Pairs whose quote failed or lacked a priced leg on either venue.
@@ -77,6 +80,9 @@ pub struct PairRunOutcome {
     /// Three-hop triangles (indexes into the evaluator's triangle list) that
     /// produced a quote this batch.
     pub triangle_evaluated: Vec<usize>,
+    /// Quotes and classifications parallel to [`Self::triangle_evaluated`]
+    /// (same order).
+    pub triangle_results: Vec<(crate::gaps::PairQuote, shadow::Classification)>,
     /// Triangles whose quote cleared the submission-gate floor.
     pub triangle_interesting: Vec<usize>,
     /// Triangles whose quote failed or lacked a priced edge.
@@ -116,17 +122,9 @@ pub struct PairDirtyEvaluator {
     /// `AboveThreshold` at absurd USD values (same bound as `gap-vs-toll
     /// --max-skew`).
     max_log2_skew: f64,
-    /// Highest block number the evaluator has been told about (the last poll's
-    /// chain tip). Every cached `PoolPrice.block` is compared against this to
-    /// decide whether a quote's reference leg is stale.
-    current_block: u64,
-    /// Maximum age in blocks (relative to [`Self::current_block`]) a quote's
-    /// oldest leg may carry and still be classified normally. A reference leg
-    /// that is refresh-starved — priced once and never re-priced by the ring
-    /// sweep — produces a pseudo-gap against the fresh other venue; quotes
-    /// older than this bound are screened out instead of gated. The default
-    /// (`0`) disables the screen.
-    max_price_age: u64,
+    /// How each quote's borrow cost is selected. Quotes whose anchor has no
+    /// configured flash-loan source are never gated.
+    flash: shadow::flash_loan::FlashSelection,
 }
 
 impl PairDirtyEvaluator {
@@ -234,8 +232,7 @@ impl PairDirtyEvaluator {
             economics,
             reference: CostSnapshot::invalid(),
             max_log2_skew: 0.5,
-            current_block: 0,
-            max_price_age: 0,
+            flash: shadow::flash_loan::FlashSelection::None,
         }
     }
 
@@ -252,21 +249,12 @@ impl PairDirtyEvaluator {
         self.max_log2_skew = max_log2_skew;
     }
 
-    /// Bounds how old (in blocks, vs the latest poll's tip) a quote's oldest
-    /// leg price may be and still be classified normally (default `0` =
-    /// disabled). A refresh-starved reference leg — priced once and never
-    /// re-priced by the V3 ring sweep — produces a pseudo-gap against the
-    /// continuously-priced V4 side, so such quotes are screened out instead of
-    /// surfacing as `AboveThreshold` at stale-leg USD values.
-    pub fn set_max_price_age(&mut self, max_price_blocks: u64) {
-        self.max_price_age = max_price_blocks;
-    }
-
-    /// Records the highest block number seen so far (the last poll's chain
-    /// tip) so price-age screening can compare each cached
-    /// `PoolPrice.block` against it.
-    pub fn set_current_block(&mut self, block: u64) {
-        self.current_block = block;
+    /// Sets how each quote's borrow cost is selected. In
+    /// [`FlashSelection::Auto`] mode a quote whose anchor token has no
+    /// supporting provider is screened `NotEvaluated` (fail-closed) instead of
+    /// gating at an assumed rate.
+    pub fn set_flash_selection(&mut self, flash: shadow::flash_loan::FlashSelection) {
+        self.flash = flash;
     }
 
     /// Sets per-token USD prices (fixed-point) used to value each pair's
@@ -276,27 +264,23 @@ impl PairDirtyEvaluator {
         self.token_usd = prices;
     }
 
+    /// Whether the token carries a non-zero USD price in the loaded prices
+    /// table. `false` means classification fell back to the `$1` fixture —
+    /// such rows are flagged in the canary CSV so stale-reference artifacts
+    /// priced at a meaningless `$1`/token are visible instead of silent.
+    #[must_use]
+    pub fn token_is_priced(&self, token: Address) -> bool {
+        self.token_usd.get(&token).is_some_and(|usd| !usd.is_zero())
+    }
+
     /// Classifies one pair's quote against the pair's anchor-token USD price.
     fn classify_pair(&self, pair: PairKey, quote: &PairQuote) -> shadow::Classification {
         if quote.log2_skew > self.max_log2_skew {
             return self.skew_screened(quote);
         }
-        if self.is_stale(quote) {
-            return self.price_age_screened(quote);
-        }
         let mut reference = self.reference;
         let anchor = Address::from_slice(&pair.0);
-        if let Some(usd) = self.token_usd.get(&anchor)
-            && !usd.is_zero()
-        {
-            reference.usd_per_token = *usd;
-        }
-        let optimal = OptimalQuote {
-            input: quote.input,
-            output: quote.output,
-            profit: quote.profit,
-        };
-        self.economics.classify(&optimal, &reference)
+        self.classify_with_flash(anchor, quote, &mut reference)
     }
 
     /// Marks every pair and triangle indexed by the changed pool as dirty.
@@ -389,6 +373,7 @@ impl PairDirtyEvaluator {
             if matches!(classification.reason, ClassificationReason::AboveThreshold) {
                 outcome.interesting.push(pair);
             }
+            outcome.pair_results.push((quote, classification));
         }
 
         let tri_batch = self.tri_queue.drain();
@@ -418,31 +403,76 @@ impl PairDirtyEvaluator {
             if matches!(classification.reason, ClassificationReason::AboveThreshold) {
                 outcome.triangle_interesting.push(tri);
             }
+            outcome.triangle_results.push((quote, classification));
         }
         outcome
     }
 
     /// Classifies a quote against an anchor token's USD price (triangles use
-    /// their `p0` anchor).
+    /// their `p0` anchor). Pairs delegate here after resolving their anchor.
     fn classify_anchor(&self, anchor: Address, quote: &PairQuote) -> shadow::Classification {
         if quote.log2_skew > self.max_log2_skew {
             return self.skew_screened(quote);
         }
-        if self.is_stale(quote) {
-            return self.price_age_screened(quote);
-        }
         let mut reference = self.reference;
+        self.classify_with_flash(anchor, quote, &mut reference)
+    }
+
+    /// Shared classification body once skew/age screens have passed and the
+    /// anchor is known. Charges the selected flash-loan rate against the
+    /// gross profit; fail-closed when no provider supports the anchor.
+    fn classify_with_flash(
+        &self,
+        anchor: Address,
+        quote: &PairQuote,
+        reference: &mut CostSnapshot,
+    ) -> shadow::Classification {
         if let Some(usd) = self.token_usd.get(&anchor)
             && !usd.is_zero()
         {
             reference.usd_per_token = *usd;
         }
+        let Some(flash_fee_rate) = self.flash.rate_for(anchor) else {
+            return Self::unsupported_flash_screened(anchor, quote);
+        };
+        let economics = Economics {
+            flash_fee_rate,
+            ..self.economics
+        };
         let optimal = OptimalQuote {
             input: quote.input,
             output: quote.output,
             profit: quote.profit,
         };
-        self.economics.classify(&optimal, &reference)
+        let mut classification = economics.classify(&optimal, reference);
+        if matches!(classification.reason, ClassificationReason::AboveThreshold)
+            && !self.token_is_priced(anchor)
+        {
+            // The gate passed only at the `$1` fixture valuation. Demote to
+            // `Provisional`: visible in the canary CSV, never counted as an
+            // honest candidate.
+            classification.reason = ClassificationReason::Provisional {
+                detail: format!("anchor {anchor} unpriced; gate passed at $1 fixture"),
+            };
+        }
+        classification
+    }
+
+    /// Screens a quote whose anchor token has no configured flash-loan
+    /// source. Without a borrow-cost model the gate would silently assume
+    /// free capital, so such quotes are never classified economically.
+    fn unsupported_flash_screened(anchor: Address, quote: &PairQuote) -> shadow::Classification {
+        shadow::Classification {
+            gross_profit: quote.profit,
+            gross_profit_usd: U256::ZERO,
+            flash_cost_usd: U256::ZERO,
+            gas_cost_usd: U256::ZERO,
+            estimated_net_profit_usd: U256::ZERO,
+            threshold_usd: U256::ZERO,
+            reason: shadow::ClassificationReason::NotEvaluated {
+                detail: format!("no flash source for anchor {anchor}"),
+            },
+        }
     }
 
     /// Screens a quote whose `|log2 skew|` exceeds the captureable bound.
@@ -466,39 +496,6 @@ impl PairDirtyEvaluator {
         }
     }
 
-    /// Whether a quote's oldest leg price is older than the configured
-    /// `max_price_age` bound (in blocks) relative to the current chain tip.
-    fn is_stale(&self, quote: &PairQuote) -> bool {
-        if self.max_price_age == 0 {
-            return false;
-        }
-        let age = self.current_block.saturating_sub(quote.oldest_leg_block);
-        age > self.max_price_age
-    }
-
-    /// Screens a quote whose oldest leg price is older than the configured
-    /// price-age bound. A refresh-starved reference leg (priced once, never
-    /// re-priced by the V3 ring sweep) produces a pseudo-gap against the
-    /// continuously-priced V4 side; such quotes never reach economic gating.
-    fn price_age_screened(&self, quote: &PairQuote) -> shadow::Classification {
-        shadow::Classification {
-            gross_profit: quote.profit,
-            gross_profit_usd: U256::ZERO,
-            flash_cost_usd: U256::ZERO,
-            gas_cost_usd: U256::ZERO,
-            estimated_net_profit_usd: U256::ZERO,
-            threshold_usd: U256::ZERO,
-            reason: shadow::ClassificationReason::NotEvaluated {
-                detail: format!(
-                    "price block {} is {} blocks older than max price age {}",
-                    quote.oldest_leg_block,
-                    self.current_block.saturating_sub(quote.oldest_leg_block),
-                    self.max_price_age,
-                ),
-            },
-        }
-    }
-
     /// Re-quotes one arbitrary pair from cached prices (used by tests and the
     /// unstaged CLI path). Returns the quote and its gate classification.
     #[must_use]
@@ -514,7 +511,9 @@ impl PairDirtyEvaluator {
         self.triangles[index]
     }
 
-    /// Re-quotes one triangle (by index) from cached prices.
+    /// Re-quotes one triangle (by index) from cached prices. Used by tests;
+    /// the poll loop consumes `PairRunOutcome::triangle_results` directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn quote_triangle(&self, tri: usize) -> Option<(PairQuote, shadow::Classification)> {
         let (t0, t1, t2) = *self.triangles.get(tri)?;
@@ -625,6 +624,14 @@ mod tests {
         (vec![a_pool], vec![b_pool], key_a, key_b)
     }
 
+    /// Prices the fixture anchor at $1 so gate passes classify honestly
+    /// instead of demoting to `Provisional`.
+    fn price_anchor(evaluator: &mut PairDirtyEvaluator) {
+        let mut prices = HashMap::new();
+        prices.insert(token_a(), usd(1));
+        evaluator.set_token_prices(prices);
+    }
+
     #[test]
     fn swap_rechecks_only_pairs_indexed_by_that_pool() {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
@@ -654,10 +661,69 @@ mod tests {
             key_b,
             price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
         );
+        price_anchor(&mut evaluator);
         assert_eq!(evaluator.queue_len(), 1);
         let outcome = evaluator.run_once();
         assert_eq!(outcome.evaluated.len(), 1);
         assert_eq!(outcome.interesting.len(), 1);
+    }
+
+    #[test]
+    fn token_is_priced_reflects_price_table() {
+        let (a_pools, b_pools, _key_a, _key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+
+        // Unknown tokens fall back to the $1 fixture: unpriced.
+        assert!(!evaluator.token_is_priced(token_a()));
+
+        // A non-zero entry prices the token.
+        let mut prices = HashMap::new();
+        prices.insert(token_a(), usd(2));
+        evaluator.set_token_prices(prices);
+        assert!(evaluator.token_is_priced(token_a()));
+        assert!(!evaluator.token_is_priced(token_b()));
+
+        // A zero entry is treated as unpriced, same as absent.
+        let mut prices = HashMap::new();
+        prices.insert(token_b(), U256::ZERO);
+        evaluator.set_token_prices(prices);
+        assert!(!evaluator.token_is_priced(token_b()));
+    }
+
+    #[test]
+    fn run_once_returns_results_parallel_to_evaluated() {
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
+        );
+
+        let outcome = evaluator.run_once();
+        assert_eq!(outcome.evaluated.len(), outcome.pair_results.len());
+        assert!(outcome.triangle_evaluated.is_empty());
+        assert!(outcome.triangle_results.is_empty());
+        // The retained classification matches a direct re-quote of the pair.
+        let pair = outcome.evaluated[0];
+        let (quote, classification) = &outcome.pair_results[0];
+        assert_eq!(quote.profit, {
+            let (re_quote, _) = evaluator.quote_pair(pair).expect("quote present");
+            re_quote.profit
+        });
+        assert_eq!(
+            matches!(classification.reason, ClassificationReason::AboveThreshold),
+            outcome.interesting.contains(&pair)
+        );
     }
 
     #[test]
@@ -738,6 +804,132 @@ mod tests {
         assert!(outcome.interesting.is_empty());
     }
 
+    /// Prices both legs of the one-pair fixture and marks the pair dirty.
+    fn price_one_pair(
+        evaluator: &mut PairDirtyEvaluator,
+        key_a: [u8; 32],
+        key_b: [u8; 32],
+    ) -> PairKey {
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
+        );
+        let pair: PairKey = (*token_a().0, *token_b().0);
+        evaluator.mark_pool(*b"v3", key_a);
+        pair
+    }
+
+    #[test]
+    fn auto_flash_screens_unsupported_anchor_fail_closed() {
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        // Support map names a different token entirely.
+        let mut support = std::collections::HashMap::new();
+        support.insert(
+            Address::repeat_byte(9),
+            vec![shadow::flash_loan::FlashLoanProvider::AaveV3],
+        );
+        evaluator.set_flash_selection(shadow::flash_loan::FlashSelection::Auto(support));
+        let pair = price_one_pair(&mut evaluator, key_a, key_b);
+
+        let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
+        match classification.reason {
+            ClassificationReason::NotEvaluated { detail } => {
+                assert!(detail.starts_with("no flash source for anchor"), "{detail}");
+            }
+            other => panic!("expected flash-screened NotEvaluated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_flash_selects_cheapest_supporting_provider() {
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        let mut support = std::collections::HashMap::new();
+        support.insert(
+            token_a(),
+            vec![
+                shadow::flash_loan::FlashLoanProvider::AaveV3,
+                shadow::flash_loan::FlashLoanProvider::BalancerV2,
+            ],
+        );
+        evaluator.set_flash_selection(shadow::flash_loan::FlashSelection::Auto(support));
+        price_anchor(&mut evaluator);
+        let pair = price_one_pair(&mut evaluator, key_a, key_b);
+
+        // Balancer is free: the quote still clears the gate exactly as with
+        // the legacy zero-fee assumption.
+        let outcome = evaluator.run_once();
+        assert_eq!(outcome.interesting.len(), 1);
+        let _ = pair;
+    }
+
+    #[test]
+    fn fixed_flash_fee_is_charged_at_the_gate() {
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+
+        // Zero-fee baseline gates above the floor...
+        let mut free = PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        free.set_reference(valid_reference());
+        free.set_max_log2_skew(4.0);
+        price_anchor(&mut free);
+        free.apply_swap(
+            *b"v3",
+            key_a,
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
+        );
+        free.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
+        );
+        let pair = *free.run_once().evaluated.first().expect("pair evaluated");
+        let (_, free_class) = free.quote_pair(pair).expect("quote present");
+        assert!(matches!(
+            free_class.reason,
+            ClassificationReason::AboveThreshold
+        ));
+        assert_eq!(free_class.flash_cost_usd, U256::ZERO);
+
+        // ...while the same route at Aave's 0.05% premium pays
+        // input_usd * rate at the gate, strictly reducing net profit.
+        let mut premium = PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        premium.set_reference(valid_reference());
+        premium.set_max_log2_skew(4.0);
+        price_anchor(&mut premium);
+        premium.set_flash_selection(shadow::flash_loan::FlashSelection::Fixed(
+            shadow::flash_loan::FlashLoanProvider::AaveV3,
+        ));
+        premium.apply_swap(
+            *b"v3",
+            key_a,
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
+        );
+        premium.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
+        );
+        let (_, premium_class) = premium.quote_pair(pair).expect("quote present");
+        assert!(premium_class.flash_cost_usd > U256::ZERO);
+        assert!(
+            premium_class.estimated_net_profit_usd + premium_class.flash_cost_usd
+                <= free_class.estimated_net_profit_usd
+        );
+    }
+
     #[test]
     fn gate_uses_gas_cost_over_expected_win_rate() {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
@@ -745,6 +937,7 @@ mod tests {
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
+        price_anchor(&mut evaluator);
         evaluator.apply_swap(
             *b"v3",
             key_a,
@@ -837,19 +1030,25 @@ mod tests {
 
         // Raising the bound restores normal economic gating for the same quote.
         evaluator.set_max_log2_skew(4.0);
+        let mut token_prices = HashMap::new();
+        token_prices.insert(token_a(), usd(1));
+        evaluator.set_token_prices(token_prices);
         let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
         assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
     }
 
     #[test]
-    fn stale_reference_leg_is_screened_before_economic_gating() {
+    fn stale_but_untraded_legs_still_evaluate() {
+        // A leg cached once and never re-priced carries a correct price as
+        // long as its pool has not traded: poll windows are contiguous, so
+        // "no events" means "no state change". Old legs therefore evaluate
+        // economically instead of being screened by age.
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
-        // Legs priced early (blocks 1 and 2); the poll tip is far ahead, so a
-        // refreshed-V4-vs-stale-V3 pseudo-gap must not gate.
+        // Legs priced at blocks 1 and 2; there is no tip tracking at all.
         evaluator.apply_swap(
             *b"v3",
             key_a,
@@ -860,68 +1059,70 @@ mod tests {
             key_b,
             price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
         );
-        evaluator.set_current_block(1_000_000);
-        evaluator.set_max_price_age(50_000);
+        let mut token_prices = HashMap::new();
+        token_prices.insert(token_a(), usd(1));
+        evaluator.set_token_prices(token_prices);
         let pair = crate::gaps::pair_key(token_a(), token_b());
-        let (quote, classification) = evaluator.quote_pair(pair).expect("quote present");
-        assert!(
-            quote.oldest_leg_block < 1_000_000,
-            "fixture legs must predate the tip for this test to mean anything"
-        );
-        assert!(
-            matches!(
-                &classification.reason,
-                ClassificationReason::NotEvaluated { detail }
-                    if detail.contains("price") && detail.contains("max price age")
-            ),
-            "a stale reference leg must be screened with a price-age detail, not gated: {classification:?}"
-        );
-
-        // Raising the bound past the leg age restores normal gating.
-        evaluator.set_max_price_age(1_000_000);
-        let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
-        assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
-
-        // A disabled screen (default 0) also gates normally.
-        evaluator.set_max_price_age(0);
         let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
         assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
     }
 
     #[test]
-    fn fresh_legs_are_not_screened_within_price_age_bound() {
+    fn unpriced_anchor_demotes_gate_pass_to_provisional() {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
-        let tip = 500;
         evaluator.apply_swap(
             *b"v3",
             key_a,
-            price(
-                U256::from(1u64) << 97,
-                10_000_000_000_000_000_000_000,
-                tip - 3,
-            ),
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
         );
         evaluator.apply_swap(
             *b"v4",
             key_b,
-            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, tip),
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
         );
-        evaluator.set_current_block(tip);
-        evaluator.set_max_price_age(10);
         let pair = crate::gaps::pair_key(token_a(), token_b());
+
+        // With no price table entry the gate pass is fixture-valued, so it is
+        // demoted to `Provisional` instead of counting as honest.
+        let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
+        assert!(
+            matches!(
+                &classification.reason,
+                ClassificationReason::Provisional { detail }
+                    if detail.contains("unpriced") && detail.contains("$1 fixture")
+            ),
+            "an unpriced-anchor gate pass must be provisional, not honest: {classification:?}"
+        );
+        assert!(classification.estimated_net_profit_usd > U256::ZERO);
+
+        // Pricing the anchor restores the honest classification on the same
+        // quote economics.
+        let mut token_prices = HashMap::new();
+        token_prices.insert(token_a(), usd(1));
+        evaluator.set_token_prices(token_prices);
         let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
         assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+
+        // And a sub-cent anchor price makes the same gross profit dust, so
+        // the honest path classifies below the floor instead of gating.
+        let mut token_prices = HashMap::new();
+        token_prices.insert(token_a(), U256::from(1_000_000));
+        evaluator.set_token_prices(token_prices);
+        let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
+        assert_eq!(classification.reason, ClassificationReason::NotProfitable);
     }
 
     #[test]
-    fn triple_hop_stale_leg_is_screened() {
+    fn triple_hop_stale_leg_evaluates_economically() {
         // Cheapest leg per edge wins, so a stale lower-fee v3 leg is chosen
-        // over a fresh v4 leg with a higher toll — the exact artifact setup
-        // (refresh-starved V3 vs continuously-priced V4).
+        // over a fresh v4 leg with a higher toll. The stale v3 price is still
+        // correct (its pool has not traded), so the triangle evaluates
+        // economically instead of being screened by leg age; the anchor here
+        // is unpriced, so a gate pass lands as `Provisional`.
         let cheap_v3 = |token0: Address, token1: Address, id: u8| {
             entry(
                 "0xf300000000000000000000000000000000000001"
@@ -992,16 +1193,14 @@ mod tests {
                 ),
             );
         }
-        evaluator.set_current_block(tip);
-        evaluator.set_max_price_age(50_000);
         let (_, classification) = evaluator.quote_triangle(0).expect("triangle re-quote");
         assert!(
             matches!(
                 &classification.reason,
-                ClassificationReason::NotEvaluated { detail }
-                    if detail.contains("max price age")
+                ClassificationReason::Provisional { .. } | ClassificationReason::NotProfitable
             ),
-            "a stale triangle leg must be screened: {classification:?}"
+            "a stale-leg triangle must evaluate economically (provisional at the \
+             unpriced fixture), not screen: {classification:?}"
         );
     }
 
@@ -1087,6 +1286,7 @@ mod tests {
             PairDirtyEvaluator::new(&v3_pools, &v4_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(200.0);
+        price_anchor(&mut evaluator);
         assert_eq!(evaluator.triangles.len(), 1, "one triangle expected");
         let tri = evaluator.triangles[0];
         assert_eq!(

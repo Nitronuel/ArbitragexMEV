@@ -618,6 +618,168 @@ where
     Ok(latest)
 }
 
+/// Counts `Swap` events per pool key over one inclusive block window, so an
+/// offline ranking pass can measure which catalog pools actually traded.
+///
+/// Same transport shape as [`sweep_swap_prices`]: V3 scopes each request by a
+/// chunked pool-address list; V4 filters the single `pool_manager` singleton
+/// and keeps only logs whose `topic1` matches a requested `PoolId`. Unlike the
+/// price sweep this needs no payload decode — a log with the right topic
+/// shape *is* a swap — so it only tallies.
+///
+/// # Errors
+///
+/// Returns a [`TransportError`] on an empty filter or a transport/budget
+/// failure.
+#[allow(clippy::too_many_arguments)]
+pub fn sweep_swap_activity<B, S>(
+    reader: &ChainReader<B, S>,
+    profile: [u8; 2],
+    pool_manager: Address,
+    keys: &[PoolEntry],
+    from: u64,
+    to: u64,
+    window: u64,
+    request_delay: Duration,
+) -> Result<HashMap<[u8; 32], u64>, TransportError>
+where
+    B: HttpBackend,
+    S: Sleeper,
+{
+    let topic = if profile == *b"v4" {
+        v4_swap_topic()
+    } else {
+        v3_swap_topic()
+    };
+    let mut counts: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut start = from;
+    loop {
+        let end = start.saturating_add(window.saturating_sub(1)).min(to);
+        if profile == *b"v4" {
+            let logs = reader.get_logs_windowed(
+                &LogFilter {
+                    from_block: start,
+                    to_block: end,
+                    addresses: vec![pool_manager],
+                    topic0: topic,
+                },
+                window,
+            )?;
+            let ids: HashSet<[u8; 32]> = keys.iter().map(|e| e.id).collect();
+            for raw in &logs {
+                let Ok(envelope) = RawLogEnvelope::from_rpc_value(raw) else {
+                    continue;
+                };
+                if envelope.topics.len() < 2 {
+                    continue;
+                }
+                let id = envelope.topics[1].0;
+                if ids.contains(&id) {
+                    *counts.entry(id).or_default() += 1;
+                }
+            }
+        } else {
+            for chunk in keys.chunks(MAX_ADDRESS_CHUNK) {
+                let addresses: Vec<Address> = chunk.iter().map(|e| e.venue).collect();
+                let logs = reader.get_logs_windowed(
+                    &LogFilter {
+                        from_block: start,
+                        to_block: end,
+                        addresses,
+                        topic0: topic,
+                    },
+                    window,
+                )?;
+                for raw in &logs {
+                    let Ok(envelope) = RawLogEnvelope::from_rpc_value(raw) else {
+                        continue;
+                    };
+                    *counts
+                        .entry(envelope.address.into_word().into())
+                        .or_default() += 1;
+                }
+                if !request_delay.is_zero() {
+                    std::thread::sleep(request_delay);
+                }
+            }
+        }
+        if !request_delay.is_zero() && profile == *b"v4" {
+            std::thread::sleep(request_delay);
+        }
+        if end == to {
+            break;
+        }
+        start = end + 1;
+    }
+    Ok(counts)
+}
+
+/// One cross-venue pair's measured swap activity: per-venue counts of the
+/// most-active single pool on that venue for the pair, and the ranking score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairActivityRanking {
+    pub token_lo: Address,
+    pub token_hi: Address,
+    /// Swap count of the most-active venue-A pool carrying this pair.
+    pub swaps_a: u64,
+    /// Swap count of the most-active venue-B pool carrying this pair.
+    pub swaps_b: u64,
+    /// Ranking score: `min(swaps_a, swaps_b)`. A cross-venue quote needs a
+    /// priced leg on both venues during the live window, so the quieter side
+    /// bounds how often the pair can actually be evaluated; one-sided activity
+    /// never makes a pair quotable and must not outrank two-sided activity.
+    pub score: u64,
+}
+
+/// Ranks every cross-venue token pair by observed swap activity. Pairs whose
+/// quieter side saw zero swaps cannot be evaluated live and are dropped.
+#[must_use]
+pub fn pair_activity_rankings(
+    a: &[PoolEntry],
+    b: &[PoolEntry],
+    activity_a: &HashMap<[u8; 32], u64>,
+    activity_b: &HashMap<[u8; 32], u64>,
+) -> Vec<PairActivityRanking> {
+    let mut best_a: HashMap<([u8; 20], [u8; 20]), u64> = HashMap::new();
+    for entry in a {
+        let count = activity_a.get(&pool_key(entry)).copied().unwrap_or(0);
+        let slot = best_a
+            .entry(pair_key(entry.token0, entry.token1))
+            .or_default();
+        *slot = (*slot).max(count);
+    }
+    let mut best_b: HashMap<([u8; 20], [u8; 20]), u64> = HashMap::new();
+    for entry in b {
+        let count = activity_b.get(&pool_key(entry)).copied().unwrap_or(0);
+        let slot = best_b
+            .entry(pair_key(entry.token0, entry.token1))
+            .or_default();
+        *slot = (*slot).max(count);
+    }
+    let mut rankings: Vec<PairActivityRanking> = best_a
+        .into_iter()
+        .filter_map(|(key, swaps_a)| {
+            let swaps_b = *best_b.get(&key)?;
+            Some(PairActivityRanking {
+                token_lo: Address::new(key.0),
+                token_hi: Address::new(key.1),
+                swaps_a,
+                swaps_b,
+                score: swaps_a.min(swaps_b),
+            })
+        })
+        .filter(|ranking| ranking.score > 0)
+        .collect();
+    rankings.sort_by(|x, y| {
+        y.score.cmp(&x.score).then_with(|| {
+            (y.swaps_a + y.swaps_b)
+                .cmp(&(x.swaps_a + x.swaps_b))
+                .then_with(|| (y.token_lo, y.token_hi).cmp(&(x.token_lo, x.token_hi)))
+        })
+    });
+    rankings
+}
+
 fn parse_b256(s: &str) -> Result<[u8; 32], String> {
     let v: alloy_primitives::B256 = s
         .trim_start_matches("0x")
@@ -845,12 +1007,6 @@ pub struct PairQuote {
     pub toll: f64,
     /// Observed log2 price skew across the two legs.
     pub log2_skew: f64,
-    /// Block number of the oldest (`PoolPrice.block`) among the legs used by
-    /// this quote. A quote whose reference leg is refresh-starved — cached
-    /// once and never re-priced by the ring sweep — carries a stale price, so
-    /// its skew is not a live cross-venue gap. The evaluator screens quotes
-    /// older than its `max_price_age` bound instead of gating them.
-    pub oldest_leg_block: u64,
 }
 
 /// Reduces a concentrated pool's sampled state to the virtual constant-product
@@ -1024,7 +1180,6 @@ pub fn quote_pair(
         profit: quote.profit,
         toll,
         log2_skew: skew,
-        oldest_leg_block: leg_price_a.block.min(leg_price_b.block),
     }))
 }
 
@@ -1286,11 +1441,6 @@ pub fn quote_triangle(
         profit: quote.profit,
         toll,
         log2_skew,
-        oldest_leg_block: leg01
-            .price
-            .block
-            .min(leg12.price.block)
-            .min(leg20.price.block),
     }))
 }
 
@@ -2502,5 +2652,198 @@ mod tests {
         // Without a seed restriction both anchored legs survive.
         let (all_legs, _) = usd_legs_for(&a, &[], None);
         assert_eq!(all_legs.len(), 2);
+    }
+
+    /// Canned `eth_getLogs` backend: returns one queued result per request.
+    struct ActivityBackend {
+        results: std::cell::RefCell<std::collections::VecDeque<Vec<serde_json::Value>>>,
+    }
+
+    impl provider::HttpBackend for ActivityBackend {
+        fn request(
+            &self,
+            _request: &provider::RpcRequest,
+        ) -> Result<provider::HttpResponse, TransportError> {
+            let logs = self.results.borrow_mut().pop_front().unwrap_or_default();
+            Ok(provider::HttpResponse {
+                result: serde_json::Value::Array(logs),
+                response_bytes: 10,
+            })
+        }
+    }
+
+    struct NoSleeper;
+
+    impl provider::Sleeper for NoSleeper {
+        fn sleep(&self, _duration: Duration) {}
+    }
+
+    fn activity_reader(backend: ActivityBackend) -> ChainReader<ActivityBackend, NoSleeper> {
+        ChainReader::new(
+            backend,
+            NoSleeper,
+            provider::ProviderBudget::new(u64::MAX, 1 << 24),
+            provider::RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            4663,
+        )
+    }
+
+    fn swap_log(address: Address, topic1: Option<[u8; 32]>) -> serde_json::Value {
+        let mut topics = vec![v3_swap_topic()];
+        if let Some(id) = topic1 {
+            topics.push(alloy_primitives::B256::new(id));
+        }
+        serde_json::json!({
+            "address": format!("{address:?}"),
+            "topics": topics,
+            "data": "0x00",
+            "blockNumber": "0x10",
+            "transactionIndex": "0x1",
+            "logIndex": "0x2",
+            "removed": false,
+        })
+    }
+
+    fn catalog_entry(profile: [u8; 2], venue: Address, id: [u8; 32]) -> PoolEntry {
+        PoolEntry {
+            profile,
+            venue,
+            id,
+            fee: 3000,
+            token0: Address::repeat_byte(0x11),
+            token1: Address::repeat_byte(0x22),
+            fee_denominator: 1_000_000,
+            factory: Address::ZERO,
+            chain_id: 4663,
+        }
+    }
+
+    #[test]
+    fn sweep_swap_activity_counts_events_per_pool() {
+        // V3 path: one address chunk; the mock returns two swaps on pool A
+        // and one on an unknown address (still counted — the filter scoped
+        // the request to catalog pools).
+        let pool_a = Address::repeat_byte(0xaa);
+        let pool_b = Address::repeat_byte(0xbb);
+        let entries = vec![
+            catalog_entry(*b"v3", pool_a, [1u8; 32]),
+            catalog_entry(*b"v3", pool_b, [2u8; 32]),
+        ];
+        let backend = ActivityBackend {
+            results: std::cell::RefCell::new(std::collections::VecDeque::from([vec![
+                swap_log(pool_a, None),
+                swap_log(pool_a, None),
+                swap_log(pool_b, None),
+            ]])),
+        };
+        let reader = activity_reader(backend);
+        let counts = sweep_swap_activity(
+            &reader,
+            *b"v3",
+            Address::ZERO,
+            &entries,
+            1,
+            10,
+            50,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let key_a: [u8; 32] = pool_a.into_word().into();
+        let key_b: [u8; 32] = pool_b.into_word().into();
+        assert_eq!(counts.get(&key_a), Some(&2));
+        assert_eq!(counts.get(&key_b), Some(&1));
+
+        // V4 path: the singleton stream is filtered by topic1 id; a foreign
+        // pool's swap must not be counted.
+        let id_known = [7u8; 32];
+        let id_foreign = [9u8; 32];
+        let v4_entries = vec![catalog_entry(*b"v4", V4_MANAGER_TEST, id_known)];
+        let singleton = V4_MANAGER_TEST;
+        let backend_v4 = ActivityBackend {
+            results: std::cell::RefCell::new(std::collections::VecDeque::from([vec![
+                swap_log(singleton, Some(id_known)),
+                swap_log(singleton, Some(id_known)),
+                swap_log(singleton, Some(id_foreign)),
+            ]])),
+        };
+        let reader_v4 = activity_reader(backend_v4);
+        let counts_v4 = sweep_swap_activity(
+            &reader_v4,
+            *b"v4",
+            singleton,
+            &v4_entries,
+            1,
+            10,
+            50,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(counts_v4.get(&id_known), Some(&2));
+        assert!(!counts_v4.contains_key(&id_foreign));
+    }
+
+    const V4_MANAGER_TEST: Address =
+        alloy_primitives::address!("0x8366a39CC670B4001A1121B8F6A443A643e40951");
+
+    #[test]
+    fn pair_activity_rankings_scores_two_sided_minimum() {
+        let lo: Address = "0x1000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let hi: Address = "0x2000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let other: Address = "0x3000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let entry_with = |profile: [u8; 2], venue: Address, id: [u8; 32]| PoolEntry {
+            profile,
+            venue,
+            id,
+            fee: 3000,
+            token0: lo,
+            token1: hi,
+            fee_denominator: 1_000_000,
+            factory: Address::ZERO,
+            chain_id: 4663,
+        };
+
+        // Pair (lo,hi): active venue-A pool (5) + two venue-B fee tiers whose
+        // best leg traded 3 times. Pair (lo,other): wildly active on A only.
+        let mut a_entries = vec![
+            entry_with(*b"v3", Address::repeat_byte(0xa1), [1u8; 32]),
+            entry_with(*b"v3", Address::repeat_byte(0xa2), [2u8; 32]),
+        ];
+        a_entries[1].token1 = other;
+        let b_entries = vec![
+            entry_with(*b"v4", V4_MANAGER_TEST, [3u8; 32]),
+            entry_with(*b"v4", V4_MANAGER_TEST, [4u8; 32]),
+        ];
+        // Venue-A pools are keyed by address; venue-B by PoolId.
+        let activity_a: HashMap<[u8; 32], u64> = HashMap::from([
+            (Address::repeat_byte(0xa1).into_word().into(), 5),
+            (Address::repeat_byte(0xa2).into_word().into(), 50),
+        ]);
+        let activity_b: HashMap<[u8; 32], u64> = HashMap::from([([3u8; 32], 3), ([4u8; 32], 1)]);
+
+        let rankings = pair_activity_rankings(&a_entries, &b_entries, &activity_a, &activity_b);
+
+        // The one-sided (lo,other) pair must be dropped entirely: it can
+        // never be evaluated without a priced B leg.
+        assert_eq!(
+            rankings.len(),
+            1,
+            "one-sided pairs are dropped: {rankings:?}"
+        );
+        let top = &rankings[0];
+        assert_eq!(top.token_lo, lo);
+        assert_eq!(top.token_hi, hi);
+        assert_eq!(top.swaps_a, 5);
+        assert_eq!(top.swaps_b, 3);
+        assert_eq!(top.score, 3, "score is the quieter side");
     }
 }
