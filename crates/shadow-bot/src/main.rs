@@ -1507,6 +1507,28 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     let prices = gaps::derive_usd_prices(&legs_a, &legs_b, &priced_a, &priced_b);
+
+    // The whole derivation hangs on the USDG decimals constant: every price
+    // scales by `10^(36-d_usdg)`, so a wrong constant shifts the entire table
+    // uniformly (and silently re-prices every gate). Verify it on-chain,
+    // fail-closed, before writing anything.
+    let decimals_data = reader
+        .call(
+            gaps::RHC_USDG,
+            &alloy_primitives::Bytes::from(vec![0x31, 0x3c, 0xe5, 0x67]),
+            args.to,
+        )
+        .map_err(|e| format!("USDG decimals() call failed: {e}"))?;
+    let usdg_decimals = gaps::decode_word_decimals(&decimals_data)
+        .ok_or("USDG decimals() returned malformed data")?;
+    if usdg_decimals != gaps::RHC_USDG_DECIMALS {
+        return Err(format!(
+            "on-chain USDG decimals() = {usdg_decimals} but RHC_USDG_DECIMALS = {} \
+             — price derivation constants are stale; update before deriving",
+            gaps::RHC_USDG_DECIMALS
+        ));
+    }
+
     let mut out =
         std::io::BufWriter::new(std::fs::File::create(args.out).map_err(|e| e.to_string())?);
     writeln!(out, "token,usd_per_token").map_err(|e| e.to_string())?;

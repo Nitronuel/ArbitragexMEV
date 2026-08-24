@@ -290,6 +290,21 @@ fn factor_ten(exp: usize) -> U256 {
     factor
 }
 
+/// Decodes a `uint8`-style `eth_call` return (a right-aligned 32-byte word)
+/// into its scalar value. Returns `None` for empty or oversized payloads —
+/// callers fail closed rather than guessing a decimals constant.
+#[must_use]
+pub fn decode_word_decimals(data: &[u8]) -> Option<u8> {
+    if data.is_empty() || data.len() > 32 {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for byte in data {
+        value = (value << 8) | u64::from(*byte);
+    }
+    u8::try_from(value).ok()
+}
+
 /// `numerator × factor / denominator`, i.e. the USD per token when the
 /// numerator is the USDG-side reserve and the denominator the token-side one.
 #[must_use]
@@ -2515,6 +2530,74 @@ mod tests {
         assert_eq!(
             out[&token],
             U256::from(250_000_000_000_000_000_000_000_000_000_u128)
+        );
+    }
+
+    #[test]
+    fn decode_word_decimals_parses_and_fails_closed() {
+        // `decimals()` on a 6-dec token: right-aligned word.
+        let mut word = vec![0u8; 32];
+        word[31] = 6;
+        assert_eq!(decode_word_decimals(&word), Some(6));
+        assert_eq!(decode_word_decimals(&[18]), Some(18));
+        // Malformed: empty or wider than a word must not guess.
+        assert_eq!(decode_word_decimals(&[]), None);
+        assert_eq!(decode_word_decimals(&[0u8; 33]), None);
+        // Values beyond u8 are rejected rather than truncated.
+        let mut big = vec![0u8; 32];
+        big[30] = 1;
+        assert_eq!(decode_word_decimals(&big), None);
+    }
+
+    #[test]
+    fn usd_derivation_cancels_token_decimals() {
+        // The `x10^(36-d_usdg)` factor is only correct because the token
+        // side's decimals cancel against the fixed-point convention
+        // (`V = P x 1e36/10^d_tok`). Two tokens with different decimals,
+        // each in a USG leg at human parity ($1 per whole token), must
+        // derive to V values whose implied human prices are both $1.
+        //
+        // Parity for an (usg=tok0, x=tok1) pool: whole-X per whole-USG
+        // = (r1/r0) * 10^(d_usg-d_x) = 1 => r0/r1 = 10^(d_x-d_usg).
+        let six_dec: Address = "0x6000000000000000000000000000000000000006"
+            .parse()
+            .unwrap();
+        let eighteen_dec: Address = "0x1800000000000000000000000000000000000018"
+            .parse()
+            .unwrap();
+        let usg = RHC_USDG;
+        let two_96: U256 = U256::from(1u64) << 96;
+        // Six-dec token: r0/r1 = 10^0 = 1.
+        let e6 = price_entry(Address::repeat_byte(0xa1), usg, six_dec);
+        // Eighteen-dec token: r0/r1 = 1e12 => sqrt = 2^96 * 1e6.
+        let e18 = price_entry(Address::repeat_byte(0xa2), usg, eighteen_dec);
+        let mut priced = HashMap::new();
+        priced.insert(
+            pool_key(&e6),
+            PoolPrice {
+                sqrt: two_96,
+                liquidity: U256::from(1_000_000_000_000_u64),
+                block: 1,
+            },
+        );
+        priced.insert(
+            pool_key(&e18),
+            PoolPrice {
+                sqrt: two_96.checked_mul(U256::from(1_000_000_u64)).unwrap(),
+                liquidity: U256::from(1_000_000_000_000_u64),
+                block: 1,
+            },
+        );
+        let out = derive_usd_prices(&[], &[e6, e18], &HashMap::new(), &priced);
+        // Implied human price: P = V * 10^d_tok / 1e36. Both legs are at $1.
+        let implied = |v: U256, d: u32| f64_of(v) * 10f64.powi(d as i32) / 1e36;
+        assert!(
+            (implied(out[&six_dec], 6) - 1.0).abs() < 1e-6
+                && (implied(out[&eighteen_dec], 18) - 1.0).abs() < 1e-6,
+            "$1 tokens with different decimals must imply $1 after derivation: \
+             v6={} v18={}",
+            out[&six_dec],
+            out[&eighteen_dec]
         );
     }
 
