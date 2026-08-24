@@ -5,6 +5,7 @@ members = [
     "crates/provider",
     "crates/shadow",
     "crates/shadow-bot",
+    "crates/simulation",
     "crates/state",
     "crates/storage",
     "crates/v2-math",

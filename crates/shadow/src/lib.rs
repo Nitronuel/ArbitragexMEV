@@ -1,5 +1,6 @@
 pub mod economics;
 pub mod evaluator;
+pub mod flash_loan;
 pub mod live;
 pub mod queue;
 pub mod report;
