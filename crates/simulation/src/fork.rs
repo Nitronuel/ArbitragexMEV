@@ -7,11 +7,12 @@
 //! layer on top via `CacheDB<ForkDb>` exactly as fixtures do over
 //! `CacheDB<EmptyDB>`. Reads are lazily fetched, cached per run, and never
 //! broadcast anything.
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use alloy_primitives::{Address, B256, U256};
 use provider::{ChainReader, HttpBackend, Sleeper, TransportError};
-use revm::database_interface::{DBErrorMarker, Database};
+use revm::database_interface::{DBErrorMarker, Database, DatabaseRef};
 use revm::state::{AccountInfo, Bytecode};
 
 #[cfg(test)]
@@ -39,9 +40,9 @@ impl DBErrorMarker for ForkDbError {}
 pub struct ForkDb<B: HttpBackend, S: Sleeper> {
     reader: ChainReader<B, S>,
     block: u64,
-    accounts: HashMap<Address, AccountInfo>,
-    storage: HashMap<(Address, U256), U256>,
-    block_hashes: HashMap<u64, B256>,
+    accounts: RefCell<HashMap<Address, AccountInfo>>,
+    storage: RefCell<HashMap<(Address, U256), U256>>,
+    block_hashes: RefCell<HashMap<u64, B256>>,
 }
 
 impl<B: HttpBackend, S: Sleeper> ForkDb<B, S> {
@@ -51,9 +52,9 @@ impl<B: HttpBackend, S: Sleeper> ForkDb<B, S> {
         Self {
             reader,
             block,
-            accounts: HashMap::new(),
-            storage: HashMap::new(),
-            block_hashes: HashMap::new(),
+            accounts: RefCell::new(HashMap::new()),
+            storage: RefCell::new(HashMap::new()),
+            block_hashes: RefCell::new(HashMap::new()),
         }
     }
 
@@ -62,13 +63,47 @@ impl<B: HttpBackend, S: Sleeper> ForkDb<B, S> {
     pub fn block(&self) -> u64 {
         self.block
     }
+
+    /// The pinned-block reader, for direct RPC reads alongside EVM execution.
+    #[must_use]
+    pub fn reader(&self) -> &ChainReader<B, S> {
+        &self.reader
+    }
 }
 
-impl<B: HttpBackend, S: Sleeper> Database for ForkDb<B, S> {
-    type Error = ForkDbError;
+/// The result of one forked transaction: revm's execution outcome plus the
+/// post-state database (mutations committed into the `CacheDB` overlay).
+pub struct ForkTx<B: HttpBackend, S: Sleeper> {
+    /// revm's committed result (`None`-free: EVM halts are reported inside).
+    pub result: Result<revm::context_interface::result::ExecutionResult, String>,
+    /// Post-state database; reuse it to chain further transactions.
+    pub db: revm::database::CacheDB<ForkDb<B, S>>,
+}
 
-    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        if let Some(info) = self.accounts.get(&address) {
+/// Executes one transaction against the pinned block's real state. This is
+/// the primitive every fork replay builds on: route steps run as successive
+/// `fork_transact` calls sharing one `CacheDB`, so pool mutations accumulate
+/// exactly as they would in a live bundle.
+///
+/// # Errors
+///
+/// Returns [`ForkDbError`] if constructing the database fails; EVM-level
+/// reverts surface inside [`ForkTx::result`].
+pub fn fork_transact<B: HttpBackend + 'static, S: Sleeper + 'static>(
+    reader: ChainReader<B, S>,
+    block: u64,
+    caller: Address,
+    to: Address,
+    data: alloy_primitives::Bytes,
+) -> Result<ForkTx<B, S>, ForkDbError> {
+    let db = revm::database::CacheDB::new(ForkDb::new(reader, block));
+    let (result, db) = crate::engine::run_tx(db, caller, to, data);
+    Ok(ForkTx { result, db })
+}
+
+impl<B: HttpBackend, S: Sleeper> ForkDb<B, S> {
+    fn basic_inner(&self, address: Address) -> Result<Option<AccountInfo>, ForkDbError> {
+        if let Some(info) = self.accounts.borrow().get(&address) {
             return Ok(Some(info.clone()));
         }
         let balance = self.reader.balance(address, self.block)?;
@@ -87,14 +122,12 @@ impl<B: HttpBackend, S: Sleeper> Database for ForkDb<B, S> {
             account_id: None,
             code: Some(bytecode),
         };
-        self.accounts.insert(address, info.clone());
+        self.accounts.borrow_mut().insert(address, info.clone());
         Ok(Some(info))
     }
 
-    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // `basic` always attaches code, so revm never needs to resolve a hash
-        // it has not seen; reaching here means an inconsistent provider.
-        for info in self.accounts.values() {
+    fn code_by_hash_inner(&self, code_hash: B256) -> Result<Bytecode, ForkDbError> {
+        for info in self.accounts.borrow().values() {
             if info.code_hash == code_hash {
                 return Ok(info.code.clone().unwrap_or_default());
             }
@@ -102,22 +135,62 @@ impl<B: HttpBackend, S: Sleeper> Database for ForkDb<B, S> {
         Err(ForkDbError::UnknownCodeHash(code_hash))
     }
 
-    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        if let Some(value) = self.storage.get(&(address, index)) {
+    fn storage_inner(&self, address: Address, index: U256) -> Result<U256, ForkDbError> {
+        if let Some(value) = self.storage.borrow().get(&(address, index)) {
             return Ok(*value);
         }
         let value = self.reader.storage_at(address, index, self.block)?;
-        self.storage.insert((address, index), value);
+        self.storage.borrow_mut().insert((address, index), value);
         Ok(value)
     }
 
-    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        if let Some(hash) = self.block_hashes.get(&number) {
+    fn block_hash_inner(&self, number: u64) -> Result<B256, ForkDbError> {
+        if let Some(hash) = self.block_hashes.borrow().get(&number) {
             return Ok(*hash);
         }
         let hash = B256::from(self.reader.block_hash(number)?);
-        self.block_hashes.insert(number, hash);
+        self.block_hashes.borrow_mut().insert(number, hash);
         Ok(hash)
+    }
+}
+
+impl<B: HttpBackend, S: Sleeper> DatabaseRef for ForkDb<B, S> {
+    type Error = ForkDbError;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.basic_inner(address)
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.code_by_hash_inner(code_hash)
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.storage_inner(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        self.block_hash_inner(number)
+    }
+}
+
+impl<B: HttpBackend, S: Sleeper> Database for ForkDb<B, S> {
+    type Error = ForkDbError;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.basic_inner(address)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.code_by_hash_inner(code_hash)
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.storage_inner(address, index)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.block_hash_inner(number)
     }
 }
 
@@ -303,5 +376,77 @@ mod tests {
             Database::block_hash(&mut missing, 99),
             Err(ForkDbError::Transport(TransportError::InvalidResponse))
         ));
+    }
+
+    #[test]
+    fn fork_transact_executes_real_code_and_returns_output() {
+        // The "contract": MSTORE(0, 0x2a) then RETURN(0, 32) — a deterministic
+        // 32-byte answer proving code was fetched from the fork and executed.
+        // Only the target carries code; the caller must stay a plain account.
+        use std::sync::Arc;
+        let contract = Address::repeat_byte(0xcc);
+        let contract_hex = format!("0x{}", alloy_primitives::hex::encode(contract));
+        struct FnBackend {
+            contract_hex: String,
+            seen: Arc<RefCell<usize>>,
+        }
+        impl HttpBackend for FnBackend {
+            fn request(&self, request: &RpcRequest) -> Result<HttpResponse, TransportError> {
+                match request.method.as_str() {
+                    "eth_getCode" => {
+                        *self.seen.borrow_mut() += 1;
+                        let target = request.params[0].as_str().unwrap_or_default();
+                        Ok(HttpResponse {
+                            result: Value::String(
+                                if target.eq_ignore_ascii_case(&self.contract_hex) {
+                                    "0x602a60005260206000f3".into()
+                                } else {
+                                    "0x".into()
+                                },
+                            ),
+                            response_bytes: 10,
+                        })
+                    }
+                    "eth_getBalance" | "eth_getTransactionCount" => Ok(HttpResponse {
+                        // Even-length quantity strings only: the transport
+                        // layer hex-decodes balances as bytes.
+                        result: Value::String("0x0000000000000000".into()),
+                        response_bytes: 10,
+                    }),
+                    other => Err(TransportError::Permanent(format!("unexpected {other}"))),
+                }
+            }
+        }
+        let seen = Arc::new(RefCell::new(0_usize));
+        let reader = ChainReader::new(
+            FnBackend {
+                contract_hex,
+                seen: Arc::clone(&seen),
+            },
+            NoSleeper,
+            provider::ProviderBudget::new(u64::MAX, 1 << 24),
+            provider::RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            4663,
+        );
+        let tx = fork_transact(
+            reader,
+            9,
+            Address::repeat_byte(0x11),
+            contract,
+            Bytes::new(),
+        )
+        .expect("database constructs");
+        let result = tx.result.expect("execution succeeds");
+        let output = result.output().expect("contract returned data");
+        let mut expected = vec![0u8; 32];
+        expected[31] = 0x2a;
+        assert_eq!(output.as_ref(), &expected[..]);
+        // Code was served from the fork (revm may re-validate the caller, so
+        // only a lower bound holds).
+        assert!(*seen.borrow() >= 1);
     }
 }

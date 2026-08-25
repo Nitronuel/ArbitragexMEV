@@ -179,7 +179,7 @@ pub(crate) fn encode_transfer_from(from: Address, to: Address, amount: U256) -> 
 
 /// Runs one committed revm transaction; returns the committed database with
 /// the execution outcome.
-pub(crate) fn run_tx<D>(
+pub fn run_tx<D>(
     db: D,
     caller: Address,
     to: Address,

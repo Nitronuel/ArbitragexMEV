@@ -37,5 +37,5 @@ pub use engine::{
     FLASH_FEE_SCALE, LENDER_ADDRESS, LegResult, Outcome, RoundTripSim, SimError, Step,
     round_trip_steps,
 };
-pub use fork::ForkDb;
+pub use fork::{ForkDb, ForkTx, fork_transact};
 pub use tokens::{TokenKind, TokenSpec, token_bytecode};
