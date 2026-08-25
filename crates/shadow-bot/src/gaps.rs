@@ -639,7 +639,64 @@ where
     // the single PoolManager and deselect by topic1 id.
     let mut latest: HashMap<[u8; 32], PoolPrice> = HashMap::new();
     let mut start = from;
-    let mut ingest = |logs: &[serde_json::Value], keep_ids: Option<&HashSet<[u8; 32]>>| {
+    let ids: Option<HashSet<[u8; 32]>> = if profile == *b"v4" {
+        Some(keys.iter().map(|e| e.id).collect())
+    } else {
+        None
+    };
+    {
+        let mut ingest = swap_price_ingest(profile, &mut latest);
+        loop {
+            let end = start.saturating_add(window.saturating_sub(1)).min(to);
+            if profile == *b"v4" {
+                let logs = reader.get_logs_windowed(
+                    &LogFilter {
+                        from_block: start,
+                        to_block: end,
+                        addresses: vec![pool_manager],
+                        topic0: topic,
+                    },
+                    window,
+                )?;
+                ingest(&logs, ids.as_ref());
+                if !request_delay.is_zero() {
+                    std::thread::sleep(request_delay);
+                }
+            } else {
+                for chunk in swept_v3_chunks(keys, chunk_window) {
+                    let addresses: Vec<Address> = chunk.iter().map(|e| e.venue).collect();
+                    let logs = reader.get_logs_windowed(
+                        &LogFilter {
+                            from_block: start,
+                            to_block: end,
+                            addresses,
+                            topic0: topic,
+                        },
+                        window,
+                    )?;
+                    ingest(&logs, None);
+                    if !request_delay.is_zero() {
+                        std::thread::sleep(request_delay);
+                    }
+                }
+            }
+            if end == to {
+                break;
+            }
+            start = end + 1;
+        }
+    }
+    Ok(latest)
+}
+
+/// Builds the shared `Swap`-log → latest-`PoolPrice` ingest closure used by
+/// the price sweeps. V3 rows key on the emitting pool address; V4 rows key on
+/// the swap `topic1` `PoolId`, kept only when listed in `keep_ids`.
+fn swap_price_ingest(
+    profile: [u8; 2],
+    latest: &mut HashMap<[u8; 32], PoolPrice>,
+) -> impl FnMut(&[serde_json::Value], Option<&HashSet<[u8; 32]>>) + '_ {
+    move |logs: &[serde_json::Value], keep_ids: Option<&HashSet<[u8; 32]>>| {
         for raw in logs {
             let Ok(envelope) = RawLogEnvelope::from_rpc_value(raw) else {
                 continue;
@@ -678,52 +735,185 @@ where
                 }
             }
         }
+    }
+}
+
+/// Number of sweep chunks a venue's key set divides into under the provider's
+/// address-filter cap. V4 sweeps the singleton stream as one pseudo-chunk.
+#[must_use]
+pub fn sweep_chunk_count(profile: [u8; 2], keys: &[PoolEntry]) -> usize {
+    if profile == *b"v4" {
+        1
+    } else {
+        keys.chunks(MAX_ADDRESS_CHUNK).count().max(1)
+    }
+}
+
+/// Per-chunk catch-up cap for [`sweep_swap_prices_ring`]: one call advances a
+/// stalled chunk by at most this many blocks, bounding worst-case latency and
+/// CU burn per poll after a long stall. The next call continues from there.
+pub const DEFAULT_MAX_CATCHUP_BLOCKS: u64 = 20_000;
+
+/// One [`sweep_swap_prices_ring`] call's result.
+#[derive(Debug, Default)]
+pub struct RingSweepOutcome {
+    /// Latest observed post-swap price per pool that traded in the covered
+    /// ranges.
+    pub prices: HashMap<[u8; 32], PoolPrice>,
+    /// `(pool key, through block)` for every pool whose chunk this call
+    /// covered — including pools that emitted no events. Feeds the evaluator's
+    /// coverage voucher (`PairDirtyEvaluator::mark_swept_keys`).
+    pub covered_keys: Vec<([u8; 32], u64)>,
+}
+
+/// Incremental Swap-price sweep with **per-chunk high-water marks**.
+///
+/// This is the run-pairs poll loop's sweep. Unlike [`sweep_swap_prices`],
+/// which takes one global `from..=to` window and silently loses every block a
+/// ring-skipped chunk did not observe, each address chunk here carries its own
+/// water mark: a call covers `[water + 1 ..= min(to, water + catchup)]` for
+/// the chunks it selects and advances only those marks. No block is ever
+/// passed over permanently — an unswept chunk stays behind and is picked up
+/// when the ring reaches it.
+///
+/// Chunk selection picks the `max_chunks_per_poll` chunks with the *lowest*
+/// water marks (most behind first, index tie-break), so there is no separate
+/// cursor to drift and a failed or stalled chunk is prioritized on the next
+/// call. `0` selects every chunk.
+///
+/// A mid-chunk failure propagates as [`TransportError`] *after* advancing the
+/// water marks of windows that did succeed, so paid-for work is never
+/// re-fetched and never skipped.
+///
+/// `chunk_water` must have [`sweep_chunk_count`] entries for this key set;
+/// it is resized to that length, filling new slots with `initial_water`
+/// (pass `start.saturating_sub(1)` where `start` is the first block the
+/// caller wants observed).
+///
+/// # Errors
+///
+/// Returns a [`TransportError`] on an empty filter or a transport/budget
+/// failure; already-covered progress is retained in `chunk_water`.
+#[allow(clippy::too_many_arguments)]
+pub fn sweep_swap_prices_ring<B, S>(
+    reader: &ChainReader<B, S>,
+    profile: [u8; 2],
+    pool_manager: Address,
+    keys: &[PoolEntry],
+    chunk_water: &mut Vec<u64>,
+    initial_water: u64,
+    max_chunks_per_poll: usize,
+    to: u64,
+    window: u64,
+    request_delay: Duration,
+    max_catchup_blocks: u64,
+) -> Result<RingSweepOutcome, TransportError>
+where
+    B: HttpBackend,
+    S: Sleeper,
+{
+    let topic = if profile == *b"v4" {
+        v4_swap_topic()
+    } else {
+        v3_swap_topic()
     };
-    loop {
-        let end = start.saturating_add(window.saturating_sub(1)).min(to);
-        if profile == *b"v4" {
-            let logs = reader.get_logs_windowed(
-                &LogFilter {
-                    from_block: start,
-                    to_block: end,
-                    addresses: vec![pool_manager],
-                    topic0: topic,
-                },
-                window,
-            )?;
-            let ids: HashSet<[u8; 32]> = keys.iter().map(|e| e.id).collect();
-            ingest(&logs, Some(&ids));
-            if !request_delay.is_zero() {
-                std::thread::sleep(request_delay);
+    let chunk_count = sweep_chunk_count(profile, keys);
+    if chunk_water.len() != chunk_count {
+        chunk_water.resize(chunk_count, initial_water);
+    }
+    // Build the chunk list once: V3 = consecutive MAX_ADDRESS_CHUNK slices of
+    // the catalog; V4 = a single pseudo-chunk covering the whole singleton
+    // stream (ingest filters by `PoolId`).
+    let all_chunks: Vec<&[PoolEntry]> = if profile == *b"v4" {
+        vec![keys]
+    } else {
+        keys.chunks(MAX_ADDRESS_CHUNK).collect()
+    };
+    // Most-behind chunks first: lowest water mark wins, index breaks ties.
+    let mut order: Vec<usize> = (0..chunk_count).collect();
+    order.sort_by_key(|&c| (chunk_water[c], c));
+    let take = if max_chunks_per_poll == 0 {
+        chunk_count
+    } else {
+        max_chunks_per_poll.min(chunk_count)
+    };
+
+    let ids: Option<HashSet<[u8; 32]>> = if profile == *b"v4" {
+        Some(keys.iter().map(|e| e.id).collect())
+    } else {
+        None
+    };
+    let mut outcome = RingSweepOutcome::default();
+    {
+        let mut ingest = swap_price_ingest(profile, &mut outcome.prices);
+        for &c in order.iter().take(take) {
+            let water = chunk_water[c];
+            let from = water.saturating_add(1);
+            if from > to {
+                continue; // already current through `to`
             }
-        } else {
-            for chunk in swept_v3_chunks(keys, chunk_window) {
-                let addresses: Vec<Address> = chunk.iter().map(|e| e.venue).collect();
+            let to_c = to.min(water.saturating_add(max_catchup_blocks.max(1)));
+            let chunk = all_chunks[c];
+            let addresses: Vec<Address> = if profile == *b"v4" {
+                vec![pool_manager]
+            } else {
+                chunk.iter().map(|e| e.venue).collect()
+            };
+            let mut start = from;
+            let mut covered_through = water;
+            loop {
+                let end = start.saturating_add(window.saturating_sub(1)).min(to_c);
                 let logs = reader.get_logs_windowed(
                     &LogFilter {
                         from_block: start,
                         to_block: end,
-                        addresses,
+                        addresses: addresses.clone(),
                         topic0: topic,
                     },
                     window,
-                )?;
-                ingest(&logs, None);
-                if !request_delay.is_zero() {
-                    std::thread::sleep(request_delay);
+                );
+                match logs {
+                    Ok(logs) => {
+                        ingest(
+                            &logs,
+                            if profile == *b"v4" {
+                                ids.as_ref()
+                            } else {
+                                None
+                            },
+                        );
+                        covered_through = end;
+                        if end == to_c {
+                            break;
+                        }
+                        start = end + 1;
+                    }
+                    Err(error) => {
+                        // Keep the windows that succeeded, retry the rest:
+                        // advance the water mark through the last covered
+                        // block and record those pools' coverage before
+                        // propagating.
+                        chunk_water[c] = covered_through;
+                        if covered_through >= from {
+                            outcome
+                                .covered_keys
+                                .extend(chunk.iter().map(|e| (pool_key(e), covered_through)));
+                        }
+                        return Err(error);
+                    }
                 }
             }
+            chunk_water[c] = to_c;
+            outcome
+                .covered_keys
+                .extend(chunk.iter().map(|e| (pool_key(e), to_c)));
+            if !request_delay.is_zero() {
+                std::thread::sleep(request_delay);
+            }
         }
-        if end == to {
-            break;
-        }
-        start = end + 1;
     }
-    Ok(latest)
+    Ok(outcome)
 }
-
-/// Counts `Swap` events per pool key over one inclusive block window, so an
-/// offline ranking pass can measure which catalog pools actually traded.
 ///
 /// Same transport shape as [`sweep_swap_prices`]: V3 scopes each request by a
 /// chunked pool-address list; V4 filters the single `pool_manager` singleton
@@ -2945,6 +3135,62 @@ mod tests {
         results: std::cell::RefCell<std::collections::VecDeque<Vec<serde_json::Value>>>,
     }
 
+    /// Records every `eth_getLogs` request range and returns scripted
+    /// responses (or a transient error) per request, to drive the ring sweep.
+    /// The request log is shared via `Rc` so the test can inspect it after
+    /// the backend is moved into the [`ChainReader`].
+    type ScriptedResponse = Result<Vec<serde_json::Value>, TransportError>;
+
+    struct RingBackend {
+        requests: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+        responses: std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<ScriptedResponse>>>,
+    }
+
+    impl provider::HttpBackend for RingBackend {
+        fn request(
+            &self,
+            request: &provider::RpcRequest,
+        ) -> Result<provider::HttpResponse, TransportError> {
+            assert_eq!(request.method, "eth_getLogs");
+            let filter = &request.params[0];
+            let parse = |field: &str| -> u64 {
+                u64::from_str_radix(
+                    filter[field]
+                        .as_str()
+                        .expect("hex quantity")
+                        .trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap()
+            };
+            self.requests
+                .borrow_mut()
+                .push((parse("fromBlock"), parse("toBlock")));
+            self.responses
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()))
+                .map(|logs| provider::HttpResponse {
+                    result: serde_json::Value::Array(logs),
+                    response_bytes: 10,
+                })
+        }
+    }
+
+    fn ring_reader(backend: RingBackend) -> ChainReader<RingBackend, NoSleeper> {
+        ChainReader::new(
+            backend,
+            NoSleeper,
+            provider::ProviderBudget::new(u64::MAX, 1 << 24),
+            provider::RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            4663,
+        )
+    }
+
     impl provider::HttpBackend for ActivityBackend {
         fn request(
             &self,
@@ -3070,6 +3316,216 @@ mod tests {
         .unwrap();
         assert_eq!(counts_v4.get(&id_known), Some(&2));
         assert!(!counts_v4.contains_key(&id_foreign));
+    }
+
+    #[test]
+    fn ring_sweep_covers_every_block_exactly_once_across_polls() {
+        // The S2a regression: with a global high-water mark, chunks not in a
+        // poll's ring slice permanently lost their block range. Per-chunk
+        // water marks mean every block in [start..=to] is requested by
+        // exactly one chunk across the poll sequence, regardless of cadence.
+        let pool_a = Address::repeat_byte(0xaa);
+        let pool_b = Address::repeat_byte(0xbb);
+        let entries = vec![
+            catalog_entry(*b"v3", pool_a, [1u8; 32]),
+            catalog_entry(*b"v3", pool_b, [2u8; 32]),
+        ];
+        let requests_log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let responses: std::rc::Rc<
+            std::cell::RefCell<std::collections::VecDeque<ScriptedResponse>>,
+        > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new()));
+        let reader = ring_reader(RingBackend {
+            requests: std::rc::Rc::clone(&requests_log),
+            responses: std::rc::Rc::clone(&responses),
+        });
+        let mut chunk_water = vec![0u64; sweep_chunk_count(*b"v3", &entries)];
+        assert_eq!(chunk_water.len(), 1, "two pools share one 999-wide chunk");
+
+        // Three "polls" advancing the tip; one chunk per poll is moot with a
+        // single chunk — exercise multi-chunk via catch-up capping instead:
+        // cap = 5 blocks per call against tips advancing by 7.
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        let mut tip = 0u64;
+        for _ in 0..3 {
+            tip += 7;
+            let outcome = sweep_swap_prices_ring(
+                &reader,
+                *b"v3",
+                Address::ZERO,
+                &entries,
+                &mut chunk_water,
+                0,
+                0,
+                tip,
+                50,
+                Duration::ZERO,
+                5,
+            )
+            .unwrap();
+            covered.extend(
+                outcome
+                    .covered_keys
+                    .iter()
+                    .map(|(_, through)| (*through, *through)),
+            );
+        }
+        // Water marks: after each capped call the chunk advanced exactly 5.
+        assert_eq!(chunk_water, vec![15], "3 calls x 5-block cap from 0");
+        // The requested ranges must tile [1..=15] with no gaps and no overlap.
+        let tiled: Vec<(u64, u64)> = requests_log.borrow().clone();
+        let mut expected = vec![(1u64, 5), (6, 10), (11, 15)];
+        expected.sort_unstable();
+        assert_eq!(
+            tiled, expected,
+            "every block covered exactly once: {tiled:?}"
+        );
+        // Coverage vouchers report through each call's effective depth — one
+        // entry per pool in the covered chunk (two pools here).
+        let mut depths: Vec<u64> = covered.into_iter().map(|(t, _)| t).collect();
+        depths.sort_unstable();
+        depths.dedup();
+        assert_eq!(depths, vec![5, 10, 15]);
+    }
+
+    #[test]
+    fn ring_sweep_failure_keeps_water_mark_and_retries_range() {
+        // A mid-chunk failure must advance only through windows that actually
+        // succeeded, so the failed range is retried — never skipped (B12).
+        let pool_a = Address::repeat_byte(0xaa);
+        let entries = vec![catalog_entry(*b"v3", pool_a, [1u8; 32])];
+        let requests_log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let responses: std::rc::Rc<
+            std::cell::RefCell<std::collections::VecDeque<ScriptedResponse>>,
+        > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new()));
+        // First request succeeds for window [1..=2]; second fails.
+        responses
+            .borrow_mut()
+            .push_back(Ok(vec![swap_log(pool_a, None)]));
+        responses
+            .borrow_mut()
+            .push_back(Err(TransportError::Transient("scripted".to_owned())));
+        let reader = ring_reader(RingBackend {
+            requests: std::rc::Rc::clone(&requests_log),
+            responses: std::rc::Rc::clone(&responses),
+        });
+        let mut chunk_water = vec![0u64];
+        let error = sweep_swap_prices_ring(
+            &reader,
+            *b"v3",
+            Address::ZERO,
+            &entries,
+            &mut chunk_water,
+            0,
+            0,
+            4,
+            2, // window width 2 → two windows over [1..=4]
+            Duration::ZERO,
+            DEFAULT_MAX_CATCHUP_BLOCKS,
+        )
+        .unwrap_err();
+        assert!(matches!(error, TransportError::Transient(_)));
+        assert_eq!(
+            chunk_water,
+            vec![2],
+            "only the succeeded window's blocks are marked"
+        );
+
+        // Retry covers exactly the remaining range.
+        responses.borrow_mut().push_back(Ok(Vec::new()));
+        let outcome = sweep_swap_prices_ring(
+            &reader,
+            *b"v3",
+            Address::ZERO,
+            &entries,
+            &mut chunk_water,
+            0,
+            0,
+            4,
+            2,
+            Duration::ZERO,
+            DEFAULT_MAX_CATCHUP_BLOCKS,
+        )
+        .unwrap();
+        assert_eq!(chunk_water, vec![4]);
+        assert_eq!(
+            requests_log.borrow().last(),
+            Some(&(3, 4)),
+            "retry resumes after the covered block"
+        );
+        assert_eq!(outcome.covered_keys.len(), 1);
+    }
+
+    #[test]
+    fn ring_sweep_advances_chunks_independently() {
+        // The literal canary shape: >999 pools split into two chunks, one
+        // chunk per poll. Each chunk's water mark advances only when its own
+        // chunk is swept; the unswept chunk's range stays pending instead of
+        // being skipped by a global high-water mark.
+        let entries: Vec<PoolEntry> = (0..1_500u32)
+            .map(|i| {
+                catalog_entry(
+                    *b"v3",
+                    Address::repeat_byte(u8::try_from(i % 251).unwrap_or(0) + 1),
+                    alloy_primitives::B256::from(U256::from(i + 1)).into(),
+                )
+            })
+            .collect();
+        assert_eq!(sweep_chunk_count(*b"v3", &entries), 2);
+        let requests_log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let responses: std::rc::Rc<
+            std::cell::RefCell<std::collections::VecDeque<ScriptedResponse>>,
+        > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new()));
+        let reader = ring_reader(RingBackend {
+            requests: std::rc::Rc::clone(&requests_log),
+            responses: std::rc::Rc::clone(&responses),
+        });
+        let mut chunk_water = vec![0u64; 2];
+
+        // Poll 1 at tip=10 sweeps the most-behind chunk (index tie-break
+        // picks chunk 0): covers [1..=10] for chunk 0 only.
+        let outcome = sweep_swap_prices_ring(
+            &reader,
+            *b"v3",
+            Address::ZERO,
+            &entries,
+            &mut chunk_water,
+            0,
+            1,
+            10,
+            50,
+            Duration::ZERO,
+            DEFAULT_MAX_CATCHUP_BLOCKS,
+        )
+        .unwrap();
+        assert_eq!(chunk_water, vec![10, 0]);
+        assert_eq!(outcome.covered_keys.len(), 999);
+        assert_eq!(
+            requests_log.borrow().as_slice(),
+            &[(1, 10)],
+            "only chunk 0's range was requested"
+        );
+
+        // Poll 2 at tip=20: chunk 1 is now most behind and is selected.
+        let _ = sweep_swap_prices_ring(
+            &reader,
+            *b"v3",
+            Address::ZERO,
+            &entries,
+            &mut chunk_water,
+            0,
+            1,
+            20,
+            50,
+            Duration::ZERO,
+            DEFAULT_MAX_CATCHUP_BLOCKS,
+        )
+        .unwrap();
+        assert_eq!(chunk_water, vec![10, 20]);
+        assert_eq!(
+            requests_log.borrow().last(),
+            Some(&(1, 20)),
+            "chunk 1 covered its full pending range [1..=20]"
+        );
     }
 
     const V4_MANAGER_TEST: Address =

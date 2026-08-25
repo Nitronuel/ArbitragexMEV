@@ -474,11 +474,18 @@ enum Command {
         /// USD gating instead of the `$1` fixture.
         #[arg(long)]
         prices: Option<PathBuf>,
-        /// V3 catalog address-chunks swept per poll in the ring sweep. When
-        /// zero, the default covers the whole V3 universe within ~1h at the
-        /// configured `--poll-ms`.
-        #[arg(long, default_value_t = 0)]
+        /// V3 catalog address-chunks swept per poll in the ring sweep. The
+        /// most-behind chunks go first; every chunk carries its own
+        /// high-water mark, so no block is ever skipped regardless of this
+        /// cadence — it trades CU burn against detection latency only.
+        /// `0` sweeps all chunks (whole universe) every poll.
+        #[arg(long, default_value_t = 1)]
         v3_chunks_per_poll: u64,
+        /// Confirmation lag: sweep up to this many blocks behind the tip so
+        /// reorged-out logs are never applied as canonical. Coverage is
+        /// stamped at the lagged block, not the tip.
+        #[arg(long, default_value_t = 10)]
+        confirm_lag_blocks: u64,
         /// Maximum `|log2 skew|` a quote may carry and still be gated.
         /// Larger gaps come from degenerate near-empty pools that are not
         /// captureable; they are screened out instead of surfacing as
@@ -738,6 +745,7 @@ fn main() {
             csv,
             prices,
             v3_chunks_per_poll,
+            confirm_lag_blocks,
             max_skew,
             flash_provider,
             flash_support,
@@ -760,6 +768,7 @@ fn main() {
             csv: csv.as_deref(),
             prices: prices.as_deref(),
             v3_chunks_per_poll,
+            confirm_lag_blocks,
             max_skew,
             flash_provider: &flash_provider,
             flash_support: flash_support.as_deref(),
@@ -1819,9 +1828,10 @@ struct RunPairsArgs<'a> {
     delay_ms: u64,
     csv: Option<&'a std::path::Path>,
     prices: Option<&'a std::path::Path>,
-    /// V3 address chunks swept per poll in the ring sweep; when zero the
-    /// default covers the whole V3 universe within ~1h.
+    /// V3 address chunks swept per poll in the ring sweep (0 = all chunks).
     v3_chunks_per_poll: u64,
+    /// Confirmation lag behind the chain tip for sweeps and coverage.
+    confirm_lag_blocks: u64,
     /// Maximum `|log2 skew|` a quote may carry and still be gated; quotes
     /// above it are screened out as uncaptureable.
     max_skew: f64,
@@ -1964,7 +1974,6 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let poll = Duration::from_millis(poll_ms);
     let delay = Duration::from_millis(delay_ms);
     let since = std::time::Instant::now();
-    let mut high_water = start;
     let mut applied = 0u64;
     let mut evals = 0usize;
     let mut interesting = 0usize;
@@ -1975,22 +1984,15 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut near_misses = 0usize;
     let mut provisionals = 0usize;
     let mut last_window = 0u64;
-    let v3_chunks = (a_entries.chunks(999).count() * usize::from(profile_bytes_a == *b"v3"))
-        .max(b_entries.chunks(999).count() * usize::from(profile_bytes_b == *b"v3"))
-        .max(1);
-    // Default ring: sweep the whole V3 universe once per ~1h at the poll
-    // cadence (chunks-per-poll = chunks × poll_ms / 3_600_000), so detection
-    // latency stays under an hour while each poll burns one chunk of CU.
-    let v3_chunks_per_poll_eff = if args.v3_chunks_per_poll == 0 {
-        let per_hour = u64::try_from(v3_chunks)
-            .expect("v3 catalog chunk count must fit u64")
-            .saturating_mul(poll_ms)
-            .saturating_div(3_600_000);
-        per_hour.max(1)
-    } else {
-        args.v3_chunks_per_poll
-    };
-    let mut v3_ring_start = 0u64;
+    // Per-chunk high-water marks: chunk c is observed through water[c]. Each
+    // poll sweeps the most-behind chunks and advances only their marks, so
+    // ring-skipped chunks keep their position instead of silently losing the
+    // block range (the S2a data-loss defect). V4 sweeps as one pseudo-chunk.
+    let mut water_a =
+        vec![start.saturating_sub(1); gaps::sweep_chunk_count(profile_bytes_a, &a_entries)];
+    let mut water_b =
+        vec![start.saturating_sub(1); gaps::sweep_chunk_count(profile_bytes_b, &b_entries)];
+    let v3_chunks_per_poll_eff = usize::try_from(args.v3_chunks_per_poll).unwrap_or(usize::MAX);
 
     loop {
         if stop.flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2012,85 +2014,68 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             }
             Err(error) => return Err(error.to_string()),
         };
-        if latest <= high_water {
-            std::thread::sleep(poll);
-            continue;
-        }
-        let window_from = high_water + 1;
-        let v3_window = if profile_bytes_a == *b"v3" {
-            Some((v3_ring_start, v3_chunks_per_poll_eff))
-        } else {
-            None
-        };
-        let priced_a = match gaps::sweep_swap_prices(
+        // Sweep up to the confirmation-lagged tip: reorged-out logs are
+        // never applied as canonical, and coverage is stamped at the lagged
+        // block, not the raw tip.
+        let to_eff = latest.saturating_sub(args.confirm_lag_blocks);
+        let sweep_a = match gaps::sweep_swap_prices_ring(
             &reader,
             profile_bytes_a,
             pool_manager.unwrap_or(V4_POOL_MANAGER),
             &a_entries,
-            window_from,
-            latest,
+            &mut water_a,
+            start.saturating_sub(1),
+            v3_chunks_per_poll_eff,
+            to_eff,
             window,
             delay,
-            v3_window,
+            gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
         ) {
-            Ok(priced) => priced,
+            Ok(outcome) => outcome,
             Err(TransportError::Transient(message)) => {
-                eprintln!("run-pairs: transient error sweeping profile A; retrying: {message}");
+                eprintln!("run-pairs: transient error sweeping venue A; retrying: {message}");
                 std::thread::sleep(poll);
                 continue;
             }
             Err(error) => return Err(error.to_string()),
         };
-        let v4_window = if profile_bytes_b == *b"v3" {
-            Some((v3_ring_start, v3_chunks_per_poll_eff))
-        } else {
-            None
-        };
-        let priced_b = match gaps::sweep_swap_prices(
+        let sweep_b = match gaps::sweep_swap_prices_ring(
             &reader,
             profile_bytes_b,
             pool_manager.unwrap_or(V4_POOL_MANAGER),
             &b_entries,
-            window_from,
-            latest,
+            &mut water_b,
+            start.saturating_sub(1),
+            v3_chunks_per_poll_eff,
+            to_eff,
             window,
             delay,
-            v4_window,
+            gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
         ) {
-            Ok(priced) => priced,
+            Ok(outcome) => outcome,
             Err(TransportError::Transient(message)) => {
-                eprintln!("run-pairs: transient error sweeping profile B; retrying: {message}");
+                eprintln!("run-pairs: transient error sweeping venue B; retrying: {message}");
                 std::thread::sleep(poll);
                 continue;
             }
             Err(error) => return Err(error.to_string()),
         };
-        // Advance the V3 ring cursor past the chunks swept this poll so every
-        // pool is re-priced once per full ring.
-        v3_ring_start = (v3_ring_start + v3_chunks_per_poll_eff) % v3_chunks as u64;
+        let priced_a = sweep_a.prices;
+        let covered_a = sweep_a.covered_keys;
+        let priced_b = sweep_b.prices;
+        let covered_b = sweep_b.covered_keys;
         let applied_this = priced_a.len() + priced_b.len();
         applied = applied.saturating_add(applied_this as u64);
         evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
         evaluator.seed_prices(profile_bytes_b, &b_entries, &priced_b)?;
-        // Stamp sweep coverage for this poll *after* both sweeps succeeded:
-        // every pool in a covered chunk is observed through `latest`, whether
-        // or not it emitted events. A pool in an unswept chunk keeps its old
-        // coverage and its pairs screen stale until its chunk comes around.
-        evaluator.set_tip(latest);
-        if profile_bytes_a == *b"v3" {
-            for chunk in gaps::swept_v3_chunks(&a_entries, v3_window) {
-                evaluator.mark_swept(profile_bytes_a, chunk, latest);
-            }
-        } else {
-            evaluator.mark_swept(profile_bytes_a, &a_entries, latest);
-        }
-        if profile_bytes_b == *b"v3" {
-            for chunk in gaps::swept_v3_chunks(&b_entries, v4_window) {
-                evaluator.mark_swept(profile_bytes_b, chunk, latest);
-            }
-        } else {
-            evaluator.mark_swept(profile_bytes_b, &b_entries, latest);
-        }
+        // Stamp sweep coverage *after* both sweeps succeeded. The ring
+        // outcome reports exactly which pools were observed through which
+        // block (catch-up capping can leave chunks at different depths);
+        // pools in chunks not selected this poll keep their old voucher and
+        // their pairs screen stale until their chunk comes around.
+        evaluator.set_tip(to_eff);
+        evaluator.mark_swept_keys(profile_bytes_a, &covered_a);
+        evaluator.mark_swept_keys(profile_bytes_b, &covered_b);
         let outcome = evaluator.run_once();
         if !outcome.stale_screened.is_empty() || !outcome.triangle_stale_screened.is_empty() {
             eprintln!(
@@ -2199,12 +2184,9 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                 csv_out = None;
             }
         }
-        last_window = latest;
-        high_water = latest;
+        last_window = to_eff;
         println!(
-            "run-pairs: poll {}-{} priced a={} b={} evals={} gated={} triangles={}/{} stale_screened={} dirty={}",
-            window_from,
-            latest,
+            "run-pairs: poll tip={latest} swept_to={to_eff} priced a={} b={} evals={} gated={} triangles={}/{} stale_screened={} dirty={}",
             priced_a.len(),
             priced_b.len(),
             outcome.evaluated.len(),

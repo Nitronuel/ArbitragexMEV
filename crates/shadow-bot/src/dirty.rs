@@ -321,6 +321,7 @@ impl PairDirtyEvaluator {
     ///
     /// A sweep that returned an error must not mark — partial coverage is no
     /// coverage.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn mark_swept(&mut self, profile: [u8; 2], entries: &[PoolEntry], through: u64) {
         let covered = if profile == self.profile_b {
             &mut self.covered_b
@@ -331,6 +332,23 @@ impl PairDirtyEvaluator {
         };
         for entry in entries {
             covered.insert(pool_key(entry), through);
+        }
+    }
+
+    /// Same as [`Self::mark_swept`] but takes precomputed pool keys with
+    /// their individual covered-through blocks — the shape
+    /// [`crate::gaps::RingSweepOutcome::covered_keys`] reports when catch-up
+    /// capping leaves chunks at different depths.
+    pub fn mark_swept_keys(&mut self, profile: [u8; 2], covered: &[([u8; 32], u64)]) {
+        let covered_map = if profile == self.profile_b {
+            &mut self.covered_b
+        } else if profile == self.profile_a {
+            &mut self.covered_a
+        } else {
+            return;
+        };
+        for (key, through) in covered {
+            covered_map.insert(*key, *through);
         }
     }
 
