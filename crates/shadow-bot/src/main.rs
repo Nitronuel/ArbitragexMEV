@@ -286,6 +286,28 @@ enum Command {
         #[arg(long)]
         csv: PathBuf,
     },
+    /// Re-quotes one pinned-block capture against fresh chain reads and
+    /// prints its make/loss ledger (read-only).
+    VerifyCapture {
+        /// Capture JSON written by `scripts/watch-gates.sh`.
+        #[arg(long)]
+        capture: PathBuf,
+        /// Manifest scoping the sweep to the candidate pool set.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// v4 `PoolManager` contract address (only required when a profile is v4).
+        #[arg(long)]
+        pool_manager: Option<Address>,
+        /// Chain endpoint URL.
+        #[arg(long)]
+        rpc: String,
+        /// USD prices table (`derive-prices` output).
+        #[arg(long)]
+        prices: PathBuf,
+        /// Gas spend per attempt, USD fixed-point.
+        #[arg(long, default_value_t = U256::from(30_000_000_000_000_000_u64))]
+        gas_usd: U256,
+    },
     /// Expands a selected-pairs CSV into a concrete-pool manifest, merging the
     /// pools from two enumerated catalogs that carry the selected pairs
     /// (read-only, offline).
@@ -608,6 +630,21 @@ fn main() {
             delay_ms,
             top,
             csv: &csv,
+        }),
+        Command::VerifyCapture {
+            capture,
+            manifest,
+            pool_manager,
+            rpc,
+            prices,
+            gas_usd,
+        } => verify_capture_command(&VerifyCaptureArgs {
+            capture: &capture,
+            manifest: &manifest,
+            pool_manager,
+            rpc: &rpc,
+            prices: &prices,
+            gas_usd,
         }),
         Command::BuildManifest {
             a,
@@ -1248,6 +1285,135 @@ fn rank_activity_command(args: &RankActivityArgs<'_>) -> Result<(), String> {
         two_sided_pairs,
         selected.len(),
         args.csv.display()
+    );
+    Ok(())
+}
+
+/// Arguments for [`verify_capture_command`].
+struct VerifyCaptureArgs<'a> {
+    capture: &'a PathBuf,
+    manifest: &'a PathBuf,
+    pool_manager: Option<Address>,
+    rpc: &'a str,
+    prices: &'a PathBuf,
+    gas_usd: U256,
+}
+
+/// Re-quotes one pinned capture against fresh chain reads and prints its
+/// make/loss ledger. Read-only; no signing or submission.
+///
+/// The capture's `tip_block` pins every read, so the re-quote sees the same
+/// state the live evaluator raced against — within the gateway's 60–120
+/// minute history horizon (capture promptly).
+#[allow(clippy::too_many_lines)]
+fn verify_capture_command(args: &VerifyCaptureArgs<'_>) -> Result<(), String> {
+    let raw = std::fs::read_to_string(args.capture).map_err(|e| e.to_string())?;
+    let capture: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("malformed capture: {e}"))?;
+    let block = capture["tip_block"]
+        .as_u64()
+        .ok_or("capture lacks tip_block")?;
+    let gated = capture["gated"].as_u64().unwrap_or(0);
+    println!("verify-capture: pinned block {block} ({gated} gate-passing rows at detection)");
+
+    let http_url: RedactedUrl = args
+        .rpc
+        .parse::<RedactedUrl>()
+        .map_err(|error| error.to_string())?;
+    let budget = ProviderBudget::new(200_000, 1 << 24);
+    let retry = RetryPolicy {
+        max_retries: 8,
+        initial_delay: Duration::from_millis(600),
+        max_delay: Duration::from_secs(12),
+    };
+    let reader = ChainReader::new(
+        LiveHttp::new(http_url.clone()),
+        ThreadSleeper,
+        budget.clone(),
+        retry,
+        domain::ROBINHOOD_CHAIN_ID,
+    );
+
+    let (legs_a, legs_b) = gaps::restrict_to_manifest(args.manifest, *b"v3", *b"v4")?;
+    if legs_a.is_empty() || legs_b.is_empty() {
+        return Err("manifest has no pools for one of the venues".to_owned());
+    }
+
+    // Re-read chain truth at the pinned block: latest Swap-implied price per
+    // leg within the lookback window.
+    let from = block.saturating_sub(72_000);
+    let prices_a = gaps::sweep_swap_prices(
+        &reader,
+        *b"v3",
+        args.pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &legs_a,
+        from,
+        block,
+        1000,
+        Duration::from_millis(400),
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    let prices_b = gaps::sweep_swap_prices(
+        &reader,
+        *b"v4",
+        args.pool_manager.unwrap_or(V4_POOL_MANAGER),
+        &legs_b,
+        from,
+        block,
+        1000,
+        Duration::from_millis(400),
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Anchor price from the table; a missing anchor is fail-closed.
+    println!(
+        "verify-capture: re-read prices a={} b={}",
+        prices_a.len(),
+        prices_b.len()
+    );
+    let table = gaps::load_prices(args.prices)?;
+    let entries_a: Vec<_> = legs_a.clone();
+    let entries_b: Vec<_> = legs_b.clone();
+    let Some(quote) = gaps::quote_pair(&entries_a, &entries_b, &prices_a, &prices_b)? else {
+        return Err("no priced leg on both venues at the pinned block".to_owned());
+    };
+    let usd_per_anchor = *table
+        .get(&quote.token_lo)
+        .ok_or_else(|| format!("anchor {} unpriced in the table", quote.token_lo))?;
+    if usd_per_anchor.is_zero() {
+        return Err(format!("anchor {} priced at zero", quote.token_lo));
+    }
+
+    let ledger = gaps::verify_capture_ledger(
+        &entries_a,
+        &entries_b,
+        &prices_a,
+        &prices_b,
+        quote.token_lo,
+        usd_per_anchor,
+        args.gas_usd,
+    )?;
+
+    let scale = U256::from(shadow::FIXED_POINT_SCALE);
+    let fmt_usd = |v: U256| {
+        let whole = v / scale;
+        let frac = (v % scale) * U256::from(1000) / scale;
+        format!("${}.{:03}", whole, u64::try_from(frac).unwrap_or(999))
+    };
+    println!(
+        "verify-capture: pair {} :: {}",
+        ledger.token_lo, ledger.token_hi
+    );
+    println!(
+        "verify-capture: optimal input={} output={} profit={} tokens (skew {:.4})",
+        ledger.input, ledger.output, ledger.profit, ledger.log2_skew
+    );
+    println!(
+        "verify-capture: net with free flash loan {} | net with Aave 0.05% {}",
+        fmt_usd(ledger.net_usd_none),
+        fmt_usd(ledger.net_usd_aave)
     );
     Ok(())
 }

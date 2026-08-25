@@ -290,6 +290,78 @@ fn factor_ten(exp: usize) -> U256 {
     factor
 }
 
+/// One opportunity's make/loss ledger: what the closed-form quote produced
+/// from freshly re-read chain truth at the pinned block, with every cost a
+/// live execution would carry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureLedger {
+    pub token_lo: Address,
+    pub token_hi: Address,
+    /// Cheapest-leg quote recomputed at the pinned block.
+    pub input: U256,
+    pub output: U256,
+    pub profit: U256,
+    pub log2_skew: f64,
+    /// Net after gas only (measurement mode, no borrow fee).
+    pub net_usd_none: U256,
+    /// Net after Aave V3's 0.05% premium on the borrowed input.
+    pub net_usd_aave: U256,
+}
+
+/// Builds the capture ledger from re-read leg prices. `gas_cost_usd` is the
+/// per-attempt spend floor; `usd_per_anchor` values the anchor token under
+/// the `load_prices` fixed-point convention.
+///
+/// # Errors
+///
+/// Returns an error when either venue lacks a priced leg at the pinned block
+/// or the pair is not captureable.
+pub fn verify_capture_ledger(
+    a: &[PoolEntry],
+    b: &[PoolEntry],
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+    anchor: Address,
+    usd_per_anchor: U256,
+    gas_cost_usd: U256,
+) -> Result<CaptureLedger, String> {
+    let Some(quote) = quote_pair(a, b, prices_a, prices_b)? else {
+        return Err("pair has no priced leg on both venues at the pinned block".to_owned());
+    };
+    let scale = U256::from(shadow::FIXED_POINT_SCALE);
+    // The quote is denominated in the anchor (token_lo); convert like the
+    // economics path does.
+    if quote.token_lo != anchor {
+        return Err(format!(
+            "quote anchor {} does not match expected {anchor}",
+            quote.token_lo
+        ));
+    }
+    let gross_usd = quote
+        .profit
+        .checked_mul(usd_per_anchor)
+        .ok_or("gross conversion overflow")?
+        / scale;
+    let input_usd = quote
+        .input
+        .checked_mul(usd_per_anchor)
+        .ok_or("input conversion overflow")?
+        / scale;
+    // Aave V3 premium: 5 bps of the borrowed principal.
+    let aave_fee = input_usd * U256::from(5) / U256::from(100_000);
+    let net = |cost: U256| gross_usd.saturating_sub(cost);
+    Ok(CaptureLedger {
+        token_lo: quote.token_lo,
+        token_hi: quote.token_hi,
+        input: quote.input,
+        output: quote.output,
+        profit: quote.profit,
+        log2_skew: quote.log2_skew,
+        net_usd_none: net(gas_cost_usd),
+        net_usd_aave: net(aave_fee + gas_cost_usd),
+    })
+}
+
 /// Decodes a `uint8`-style `eth_call` return (a right-aligned 32-byte word)
 /// into its scalar value. Returns `None` for empty or oversized payloads —
 /// callers fail closed rather than guessing a decimals constant.
@@ -2599,6 +2671,75 @@ mod tests {
             out[&six_dec],
             out[&eighteen_dec]
         );
+    }
+
+    #[test]
+    fn verify_capture_ledger_prices_costs_and_requires_priced_legs() {
+        let usg = RHC_USDG;
+        let tok: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let leg = price_entry(Address::repeat_byte(0xa1), usg, tok);
+        // sqrt 2^97 ⇒ token trades at $4 per whole (see the derive test).
+        let mut priced = HashMap::new();
+        priced.insert(
+            pool_key(&leg),
+            PoolPrice {
+                sqrt: U256::from(1u64) << 97,
+                liquidity: U256::from(1_000_000_000_000_u64),
+                block: 7,
+            },
+        );
+        // Same price both venues: zero skew, but a cross-venue round trip
+        // still pays two tolls, so profit is negative and net floors at gas.
+        let gas = U256::from(30_000_000_000_000_000_u64); // $0.03
+        let leg_a = price_entry(Address::repeat_byte(0xb1), usg, tok);
+        let mut priced_a = HashMap::new();
+        priced_a.insert(
+            pool_key(&leg_a),
+            PoolPrice {
+                sqrt: U256::from(1u64) << 96,
+                liquidity: U256::from(1_000_000_000_000_u64),
+                block: 7,
+            },
+        );
+        let ledger = verify_capture_ledger(
+            std::slice::from_ref(&leg_a),
+            std::slice::from_ref(&leg),
+            &priced_a,
+            &priced,
+            tok,
+            // token_lo is `tok` ($4/whole at this sqrt): V = P × 1e36/10^d.
+            U256::from(4) * usd_factor(),
+            gas,
+        )
+        .expect("both legs priced");
+        // The 4x venue skew is captureable: positive net after gas, and the
+        // Aave premium strictly reduces it.
+        assert!(
+            ledger.net_usd_none > U256::ZERO,
+            "profitable route: {ledger:?}"
+        );
+        assert!(ledger.net_usd_aave < ledger.net_usd_none);
+        assert_eq!(ledger.token_lo, tok);
+        assert_eq!(ledger.log2_skew > 0.0, true);
+        // A missing opposite-venue leg must fail closed.
+        assert!(
+            verify_capture_ledger(
+                &[],
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+                usg,
+                usd_factor(),
+                gas
+            )
+            .is_err()
+        );
+    }
+
+    fn usd_factor() -> U256 {
+        factor_ten(36 - usize::from(RHC_USDG_DECIMALS))
     }
 
     #[test]
