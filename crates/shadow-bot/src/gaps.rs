@@ -378,7 +378,7 @@ pub fn decode_word_decimals(data: &[u8]) -> Option<u8> {
     if data.iter().rev().skip(1).any(|byte| *byte != 0) {
         return None;
     }
-    u8::try_from(*data.last().unwrap_or(&0)).ok()
+    data.last().copied()
 }
 
 /// `numerator × factor / denominator`, i.e. the USD per token when the
@@ -1278,6 +1278,9 @@ pub fn gap_rankings(
         // pools on that venue for the pair). Audit A27: the old
         // `!ta.is_finite()` test was dead — f64::MAX *is* finite, so pairs
         // with no tollable pool on a venue slipped through ranked at MAX.
+        // Exact comparison is correct: f64::MAX is an exact assigned
+        // sentinel, never a computed value.
+        #[allow(clippy::float_cmp)]
         if ca == 0 || cb == 0 || ta == f64::MAX || tb == f64::MAX {
             continue;
         }
@@ -1919,6 +1922,33 @@ fn cheapest_leg_in(
 /// # Errors
 ///
 /// Returns a message describing malformed cycles or missing state.
+/// Oriented three-leg dislocation for one triangle (audit note): each leg's
+/// price is re-expressed in its cycle direction so the raw-wei product
+/// telescopes to `2^(96·3)` at parity; the log-magnitude of the deviation is
+/// the comparable skew.
+fn triangle_log2_skew(
+    leg01: &CycleLeg,
+    leg12: &CycleLeg,
+    leg20: &CycleLeg,
+    p0: Address,
+    p1: Address,
+    p2: Address,
+) -> f64 {
+    let oriented_cycle_price = |leg: &CycleLeg, token_in: Address| -> f64 {
+        let raw_conventioned = price_out(leg.price.sqrt);
+        if leg.entry.token0 == token_in {
+            raw_conventioned
+        } else {
+            SQRT_PRICE_CONVENTION_K * SQRT_PRICE_CONVENTION_K
+                / raw_conventioned.max(f64::MIN_POSITIVE)
+        }
+    };
+    let cycle_product = oriented_cycle_price(leg01, p0)
+        * oriented_cycle_price(leg12, p1)
+        * oriented_cycle_price(leg20, p2);
+    (cycle_product.log2() - 288.0).abs()
+}
+
 pub fn quote_triangle(
     p0: Address,
     p1: Address,
@@ -2009,28 +2039,7 @@ pub fn quote_triangle(
     };
     let keep_product = keep(&leg01)? * keep(&leg12)? * keep(&leg20)?;
     let toll = 1.0 - keep_product;
-    // Orient each leg into its cycle direction (`token_out per token_in`,
-    // convention-scaled) so the product is 2^288 at parity regardless of
-    // each pool's internal token ordering; the baseline is subtracted below.
-    let oriented_cycle_price = |leg: &CycleLeg, token_in: Address| -> f64 {
-        let raw_conventioned = price_out(leg.price.sqrt);
-        if leg.entry.token0 == token_in {
-            raw_conventioned
-        } else {
-            SQRT_PRICE_CONVENTION_K * SQRT_PRICE_CONVENTION_K
-                / raw_conventioned.max(f64::MIN_POSITIVE)
-        }
-    };
-    let cycle_product = oriented_cycle_price(&leg01, p0)
-        * oriented_cycle_price(&leg12, p1)
-        * oriented_cycle_price(&leg20, p2);
-    // Each `price_out` carries the ×2^96 sqrtPriceX96 convention factor
-    // (price_out = raw-wei price × 2^96). Raw-wei prices telescope to 1 at
-    // economic parity around a closed cycle (decimal exponents cancel), so
-    // the expected product is 2^(96·3); subtract that baseline before taking
-    // the magnitude, or every triangle is screened by a decimals-driven
-    // constant instead of real dislocation.
-    let log2_skew = (cycle_product.log2() - 288.0).abs();
+    let log2_skew = triangle_log2_skew(&leg01, &leg12, &leg20, p0, p1, p2);
     Ok(Some(PairQuote {
         token_lo: p0,
         token_hi: p2,
