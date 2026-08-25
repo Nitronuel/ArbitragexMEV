@@ -4,7 +4,7 @@ use alloy_primitives::{Address, U256};
 use shadow::{ClassificationReason, CostSnapshot, Economics};
 use v2_math::OptimalQuote;
 
-use crate::gaps::{PairQuote, PoolEntry, PoolPrice, pool_key, quote_pair};
+use crate::gaps::{PairQuote, PoolEntry, PoolPrice, pool_key};
 
 /// A normalized cross-venue pair identity: `gaps::pair_key`'s `(lo, hi)` token
 /// addresses, `lo <= hi` bytewise.
@@ -452,21 +452,6 @@ impl PairDirtyEvaluator {
         self.token_usd.get(&token).is_some_and(|usd| !usd.is_zero())
     }
 
-    /// Classifies one pair's quote against the pair's anchor-token USD price.
-    fn classify_pair(&self, pair: PairKey, quote: &PairQuote) -> shadow::Classification {
-        if quote.log2_skew > self.max_log2_skew {
-            return self.skew_screened(quote);
-        }
-        let mut reference = self.reference;
-        let anchor = Address::from_slice(&pair.0);
-        self.classify_with_flash(
-            anchor,
-            quote,
-            &mut reference,
-            shadow::PAIR_EXECUTION_GAS_UNITS,
-        )
-    }
-
     /// Marks every pair and triangle indexed by the changed pool as dirty.
     pub fn mark_pool(&mut self, profile: [u8; 2], pool: [u8; 32]) {
         if let Some(pairs) = self.by_pool.get(&(profile, pool)) {
@@ -550,14 +535,24 @@ impl PairDirtyEvaluator {
                 outcome.stale_screened.push((pair, detail));
                 continue;
             }
-            let Ok(Some(quote)) = quote_pair(a_pools, b_pools, &self.prices_a, &self.prices_b)
-            else {
+            // Audit S3a: anchor by executability — flash-borrowable AND
+            // USD-priced wins; deterministic lower-address tiebreak. The
+            // legacy lexicographic choice excluded native-anchored pairs (the
+            // chain's highest-volume) from honest gating entirely.
+            let anchor = self.select_anchor(pair);
+            let Ok(Some(quote)) = crate::gaps::quote_pair_anchored(
+                a_pools,
+                b_pools,
+                &self.prices_a,
+                &self.prices_b,
+                Some(anchor),
+            ) else {
                 outcome.not_evaluated.push(pair);
                 continue;
             };
             outcome.evaluated.push(pair);
 
-            let classification = self.classify_pair(pair, &quote);
+            let classification = self.classify_anchor(anchor, &quote);
             if matches!(classification.reason, ClassificationReason::AboveThreshold) {
                 outcome.interesting.push(pair);
             }
@@ -690,12 +685,21 @@ impl PairDirtyEvaluator {
         if matches!(classification.reason, ClassificationReason::AboveThreshold)
             && !self.token_is_priced(anchor)
         {
-            // The gate passed only at the `$1` fixture valuation. Demote to
-            // `Provisional`: visible in the canary CSV, never counted as an
-            // honest candidate.
-            classification.reason = ClassificationReason::Provisional {
-                detail: format!("anchor {anchor} unpriced; gate passed at $1 fixture"),
+            // Audit S3c/A12: the gate passed only at the `$1` fixture
+            // valuation — a fabricated price. An anchor that cannot be priced
+            // means the opportunity cannot be valued; say so instead of
+            // passing it at a made-up number.
+            classification.reason = ClassificationReason::NotEvaluated {
+                detail: format!("anchor {anchor} unpriced; opportunity cannot be valued"),
             };
+            // Every USD figure above was computed at the $1 fixture — fiction.
+            // Zero them so no consumer reads a valued number out of a screen.
+            classification.gross_profit_usd = U256::ZERO;
+            classification.flash_cost_usd = U256::ZERO;
+            classification.gas_cost_usd = U256::ZERO;
+            classification.estimated_net_profit_usd = U256::ZERO;
+            classification.threshold_usd = U256::ZERO;
+            classification.shortfall_usd = U256::ZERO;
         }
         classification
     }
@@ -745,8 +749,37 @@ impl PairDirtyEvaluator {
     #[must_use]
     pub fn quote_pair(&self, pair: PairKey) -> Option<(PairQuote, shadow::Classification)> {
         let (a_pools, b_pools) = self.by_pair.get(&pair)?;
-        let quote = quote_pair(a_pools, b_pools, &self.prices_a, &self.prices_b).ok()??;
-        Some((quote, self.classify_pair(pair, &quote)))
+        let anchor = self.select_anchor(pair);
+        let quote = crate::gaps::quote_pair_anchored(
+            a_pools,
+            b_pools,
+            &self.prices_a,
+            &self.prices_b,
+            Some(anchor),
+        )
+        .ok()??;
+        Some((quote, self.classify_anchor(anchor, &quote)))
+    }
+
+    /// Picks the cycle anchor for one pair by executability (audit S3a /
+    /// A3): a token that both has a configured flash-loan source and carries
+    /// a non-zero USD price outranks one that lacks either. Ties break to the
+    /// lower address deterministically; when neither is executable the pair
+    /// still quotes at the lower address so classification can name the
+    /// specific failure instead of hiding it.
+    ///
+    /// Borrow-source depth ranking (A3 item 3) needs per-provider depth data
+    /// that does not exist yet; the tiebreak stands in until it does.
+    fn select_anchor(&self, pair: PairKey) -> Address {
+        let lo = Address::from_slice(&pair.0);
+        let hi = Address::from_slice(&pair.1);
+        let executable =
+            |token: Address| self.flash.rate_for(token).is_some() && self.token_is_priced(token);
+        if executable(lo) || !executable(hi) {
+            lo
+        } else {
+            hi
+        }
     }
 
     /// The enumerated triangle triple at `index`.
@@ -1381,6 +1414,60 @@ mod tests {
     }
 
     #[test]
+    fn anchor_follows_executability_not_address_order() {
+        // Audit S3a: with both tokens priced, the lower address anchors.
+        // Price only the higher-address token and the anchor flips — the
+        // legacy lexicographic choice would have kept quoting (and valuing)
+        // from an unpriced token forever.
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
+        );
+        let lo = token_a(); // fixture's lower-address token
+        let hi = token_b();
+        assert!(lo < hi, "fixture premise");
+
+        // Both priced: deterministic tiebreak keeps `lo`.
+        let mut prices = HashMap::new();
+        prices.insert(lo, usd(1));
+        prices.insert(hi, usd(1));
+        evaluator.set_token_prices(prices.clone());
+        let (quote, _) = evaluator
+            .quote_pair(crate::gaps::pair_key(lo, hi))
+            .expect("quote");
+        assert_eq!(quote.token_lo, lo, "tiebreak anchors at the lower address");
+
+        // Only `hi` priced: the anchor flips to the executable token.
+        let mut prices = HashMap::new();
+        prices.insert(hi, usd(1));
+        evaluator.set_token_prices(prices);
+        let (quote, classification) = evaluator
+            .quote_pair(crate::gaps::pair_key(lo, hi))
+            .expect("quote");
+        assert_eq!(
+            quote.token_lo, hi,
+            "anchor must follow the executable token"
+        );
+        assert!(
+            !matches!(&classification.reason, ClassificationReason::NotEvaluated { detail }
+                if detail.contains("unpriced")),
+            "the unpriced counterparty must not screen an anchored-at-hi quote: {classification:?}"
+        );
+    }
+
+    #[test]
     fn capacity_overshoot_screens_before_gating() {
         // Audit S1: a thin concentrated pool's constant-product optimum
         // demands far more than one tick-spacing cell of liquidity can
@@ -1614,7 +1701,7 @@ mod tests {
     }
 
     #[test]
-    fn unpriced_anchor_demotes_gate_pass_to_provisional() {
+    fn unpriced_anchor_is_screened_as_unvaluable() {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
@@ -1636,18 +1723,18 @@ mod tests {
         );
         let pair = crate::gaps::pair_key(token_a(), token_b());
 
-        // With no price table entry the gate pass is fixture-valued, so it is
-        // demoted to `Provisional` instead of counting as honest.
+        // Audit S3c/A12: an unpriced anchor cannot be valued, so the quote is
+        // not gated at the $1 fixture — it screens with an explicit detail.
         let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
         assert!(
             matches!(
                 &classification.reason,
-                ClassificationReason::Provisional { detail }
-                    if detail.contains("unpriced") && detail.contains("$1 fixture")
+                ClassificationReason::NotEvaluated { detail }
+                    if detail.contains("unpriced") && detail.contains("cannot be valued")
             ),
-            "an unpriced-anchor gate pass must be provisional, not honest: {classification:?}"
+            "an unpriced-anchor gate pass must screen, not value at $1: {classification:?}"
         );
-        assert!(classification.estimated_net_profit_usd > U256::ZERO);
+        assert_eq!(classification.estimated_net_profit_usd, U256::ZERO);
 
         // Pricing the anchor restores the honest classification on the same
         // quote economics.
@@ -1671,8 +1758,9 @@ mod tests {
         // Cheapest leg per edge wins, so a stale lower-fee v3 leg is chosen
         // over a fresh v4 leg with a higher toll. The stale v3 price is still
         // correct (its pool has not traded), so the triangle evaluates
-        // economically instead of being screened by leg age; the anchor here
-        // is unpriced, so a gate pass lands as `Provisional`.
+        // economically instead of being screened by leg age. The anchor IS
+        // priced (audit S3c: an unpriced anchor screens as unvaluable, which
+        // would defeat this test's purpose).
         let cheap_v3 = |token0: Address, token1: Address, id: u8| {
             entry(
                 "0xf300000000000000000000000000000000000001"
@@ -1719,6 +1807,9 @@ mod tests {
         // (thin synthetic ranges overshoot by design; capacity screening has
         // its own dedicated tests).
         evaluator.set_max_capacity_overshoot(f64::INFINITY);
+        let mut anchor_price = HashMap::new();
+        anchor_price.insert(token_a(), usd(1));
+        evaluator.set_token_prices(anchor_price);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(200.0);
         let tip = 1_000_000u64;
@@ -1751,12 +1842,12 @@ mod tests {
         assert!(
             matches!(
                 &classification.reason,
-                ClassificationReason::Provisional { .. }
-                    | ClassificationReason::NotProfitable
+                ClassificationReason::AboveThreshold
                     | ClassificationReason::BelowThreshold
+                    | ClassificationReason::NotProfitable
             ),
-            "a stale-leg triangle must evaluate economically (provisional at the \
-             unpriced fixture), not screen: {classification:?}"
+            "a stale-leg triangle must evaluate economically (anchor is priced), \
+             not screen on staleness or capacity: {classification:?}"
         );
     }
 

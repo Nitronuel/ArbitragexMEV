@@ -38,6 +38,10 @@ pub enum CycleError {
     CycleIdOverflow,
 }
 
+/// Cross-anchor-aware dedup key: the cycle's anchor plus its canonical
+/// rotation (audit C40).
+type DedupKey = (Address, Vec<(Address, Address, Address)>);
+
 /// Compiles deterministic 2-4 hop anchor cycles and their dirty reverse index.
 ///
 /// # Errors
@@ -54,7 +58,12 @@ pub fn compile_cycles<S: BuildHasher>(
     let mut sorted_anchors: Vec<_> = anchors.iter().copied().collect();
     sorted_anchors.sort_unstable();
 
-    let mut discovered = HashSet::new();
+    // Audit C40: dedup is per (anchor, canonical rotation), not per rotation
+    // alone — collapsing cross-anchor rotations discarded every anchor except
+    // the address-lowest one, and the anchor determines the flash-loan token,
+    // so a borrowable rotation could be dropped in favour of an unfundable
+    // one.
+    let mut discovered: HashSet<DedupKey> = HashSet::new();
     let mut cycles = Vec::new();
     let mut by_pool = vec![Vec::new(); pools.len()];
     for anchor in sorted_anchors {
@@ -86,7 +95,7 @@ fn walk(
     path: &mut Vec<DirectedEdge>,
     used_pools: &mut HashSet<PoolId>,
     used_tokens: &mut HashSet<Address>,
-    discovered: &mut HashSet<Vec<(Address, Address, Address)>>,
+    discovered: &mut HashSet<DedupKey>,
     cycles: &mut Vec<Cycle>,
     by_pool: &mut [Vec<CycleId>],
     limits: CycleLimits,
@@ -103,7 +112,7 @@ fn walk(
                 continue;
             }
             path.push(edge);
-            let key = canonical_key(path);
+            let key = (anchor, canonical_key(path));
             if discovered.insert(key) {
                 add_cycle(anchor, path, cycles, by_pool, limits)?;
             }

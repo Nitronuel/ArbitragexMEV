@@ -1882,11 +1882,16 @@ fn build_flash_selection(
             let mut rows = Vec::new();
             for record in reader.records() {
                 let record = record.map_err(|e| e.to_string())?;
-                let token = record
+                // Tokens are normalized exactly like every quote-path anchor
+                // (audit A10): the V4 native sentinel maps to RHC_NATIVE, so
+                // a support row written with the zero address actually covers
+                // native-anchored routes instead of never matching.
+                let raw_token = record
                     .get(0)
                     .ok_or_else(|| "support row lacks token".to_owned())?
                     .parse::<Address>()
                     .map_err(|_| "bad token in support row".to_owned())?;
+                let token = gaps::normalize_currency(raw_token);
                 let provider = record
                     .get(1)
                     .ok_or_else(|| "support row lacks provider".to_owned())?;
@@ -1907,6 +1912,16 @@ fn build_flash_selection(
                 rows.len(),
                 path.display()
             );
+            if rows.is_empty() {
+                // Audit A10: an empty support set silently gated nothing for a
+                // whole canary while looking like "no opportunities". Fail the
+                // invocation instead of shipping a measurement that cannot gate.
+                return Err(format!(
+                    "flash-support file {} parsed to zero usable rows; \
+                     auto mode would screen every quote",
+                    path.display()
+                ));
+            }
             Ok(FlashSelection::auto_from_rows(&rows))
         }
         other => FlashLoanProvider::parse(other)

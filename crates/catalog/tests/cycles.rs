@@ -122,19 +122,20 @@ fn excludes_repeated_pools_and_intermediate_tokens() {
 fn deduplicates_anchor_rotations_but_preserves_reverse_routes() {
     let triangle = [pool(0, 10, 1, 2), pool(1, 11, 2, 3), pool(2, 12, 3, 1)];
     let graph = compile_cycles(&triangle, &anchors(&[1, 2, 3]), LIMITS).unwrap();
-    assert_eq!(graph.cycles.len(), 2);
-    assert_ne!(
-        graph.cycles[0]
-            .hops
-            .iter()
-            .map(|hop| hop.pool_id)
-            .collect::<Vec<_>>(),
-        graph.cycles[1]
-            .hops
-            .iter()
-            .map(|hop| hop.pool_id)
-            .collect::<Vec<_>>()
-    );
+    // Audit C40: every anchor keeps its own cycles — collapsing cross-anchor
+    // rotations discarded all but the address-lowest anchor, and the anchor
+    // determines the flash-loan token. Each anchor yields two traversals
+    // (both directions around the triangle), which are economically distinct
+    // routes, not duplicates.
+    assert_eq!(graph.cycles.len(), 6);
+    let mut cycle_anchors: Vec<_> = graph.cycles.iter().map(|c| c.anchor).collect();
+    cycle_anchors.sort();
+    cycle_anchors.dedup();
+    assert_eq!(cycle_anchors.len(), 3, "each anchor survives");
+    for anchor in cycle_anchors {
+        let count = graph.cycles.iter().filter(|c| c.anchor == anchor).count();
+        assert_eq!(count, 2, "two directions per anchor {anchor:?}");
+    }
 }
 
 #[test]

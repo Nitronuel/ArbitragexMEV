@@ -1651,6 +1651,33 @@ pub fn quote_pair(
     prices_a: &HashMap<[u8; 32], PoolPrice>,
     prices_b: &HashMap<[u8; 32], PoolPrice>,
 ) -> Result<Option<PairQuote>, String> {
+    quote_pair_anchored(a_entries, b_entries, prices_a, prices_b, None)
+}
+
+/// [`quote_pair`] with an explicit cycle anchor — the token that is flash-
+/// borrowed at the start of the round trip and in which profit is denominated.
+///
+/// Audit S3a: the legacy path always anchored at the lexicographically lower
+/// address, which is arbitrary — it need not be borrowable or priceable, and
+/// the chain's highest-volume pair was structurally excluded from honest
+/// gating because its lower-address token is native (deliberately absent from
+/// the price table). Callers that know executability pass the anchor here.
+/// `PairQuote::token_lo` is the chosen anchor and `token_hi` its counterparty
+/// in every construction, so consumers reading `token_lo` as "the anchor"
+/// stay correct.
+///
+/// # Errors
+///
+/// Same as [`quote_pair`], plus an error when `preferred_anchor` is not one
+/// of the quoted pair's two tokens.
+#[allow(clippy::too_many_lines)]
+pub fn quote_pair_anchored(
+    a_entries: &[PoolEntry],
+    b_entries: &[PoolEntry],
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+    preferred_anchor: Option<Address>,
+) -> Result<Option<PairQuote>, String> {
     let best_leg = |entries: &[PoolEntry],
                     prices: &HashMap<[u8; 32], PoolPrice>|
      -> Option<(PoolEntry, PoolPrice, f64)> {
@@ -1675,8 +1702,14 @@ pub fn quote_pair(
 
     ensure_same_pair(&leg_a, &leg_b)?;
     let pair = pair_key(leg_a.token0, leg_a.token1);
-    let anchor = Address::from_slice(&pair.0);
-    let other = Address::from_slice(&pair.1);
+    let lo = Address::from_slice(&pair.0);
+    let hi = Address::from_slice(&pair.1);
+    let anchor = match preferred_anchor {
+        Some(hint) if hint == lo || hint == hi => hint,
+        Some(hint) => return Err(format!("anchor {hint} is not in the quoted pair")),
+        None => lo,
+    };
+    let other = if anchor == lo { hi } else { lo };
 
     let make_cycle =
         |first: PoolEntry, first_price: PoolPrice, second: PoolEntry, second_price: PoolPrice| {
