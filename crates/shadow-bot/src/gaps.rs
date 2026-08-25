@@ -7,6 +7,7 @@ use provider::{
     ChainReader, HttpBackend, LogFilter, RawLogEnvelope, Sleeper, TransportError, decode_v3_swap,
     decode_v4_swap, v3_swap_topic, v4_swap_topic,
 };
+use ruint::Uint;
 
 /// Uniswap V4 marks a `PoolKey.fee` as dynamic (fee set by the hook, not the
 /// encoded scalar) when the high bit is set; a fee of `0` is likewise not a
@@ -1311,6 +1312,13 @@ pub struct PairQuote {
     pub toll: f64,
     /// Observed log2 price skew across the two legs.
     pub log2_skew: f64,
+    /// The optimiser's input before the single-tick capacity clamp (audit
+    /// S1): what the constant-product model *wanted* to trade.
+    pub optimal_unclamped: U256,
+    /// Largest cycle input every leg can absorb within one tick-spacing
+    /// cell — the bound inside which the constant-product model stays
+    /// credible. `input <= optimal_unclamped`, equal when unclamped.
+    pub input_capacity: U256,
 }
 
 /// Reduces a concentrated pool's sampled state to the virtual constant-product
@@ -1332,6 +1340,93 @@ pub fn virtual_reserves(sqrt: U256, liquidity: U256) -> (U256, U256) {
     let reserve0 = wide_liquidity * wide_two_96 / wide_sqrt.max(Uint::<512, 8>::from(1));
     let reserve1 = wide_liquidity * wide_sqrt / wide_two_96;
     (saturate(reserve0), saturate(reserve1))
+}
+
+/// Tick spacing implied by a V3 fee tier. The canonical Uniswap V3 factory
+/// maps 100→1, 500→10, 3000→60, 10000→200; anything else (V4 pools, forks,
+/// dynamic-fee placeholders) falls back to 60.
+///
+/// Catalogs do not carry `tickSpacing` yet (the enumeration CSV omits it and
+/// the deploy-time `Initialize` decode discarded it — audit B58), so this
+/// mapping is the pricing path's source until the column lands.
+#[must_use]
+pub fn tick_spacing_from_fee(fee: u32) -> i32 {
+    match fee {
+        100 => 1,
+        500 => 10,
+        10000 => 200,
+        // 3000 and every unknown tier (V4 pools, forks, dynamic-fee
+        // placeholders) share the middle spacing as the fallback.
+        _ => 60,
+    }
+}
+
+/// Maximum `token_in` a concentrated pool can absorb before its price moves
+/// one full tick-spacing cell — the largest trade for which at most one
+/// liquidity transition can occur.
+///
+/// This is the interim bound for audit finding S1: the constant-product
+/// reduction of a concentrated pool is exact only while the sampled in-range
+/// liquidity persists, and without tick data the system cannot see where that
+/// persistence ends. One cell guarantees at most one boundary crossing, so
+/// model error stays bounded instead of unbounded; trades beyond it are
+/// screened rather than trusted.
+///
+/// Exact within-range amounts (`getAmount0Delta`/`getAmount1Delta`):
+/// - selling token0 (price down by factor `r = √(1.0001^ts)`):
+///   `Δx = L · (√P − √P/r)`
+/// - selling token1 (price up): `Δy = L · (√P·r − √P)`
+///
+/// The cell ratio itself is computed in `f64` (relative error ~1e-12,
+/// negligible against the unknown distance-to-boundary, which dominates);
+/// the amount math is exact 512-bit, saturating to [`U256::MAX`].
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub fn single_tick_capacity(
+    sqrt_price_x96: U256,
+    liquidity: U256,
+    tick_spacing: i32,
+    zero_for_one: bool,
+) -> U256 {
+    const TWO_96_F64: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+    let spacing = tick_spacing.max(1);
+    // r = sqrt(1.0001^spacing) = exp(spacing · ln(1.0001) / 2)
+    let ratio = (f64::from(spacing) * 0.000_099_995_000_333_308_35 / 2.0).exp();
+    if !ratio.is_finite() || ratio <= 1.0 {
+        return U256::ZERO;
+    }
+    let two_96 = Uint::<512, 8>::from(U256::from(1u64) << 96);
+    let wide_l = Uint::<512, 8>::from(liquidity);
+    let wide_sqrt = Uint::<512, 8>::from(sqrt_price_x96);
+    let saturate = |value: Uint<512, 8>| {
+        use ruint::UintTryFrom;
+        U256::uint_try_from(value).unwrap_or(U256::MAX)
+    };
+    if zero_for_one {
+        // Selling token0 (price down by r):
+        // Δx = L · (√P − √P/r) = L · (1/√P) · (1 − 1/r)
+        // With sqrt_x96 = √P·2^96 and factor_x96 = (1 − 1/r)·2^96, the 2^96
+        // scalings cancel in one division:
+        // Δx = L · factor_x96 / sqrt_x96
+        let factor_x96 = ((1.0 - 1.0 / ratio) * TWO_96_F64) as u128;
+        if factor_x96 == 0 {
+            return U256::ZERO;
+        }
+        saturate(wide_l * Uint::<512, 8>::from(factor_x96) / wide_sqrt)
+    } else {
+        // Selling token1 (price up by r):
+        // Δy = L · √P · (r − 1) = L · (sqrt_x96/2^96) · (r − 1)
+        // = L · sqrt_x96 · factor_x96 / 2^192
+        let factor_x96 = ((ratio - 1.0) * TWO_96_F64) as u128;
+        if factor_x96 == 0 {
+            return U256::ZERO;
+        }
+        saturate(wide_l * wide_sqrt * Uint::<512, 8>::from(factor_x96) / (two_96 * two_96))
+    }
 }
 
 /// Builds the 2-hop cycle for one cross-venue pair and solves the closed-form
@@ -1375,6 +1470,76 @@ pub fn oriented_pair_skew(
     (qb / qa).log2().abs()
 }
 
+/// Largest cycle input for which every leg stays within its single-tick
+/// capacity (audit S1 interim bound).
+///
+/// Per-hop amounts are monotone in the cycle input, so the feasible set is an
+/// interval starting at zero; binary search its right edge. Returns
+/// `unclamped` unchanged when it is already feasible, and `0` when even a
+/// one-unit input breaches a leg.
+fn capacity_bounded_input(
+    cycle: &domain::Cycle,
+    states: &[domain::PoolState],
+    leg_caps: &[U256],
+    unclamped: U256,
+) -> U256 {
+    let feasible = |x: U256| match v2_math::hop_inputs(x, cycle, states) {
+        Ok(amounts) => amounts.iter().zip(leg_caps).all(|(amt, cap)| amt <= cap),
+        Err(_) => false,
+    };
+    if feasible(unclamped) {
+        return unclamped;
+    }
+    if !feasible(U256::from(1u64)) {
+        return U256::ZERO;
+    }
+    let mut low = U256::from(1u64);
+    let mut high = unclamped;
+    while low < high {
+        // Invariant: low feasible, high infeasible. Midpoint biased up so the
+        // loop terminates on adjacent integers.
+        let mid = (low + high + U256::from(1u64)) / U256::from(2u64);
+        if mid == high {
+            break;
+        }
+        if feasible(mid) {
+            low = mid;
+        } else {
+            high = mid - U256::from(1u64);
+        }
+    }
+    low
+}
+
+/// Applies the single-tick capacity clamp to an optimiser result and
+/// re-quotes the round trip at the clamped input.
+///
+/// Returns `(input, output, profit)`: the clamped input (equal to
+/// `unclamped.input` when already feasible), the exact cycle output there,
+/// and the resulting profit in anchor-token units.
+///
+/// # Errors
+///
+/// Propagates re-quote failures as messages.
+fn finalize_capacity_checked(
+    cycle: &domain::Cycle,
+    states: &[domain::PoolState],
+    leg_caps: &[U256],
+    unclamped: v2_math::OptimalQuote,
+) -> Result<(U256, U256, U256), String> {
+    let input = capacity_bounded_input(cycle, states, leg_caps, unclamped.input);
+    if input == unclamped.input {
+        return Ok((input, unclamped.output, unclamped.profit));
+    }
+    if input.is_zero() {
+        return Ok((U256::ZERO, U256::ZERO, U256::ZERO));
+    }
+    let output = v2_math::quote_cycle(input, cycle, states)
+        .map_err(|e| format!("capacity-clamped quote failed: {e}"))?;
+    let profit = output.saturating_sub(input);
+    Ok((input, output, profit))
+}
+
 /// Rejects a cross-venue quote whose two selected legs are not the same
 /// normalized token pair.
 ///
@@ -1395,15 +1560,97 @@ fn ensure_same_pair(leg_a: &PoolEntry, leg_b: &PoolEntry) -> Result<(), String> 
     }
 }
 
+/// Builds one orientation of the 2-hop cross-venue cycle: reserve states,
+/// per-hop single-tick capacities, and the optimiser's unclamped result.
+///
+/// # Errors
+///
+/// Propagates `optimal_input` failures.
+#[allow(clippy::too_many_lines)]
+fn build_pair_cycle(
+    anchor: Address,
+    other: Address,
+    first: PoolEntry,
+    first_price: PoolPrice,
+    second: PoolEntry,
+    second_price: PoolPrice,
+) -> Result<Option<BestPick>, String> {
+    use domain::{Cycle, CycleHop, CycleId, Fee, PoolId, PoolState, StateVersion};
+    use v2_math::optimal_input;
+    let (r0a, r1a) = virtual_reserves(first_price.sqrt, first_price.liquidity);
+    let (r0b, r1b) = virtual_reserves(second_price.sqrt, second_price.liquidity);
+    let states = vec![
+        PoolState {
+            reserve0: r0a,
+            reserve1: r1a,
+            block_number: first_price.block,
+            transaction_index: 0,
+            log_index: 0,
+            version: StateVersion(first_price.block),
+        },
+        PoolState {
+            reserve0: r0b,
+            reserve1: r1b,
+            block_number: second_price.block,
+            transaction_index: 0,
+            log_index: 0,
+            version: StateVersion(second_price.block),
+        },
+    ];
+    // The manifest fee is the fraction *taken* (e.g. 3000/1_000_000);
+    // v2-math expects the fraction *retained* as its numerator.
+    let fee = |entry: PoolEntry| Fee {
+        numerator: entry.fee_denominator.saturating_sub(entry.fee),
+        denominator: entry.fee_denominator,
+    };
+    let cycle = Cycle {
+        id: CycleId(0),
+        anchor,
+        hops: vec![
+            CycleHop {
+                pool_id: PoolId(0),
+                token_in: anchor,
+                token_out: other,
+                fee: fee(first),
+                zero_for_one: first.token0 == anchor,
+            },
+            CycleHop {
+                pool_id: PoolId(1),
+                token_in: other,
+                token_out: anchor,
+                fee: fee(second),
+                zero_for_one: second.token0 == other,
+            },
+        ],
+    };
+    // Per-leg single-tick capacity in each hop's own token_in units
+    // (audit S1 interim bound): how much that pool can absorb before its
+    // price leaves the sampled liquidity cell.
+    let leg_caps = vec![
+        single_tick_capacity(
+            first_price.sqrt,
+            first_price.liquidity,
+            tick_spacing_from_fee(first.fee),
+            first.token0 == anchor,
+        ),
+        single_tick_capacity(
+            second_price.sqrt,
+            second_price.liquidity,
+            tick_spacing_from_fee(second.fee),
+            second.token0 == other,
+        ),
+    ];
+    optimal_input(&cycle, &states)
+        .map(|opt| opt.map(|quote| (quote, cycle, states, leg_caps)))
+        .map_err(|e| format!("optimal input failed: {e}"))
+}
+
 pub fn quote_pair(
     a_entries: &[PoolEntry],
     b_entries: &[PoolEntry],
     prices_a: &HashMap<[u8; 32], PoolPrice>,
     prices_b: &HashMap<[u8; 32], PoolPrice>,
 ) -> Result<Option<PairQuote>, String> {
-    use domain::{Cycle, CycleHop, CycleId, Fee, PoolId, PoolState, StateVersion};
-    use v2_math::{OptimalQuote, optimal_input};
-
     let best_leg = |entries: &[PoolEntry],
                     prices: &HashMap<[u8; 32], PoolPrice>|
      -> Option<(PoolEntry, PoolPrice, f64)> {
@@ -1433,80 +1680,47 @@ pub fn quote_pair(
 
     let make_cycle =
         |first: PoolEntry, first_price: PoolPrice, second: PoolEntry, second_price: PoolPrice| {
-            let (r0a, r1a) = virtual_reserves(first_price.sqrt, first_price.liquidity);
-            let (r0b, r1b) = virtual_reserves(second_price.sqrt, second_price.liquidity);
-            let states = vec![
-                PoolState {
-                    reserve0: r0a,
-                    reserve1: r1a,
-                    block_number: first_price.block,
-                    transaction_index: 0,
-                    log_index: 0,
-                    version: StateVersion(first_price.block),
-                },
-                PoolState {
-                    reserve0: r0b,
-                    reserve1: r1b,
-                    block_number: second_price.block,
-                    transaction_index: 0,
-                    log_index: 0,
-                    version: StateVersion(second_price.block),
-                },
-            ];
-            // The manifest fee is the fraction *taken* (e.g. 3000/1_000_000);
-            // v2-math expects the fraction *retained* as its numerator.
-            let fee = |entry: PoolEntry| Fee {
-                numerator: entry.fee_denominator.saturating_sub(entry.fee),
-                denominator: entry.fee_denominator,
-            };
-            let cycle = Cycle {
-                id: CycleId(0),
-                anchor,
-                hops: vec![
-                    CycleHop {
-                        pool_id: PoolId(0),
-                        token_in: anchor,
-                        token_out: other,
-                        fee: fee(first),
-                        zero_for_one: first.token0 == anchor,
-                    },
-                    CycleHop {
-                        pool_id: PoolId(1),
-                        token_in: other,
-                        token_out: anchor,
-                        fee: fee(second),
-                        zero_for_one: second.token0 == other,
-                    },
-                ],
-            };
-            optimal_input(&cycle, &states)
+            build_pair_cycle(anchor, other, first, first_price, second, second_price)
         };
 
-    let mut best: Option<(OptimalQuote, f64)> = make_cycle(leg_a, leg_price_a, leg_b, leg_price_b)
-        .map_err(|e| format!("optimal input failed: {e}"))?
-        .map(|quote| (quote, toll_a + toll_b));
+    let mut best: Option<BestPick> = make_cycle(leg_a, leg_price_a, leg_b, leg_price_b)
+        .map_err(|e| format!("optimal input failed: {e}"))?;
     if best.is_none() {
         best = make_cycle(leg_b, leg_price_b, leg_a, leg_price_a)
             .ok()
-            .flatten()
-            .map(|quote| (quote, toll_a + toll_b));
+            .flatten();
     }
-    let Some((quote, toll)) = best else {
+    let Some((unclamped_quote, cycle, states, leg_caps)) = best else {
         return Ok(None);
     };
+    // Clamp the trade to what every leg can absorb within one liquidity
+    // cell; beyond it the constant-product model is fiction (audit S1).
+    let (input, output, profit) =
+        finalize_capacity_checked(&cycle, &states, &leg_caps, unclamped_quote)?;
     // See `oriented_pair_skew`: raw pool prices must be re-expressed in the
     // canonical pair direction before comparing venues.
     let skew = oriented_pair_skew(&leg_a, &leg_price_a, &leg_b, &leg_price_b, anchor);
     Ok(Some(PairQuote {
         token_lo: anchor,
         token_hi: other,
-        input: quote.input,
-        output: quote.output,
-        profit: quote.profit,
-        toll,
+        input,
+        output,
+        profit,
+        toll: toll_a + toll_b,
         log2_skew: skew,
+        optimal_unclamped: unclamped_quote.input,
+        input_capacity: input.min(unclamped_quote.input),
     }))
 }
+
+/// One solved orientation: unclamped optimiser quote, its cycle, reserve
+/// states, and per-hop single-tick capacities.
+type BestPick = (
+    v2_math::OptimalQuote,
+    domain::Cycle,
+    Vec<domain::PoolState>,
+    Vec<U256>,
+);
 
 /// Quotes every cross-venue pair that has at least one priced leg on each
 /// venue and returns the captureable quotes (positive-profit round trips),
@@ -1727,11 +1941,23 @@ pub fn quote_triangle(
             },
         ],
     };
-    let Some(quote) =
+    let leg_caps: Vec<U256> = [(&leg01, p0), (&leg12, p1), (&leg20, p2)]
+        .into_iter()
+        .map(|(leg, hop_in)| {
+            single_tick_capacity(
+                leg.price.sqrt,
+                leg.price.liquidity,
+                tick_spacing_from_fee(leg.entry.fee),
+                leg.entry.token0 == hop_in,
+            )
+        })
+        .collect();
+    let Some(unclamped) =
         optimal_input(&cycle, &states).map_err(|e| format!("optimal input failed: {e}"))?
     else {
         return Ok(None);
     };
+    let (input, output, profit) = finalize_capacity_checked(&cycle, &states, &leg_caps, unclamped)?;
     let keep = |leg: &CycleLeg| {
         1.0 - leg_toll(leg.entry.fee, leg.entry.fee_denominator, leg.entry.profile).unwrap_or(0.0)
     };
@@ -1761,11 +1987,13 @@ pub fn quote_triangle(
     Ok(Some(PairQuote {
         token_lo: p0,
         token_hi: p2,
-        input: quote.input,
-        output: quote.output,
-        profit: quote.profit,
+        input,
+        output,
+        profit,
         toll,
         log2_skew,
+        optimal_unclamped: unclamped.input,
+        input_capacity: input.min(unclamped.input),
     }))
 }
 
@@ -2505,6 +2733,47 @@ mod tests {
         );
         // Identity is untouched by the reorder.
         assert_eq!(kept[0].id, [0x33; 32]);
+    }
+
+    #[test]
+    fn single_tick_capacity_matches_hand_computed_amounts() {
+        // P = 4 (sqrt_x96 = 2·2^96), L = 1e22, ts = 60 → r ≈ 1.00300435.
+        // Hand-computed (see scripts in audit task 0.4):
+        //   sell token0: Δx = L·(1/√P)·(1 − 1/r) ≈ 1.4977e19
+        //   sell token1: Δy = L·√P·(r − 1)      ≈ 6.0087e19
+        use super::{single_tick_capacity, tick_spacing_from_fee};
+        let sqrt = U256::from(2u64) * (U256::from(1u64) << 96);
+        let liquidity = U256::from(10_000_000_000_000_000_000_000u128);
+        let ts = tick_spacing_from_fee(3000);
+        assert_eq!(ts, 60);
+        let cap0 = single_tick_capacity(sqrt, liquidity, ts, true);
+        let cap1 = single_tick_capacity(sqrt, liquidity, ts, false);
+        let expect0 = 1.497_677_5e19;
+        let expect1 = 6.008_708_1e19;
+        let got0 = cap0.to::<u128>() as f64;
+        let got1 = cap1.to::<u128>() as f64;
+        assert!(
+            (got0 - expect0).abs() / expect0 < 0.01,
+            "token0 capacity {got0:e} vs expected {expect0:e}"
+        );
+        assert!(
+            (got1 - expect1).abs() / expect1 < 0.01,
+            "token1 capacity {got1:e} vs expected {expect1:e}"
+        );
+
+        // Monotone in liquidity; zero liquidity → zero capacity.
+        assert!(
+            single_tick_capacity(
+                sqrt,
+                liquidity.checked_mul(U256::from(2u64)).unwrap(),
+                ts,
+                true
+            ) > cap0
+        );
+        assert!(single_tick_capacity(sqrt, U256::ZERO, ts, true).is_zero());
+
+        // Wider spacing → larger cell → larger capacity.
+        assert!(single_tick_capacity(sqrt, liquidity, tick_spacing_from_fee(10000), true) > cap0);
     }
 
     #[test]

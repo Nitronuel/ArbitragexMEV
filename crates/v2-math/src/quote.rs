@@ -76,6 +76,42 @@ pub fn quote_cycle(input: U256, cycle: &Cycle, states: &[PoolState]) -> Result<U
     })
 }
 
+/// Amount entering each hop of the cycle for a given cycle input, in each
+/// hop's own `token_in` units.
+///
+/// Monotone non-decreasing in `input`, so callers can binary-search the
+/// largest input whose per-hop amounts stay within per-pool capacity bounds
+/// (the single-tick capacity screen).
+///
+/// # Errors
+///
+/// Same conditions as [`quote_cycle`].
+pub fn hop_inputs(
+    input: U256,
+    cycle: &Cycle,
+    states: &[PoolState],
+) -> Result<Vec<U256>, MathError> {
+    if !(2..=4).contains(&cycle.hops.len()) {
+        return Err(MathError::InvalidCycleLength);
+    }
+    let mut amounts = Vec::with_capacity(cycle.hops.len());
+    let mut amount = input;
+    for hop in &cycle.hops {
+        amounts.push(amount);
+        let index = usize::try_from(hop.pool_id.0).map_err(|_| MathError::Overflow)?;
+        let state = states
+            .get(index)
+            .ok_or(MathError::MissingPoolState(hop.pool_id.0))?;
+        let (reserve_in, reserve_out) = if hop.zero_for_one {
+            (state.reserve0, state.reserve1)
+        } else {
+            (state.reserve1, state.reserve0)
+        };
+        amount = quote_hop(amount, reserve_in, reserve_out, hop.fee)?;
+    }
+    Ok(amounts)
+}
+
 pub(crate) fn validate_fee(fee: Fee) -> Result<(), MathError> {
     if fee.numerator == 0 || fee.denominator == 0 || fee.numerator > fee.denominator {
         return Err(MathError::InvalidFee);

@@ -77,6 +77,14 @@ pub const DEFAULT_MAX_LEG_AGE_BLOCKS: u64 = 50_000;
 /// the time-mosaic that fabricated canary gate-passes.
 pub const DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS: u64 = 2_000;
 
+/// Default capacity-overshoot bound: a quote whose unclamped optimal input
+/// exceeds every leg's single-tick capacity by more than this factor is
+/// screened rather than gated on its clamped remainder (audit S1). The
+/// canary's recorded gate-passers overshot by ~60–400×; the model behind
+/// those numbers cannot see tick boundaries, so large overshoots are fiction,
+/// not opportunity.
+pub const DEFAULT_MAX_CAPACITY_OVERSHOOT: f64 = 4.0;
+
 /// One drained dirty-pair evaluation batch.
 #[derive(Debug, Default)]
 pub struct PairRunOutcome {
@@ -155,6 +163,9 @@ pub struct PairDirtyEvaluator {
     /// Backstop age bound: a cached price older than this many blocks behind
     /// the tip screens even when coverage claims continuity.
     max_leg_age_blocks: u64,
+    /// Capacity-overshoot factor above which a quote is screened (see the
+    /// `DEFAULT_MAX_CAPACITY_OVERSHOOT` doc).
+    max_capacity_overshoot: f64,
     /// Maximum `|block_a - block_b|` across the priced candidate pools of one
     /// quote; wider spreads compose prices from disjoint market states.
     max_leg_age_spread_blocks: u64,
@@ -271,6 +282,7 @@ impl PairDirtyEvaluator {
             covered_b: HashMap::new(),
             max_leg_age_blocks: DEFAULT_MAX_LEG_AGE_BLOCKS,
             max_leg_age_spread_blocks: DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS,
+            max_capacity_overshoot: DEFAULT_MAX_CAPACITY_OVERSHOOT,
         }
     }
 
@@ -311,6 +323,14 @@ impl PairDirtyEvaluator {
     ) {
         self.max_leg_age_blocks = max_leg_age_blocks;
         self.max_leg_age_spread_blocks = max_leg_age_spread_blocks;
+    }
+
+    /// Overrides the single-tick capacity overshoot bound (default
+    /// [`DEFAULT_MAX_CAPACITY_OVERSHOOT`]). `f64::INFINITY` disables the
+    /// screen — used by fixtures exercising the gating paths, whose thin
+    /// synthetic ranges overshoot by design.
+    pub fn set_max_capacity_overshoot(&mut self, max_capacity_overshoot: f64) {
+        self.max_capacity_overshoot = max_capacity_overshoot;
     }
 
     /// Marks every pool in `entries` as observed through `through` on its
@@ -599,6 +619,44 @@ impl PairDirtyEvaluator {
         quote: &PairQuote,
         reference: &mut CostSnapshot,
     ) -> shadow::Classification {
+        // Single-tick capacity screen (audit S1): the constant-product model
+        // is exact only inside the sampled liquidity cell. A quote whose
+        // optimum demands far more than any leg can absorb there is priced
+        // by liquidity that may not exist — screen instead of gate.
+        if quote.optimal_unclamped > U256::ZERO {
+            // Quotients of U256s, saturating to u128 — plenty of dynamic
+            // range for a screening ratio, and no panic path.
+            let cap = quote.input_capacity.min(U256::from(u128::MAX)).to::<u128>();
+            let unc = quote
+                .optimal_unclamped
+                .min(U256::from(u128::MAX))
+                .to::<u128>();
+            let ratio = if cap == 0 {
+                f64::INFINITY
+            } else {
+                // Precision loss is irrelevant for a screening ratio.
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    unc as f64 / cap as f64
+                }
+            };
+            if ratio > self.max_capacity_overshoot {
+                return shadow::Classification {
+                    gross_profit: quote.profit,
+                    gross_profit_usd: U256::ZERO,
+                    flash_cost_usd: U256::ZERO,
+                    gas_cost_usd: U256::ZERO,
+                    estimated_net_profit_usd: U256::ZERO,
+                    threshold_usd: U256::ZERO,
+                    reason: shadow::ClassificationReason::NotEvaluated {
+                        detail: format!(
+                            "optimal input {} exceeds single-tick capacity {} by {ratio:.1}x",
+                            quote.optimal_unclamped, quote.input_capacity
+                        ),
+                    },
+                };
+            }
+        }
         if let Some(usd) = self.token_usd.get(&anchor)
             && !usd.is_zero()
         {
@@ -809,6 +867,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
 
@@ -845,6 +907,10 @@ mod tests {
         let (a_pools, b_pools, _key_a, _key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
 
         // Unknown tokens fall back to the $1 fixture: unpriced.
         assert!(!evaluator.token_is_priced(token_a()));
@@ -868,6 +934,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         evaluator.apply_swap(
@@ -903,6 +973,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         evaluator.apply_swap(
@@ -931,6 +1005,10 @@ mod tests {
     fn overload_degrades_without_dropping_queued_pairs() {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator = PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 0);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         evaluator.apply_swap(
@@ -955,6 +1033,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_max_log2_skew(4.0);
         let mut reference = valid_reference();
         reference.gas_price_age_valid = false;
@@ -1002,6 +1084,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         // Support map names a different token entirely.
@@ -1027,6 +1113,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         let mut support = std::collections::HashMap::new();
@@ -1054,6 +1144,10 @@ mod tests {
 
         // Zero-fee baseline gates above the floor...
         let mut free = PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        free.set_max_capacity_overshoot(f64::INFINITY);
         free.set_reference(valid_reference());
         free.set_max_log2_skew(4.0);
         price_anchor(&mut free);
@@ -1078,6 +1172,10 @@ mod tests {
         // ...while the same route at Aave's 0.05% premium pays
         // input_usd * rate at the gate, strictly reducing net profit.
         let mut premium = PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        premium.set_max_capacity_overshoot(f64::INFINITY);
         premium.set_reference(valid_reference());
         premium.set_max_log2_skew(4.0);
         price_anchor(&mut premium);
@@ -1107,6 +1205,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         price_anchor(&mut evaluator);
@@ -1138,6 +1240,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         evaluator.apply_swap(
@@ -1171,6 +1277,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.apply_swap(
             *b"v3",
@@ -1220,6 +1330,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         // Legs priced at blocks 1 and 2; the tip is 2 and both chunks were
@@ -1246,6 +1360,50 @@ mod tests {
     }
 
     #[test]
+    fn capacity_overshoot_screens_before_gating() {
+        // Audit S1: a thin concentrated pool's constant-product optimum
+        // demands far more than one tick-spacing cell of liquidity can
+        // absorb. With the default bound the quote screens with an explicit
+        // overshoot detail; disabling the screen restores gating on the
+        // clamped remainder.
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        price_anchor(&mut evaluator);
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(U256::from(1u64) << 97, 10_000_000_000_000_000_000_000, 1),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
+        );
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+
+        let (_, screened) = evaluator.quote_pair(pair).expect("quote present");
+        assert!(
+            matches!(&screened.reason, ClassificationReason::NotEvaluated { detail }
+                if detail.contains("single-tick capacity")),
+            "default bound must screen a ~220x overshoot: {screened:?}"
+        );
+
+        // Disabling the screen exposes the clamped economics underneath.
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
+        let (_, gated) = evaluator.quote_pair(pair).expect("quote present");
+        assert_ne!(
+            gated.reason,
+            ClassificationReason::NotEvaluated {
+                detail: String::new()
+            },
+            "disabled screen must not produce NotEvaluated: {gated:?}"
+        );
+    }
+
+    #[test]
     fn unswept_pool_screens_pair_even_when_price_is_recent() {
         // The ring sweep means "no events observed" can also mean "we were
         // not looking". A pool whose chunk was not swept through the tip has
@@ -1255,6 +1413,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         let tip = 10_000u64;
@@ -1315,6 +1477,10 @@ mod tests {
         let max_age = 500u64;
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         evaluator.set_staleness_bounds(max_age, DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS);
@@ -1373,6 +1539,10 @@ mod tests {
         let spread_max = 1_000u64;
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         evaluator.set_staleness_bounds(DEFAULT_MAX_LEG_AGE_BLOCKS, spread_max);
@@ -1427,6 +1597,10 @@ mod tests {
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         evaluator.apply_swap(
@@ -1520,6 +1694,10 @@ mod tests {
         ];
         let mut evaluator =
             PairDirtyEvaluator::new(&v3_pools, &v4_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(200.0);
         let tip = 1_000_000u64;
@@ -1552,7 +1730,9 @@ mod tests {
         assert!(
             matches!(
                 &classification.reason,
-                ClassificationReason::Provisional { .. } | ClassificationReason::NotProfitable
+                ClassificationReason::Provisional { .. }
+                    | ClassificationReason::NotProfitable
+                    | ClassificationReason::BelowThreshold
             ),
             "a stale-leg triangle must evaluate economically (provisional at the \
              unpriced fixture), not screen: {classification:?}"
@@ -1639,6 +1819,10 @@ mod tests {
         let (v3_pools, v4_pools, (a, b, _c)) = triangle_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&v3_pools, &v4_pools, interesting_economics(), 100);
+        // Gating-path fixture: disable the single-tick capacity screen
+        // (thin synthetic ranges overshoot by design; capacity screening has
+        // its own dedicated tests).
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(200.0);
         price_anchor(&mut evaluator);

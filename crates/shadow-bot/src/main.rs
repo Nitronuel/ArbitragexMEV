@@ -470,8 +470,12 @@ enum Command {
         /// Write one row per evaluated pair/triangle per poll to this path
         /// (appends; headers written on first open). Columns:
         /// `kind,token_lo,token_hi,to_block,input,output,profit,log2_skew`,
-        /// `gross_profit_usd,net_profit_usd,threshold_usd,floor_ratio,reason`,
-        /// `anchor_priced`. `anchor_priced=false` marks rows whose USD value
+        /// `gross_profit_usd,net_profit_usd,threshold_usd,floor_ratio`,
+        /// `optimal_unclamped,input_capacity,reason,anchor_priced`. The two
+        /// capacity columns expose the audit-S1 clamp: what the model wanted
+        /// to trade vs. what one tick-spacing cell can absorb.
+        /// expose the audit-S1 single-tick capacity clamp: what the model
+        /// wanted to trade vs. what one tick-spacing cell can absorb. `anchor_priced=false` marks rows whose USD value
         /// came from the `$1` fixture because the anchor token was absent
         /// (or zero) in the `--prices` table; a gate pass on such a row is
         /// classified `Provisional`, never counted as an honest candidate.
@@ -493,6 +497,11 @@ enum Command {
         /// stamped at the lagged block, not the tip.
         #[arg(long, default_value_t = 10)]
         confirm_lag_blocks: u64,
+        /// Capacity-overshoot bound: a quote whose unclamped optimal input
+        /// exceeds every leg's single-tick liquidity capacity by more than
+        /// this factor is screened instead of gated (audit S1).
+        #[arg(long, default_value_t = dirty::DEFAULT_MAX_CAPACITY_OVERSHOOT)]
+        max_capacity_overshoot: f64,
         /// Maximum `|log2 skew|` a quote may carry and still be gated.
         /// Larger gaps come from degenerate near-empty pools that are not
         /// captureable; they are screened out instead of surfacing as
@@ -757,6 +766,7 @@ fn main() {
             prices,
             v3_chunks_per_poll,
             confirm_lag_blocks,
+            max_capacity_overshoot,
             max_skew,
             flash_provider,
             flash_support,
@@ -780,6 +790,7 @@ fn main() {
             prices: prices.as_deref(),
             v3_chunks_per_poll,
             confirm_lag_blocks,
+            max_capacity_overshoot,
             max_skew,
             flash_provider: &flash_provider,
             flash_support: flash_support.as_deref(),
@@ -1911,6 +1922,8 @@ struct RunPairsArgs<'a> {
     max_leg_age_blocks: u64,
     /// Maximum block spread across one quote's priced candidate pools.
     max_leg_age_spread_blocks: u64,
+    /// Capacity-overshoot factor above which quotes are screened.
+    max_capacity_overshoot: f64,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -2024,6 +2037,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     }
     evaluator.set_flash_selection(flash_selection);
     evaluator.set_staleness_bounds(args.max_leg_age_blocks, args.max_leg_age_spread_blocks);
+    evaluator.set_max_capacity_overshoot(args.max_capacity_overshoot);
     if let Some(path) = prices_path {
         let prices = gaps::load_prices(path)?;
         println!(
@@ -2236,7 +2250,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     let hi = alloy_primitives::Address::from_slice(&pair.1);
                     writeln!(
                         out,
-                        "pair,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?},{}",
+                        "pair,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{},{},{:?},{}",
                         lo,
                         hi,
                         latest,
@@ -2251,6 +2265,10 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                             classification.estimated_net_profit_usd,
                             classification.threshold_usd
                         ),
+                        // Audit-S1 single-tick capacity clamp: what the model
+                        // wanted vs. what one tick-spacing cell absorbs.
+                        quote.optimal_unclamped,
+                        quote.input_capacity,
                         classification.reason,
                         evaluator.token_is_priced(lo),
                     )?;
@@ -2265,7 +2283,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     let hi = alloy_primitives::Address::from_slice(&t.1);
                     writeln!(
                         out,
-                        "triangle,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{:?},{}",
+                        "triangle,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{},{},{:?},{}",
                         lo,
                         hi,
                         latest,
@@ -2280,6 +2298,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                             classification.estimated_net_profit_usd,
                             classification.threshold_usd
                         ),
+                        quote.optimal_unclamped,
+                        quote.input_capacity,
                         classification.reason,
                         evaluator.token_is_priced(lo),
                     )?;
