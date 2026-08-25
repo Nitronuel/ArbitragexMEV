@@ -65,6 +65,18 @@ where
 type DirtyPairQueue = DirtyQueue<PairKey>;
 type DirtyTriQueue = DirtyQueue<usize>;
 
+/// Backstop age bound: a cached price this many blocks behind the tip screens
+/// even when sweep coverage claims continuity. Generous by design — under
+/// complete coverage an untraded pool's price stays economically valid, so
+/// this only catches pathological cases (multi-day stalls, restarts against a
+/// moved chain).
+pub const DEFAULT_MAX_LEG_AGE_BLOCKS: u64 = 50_000;
+
+/// Default maximum `|block_a - block_b|` across the priced candidate pools of
+/// one quote. Wider spreads compose leg prices from disjoint market states —
+/// the time-mosaic that fabricated canary gate-passes.
+pub const DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS: u64 = 2_000;
+
 /// One drained dirty-pair evaluation batch.
 #[derive(Debug, Default)]
 pub struct PairRunOutcome {
@@ -87,6 +99,12 @@ pub struct PairRunOutcome {
     pub triangle_interesting: Vec<usize>,
     /// Triangles whose quote failed or lacked a priced edge.
     pub triangle_not_evaluated: Vec<usize>,
+    /// Pairs screened because a priced candidate pool's sweep coverage is
+    /// broken (or its price breached the age backstop). Each entry carries the
+    /// screening detail. These pairs are *not* evaluated economically.
+    pub stale_screened: Vec<(PairKey, String)>,
+    /// Triangles screened for the same reason, parallel semantics.
+    pub triangle_stale_screened: Vec<(usize, String)>,
     /// The dirty queue exceeded its configured capacity this batch.
     pub degraded: bool,
 }
@@ -125,6 +143,21 @@ pub struct PairDirtyEvaluator {
     /// How each quote's borrow cost is selected. Quotes whose anchor has no
     /// configured flash-loan source are never gated.
     flash: shadow::flash_loan::FlashSelection,
+    /// Chain tip as of the latest poll. `None` (fixtures) disables staleness
+    /// screening entirely; the live loop always sets it.
+    tip: Option<u64>,
+    /// Block through which each venue-A pool's sweep coverage is known
+    /// continuous: the pool's chunk was swept up to this block, so absence of
+    /// events really does mean unchanged reserves.
+    covered_a: HashMap<[u8; 32], u64>,
+    /// Same guarantee for venue B.
+    covered_b: HashMap<[u8; 32], u64>,
+    /// Backstop age bound: a cached price older than this many blocks behind
+    /// the tip screens even when coverage claims continuity.
+    max_leg_age_blocks: u64,
+    /// Maximum `|block_a - block_b|` across the priced candidate pools of one
+    /// quote; wider spreads compose prices from disjoint market states.
+    max_leg_age_spread_blocks: u64,
 }
 
 impl PairDirtyEvaluator {
@@ -233,6 +266,11 @@ impl PairDirtyEvaluator {
             reference: CostSnapshot::invalid(),
             max_log2_skew: 0.5,
             flash: shadow::flash_loan::FlashSelection::None,
+            tip: None,
+            covered_a: HashMap::new(),
+            covered_b: HashMap::new(),
+            max_leg_age_blocks: DEFAULT_MAX_LEG_AGE_BLOCKS,
+            max_leg_age_spread_blocks: DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS,
         }
     }
 
@@ -255,6 +293,109 @@ impl PairDirtyEvaluator {
     /// gating at an assumed rate.
     pub fn set_flash_selection(&mut self, flash: shadow::flash_loan::FlashSelection) {
         self.flash = flash;
+    }
+
+    /// Records the chain tip as of the latest poll. Enables staleness
+    /// screening: without a tip there is no age or coverage reference, so the
+    /// screens stay dormant (legacy fixture behaviour).
+    pub fn set_tip(&mut self, tip: u64) {
+        self.tip = Some(tip);
+    }
+
+    /// Overrides the staleness bounds (defaults
+    /// [`DEFAULT_MAX_LEG_AGE_BLOCKS`] / [`DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS`]).
+    pub fn set_staleness_bounds(
+        &mut self,
+        max_leg_age_blocks: u64,
+        max_leg_age_spread_blocks: u64,
+    ) {
+        self.max_leg_age_blocks = max_leg_age_blocks;
+        self.max_leg_age_spread_blocks = max_leg_age_spread_blocks;
+    }
+
+    /// Marks every pool in `entries` as observed through `through` on its
+    /// venue. The live loop calls this once per poll with the pools whose
+    /// address-chunk (V3) or singleton stream (V4) the sweep actually covered,
+    /// *including* pools that emitted no events: under complete local
+    /// coverage, no events means unchanged reserves.
+    ///
+    /// A sweep that returned an error must not mark — partial coverage is no
+    /// coverage.
+    pub fn mark_swept(&mut self, profile: [u8; 2], entries: &[PoolEntry], through: u64) {
+        let covered = if profile == self.profile_b {
+            &mut self.covered_b
+        } else if profile == self.profile_a {
+            &mut self.covered_a
+        } else {
+            return;
+        };
+        for entry in entries {
+            covered.insert(pool_key(entry), through);
+        }
+    }
+
+    /// Screens one pair's priced candidate pools against sweep coverage, the
+    /// age backstop, and the leg-spread bound.
+    ///
+    /// Rationale: `quote_pair`'s best-leg selection picks among *priced*
+    /// pools, so a quote is only as trustworthy as the least-vouched pool it
+    /// could select. If any priced candidate's chunk was not continuously
+    /// swept through the tip, its cached price may silently miss trades (the
+    /// ring sweep, WS drops, decode failures all look identical to "no
+    /// events"), and the pair is screened instead of quoted.
+    ///
+    /// Returns `None` when screening is disabled (no tip set) or everything
+    /// passes; `Some(detail)` explains the screen.
+    fn staleness_screen(&self, pair: PairKey) -> Option<String> {
+        let tip = self.tip?;
+        let (a_pools, b_pools) = self.by_pair.get(&pair)?;
+        let mut oldest: Option<u64> = None;
+        let mut newest: Option<u64> = None;
+        let mut check = |pools: &[PoolEntry],
+                         prices: &HashMap<[u8; 32], PoolPrice>,
+                         covered: &HashMap<[u8; 32], u64>,
+                         venue: &str|
+         -> Result<(), String> {
+            for entry in pools {
+                let key = pool_key(entry);
+                let Some(price) = prices.get(&key) else {
+                    continue;
+                };
+                let swept_through = covered.get(&key).copied().unwrap_or(0);
+                if swept_through < tip {
+                    return Err(format!(
+                        "coverage gap: {venue} pool 0x{} swept through {swept_through}, tip {tip}",
+                        alloy_primitives::hex::encode(key)
+                    ));
+                }
+                let age = tip.saturating_sub(price.block);
+                if age > self.max_leg_age_blocks {
+                    return Err(format!(
+                        "leg age {age} blocks exceeds max {}",
+                        self.max_leg_age_blocks
+                    ));
+                }
+                oldest = Some(oldest.map_or(price.block, |o: u64| o.min(price.block)));
+                newest = Some(newest.map_or(price.block, |n: u64| n.max(price.block)));
+            }
+            Ok(())
+        };
+        if let Err(detail) = check(a_pools, &self.prices_a, &self.covered_a, "v3") {
+            return Some(detail);
+        }
+        if let Err(detail) = check(b_pools, &self.prices_b, &self.covered_b, "v4") {
+            return Some(detail);
+        }
+        if let (Some(oldest), Some(newest)) = (oldest, newest) {
+            let spread = newest.saturating_sub(oldest);
+            if spread > self.max_leg_age_spread_blocks {
+                return Some(format!(
+                    "leg spread {spread} blocks exceeds max {}",
+                    self.max_leg_age_spread_blocks
+                ));
+            }
+        }
+        None
     }
 
     /// Sets per-token USD prices (fixed-point) used to value each pair's
@@ -362,6 +503,10 @@ impl PairDirtyEvaluator {
                 outcome.not_evaluated.push(pair);
                 continue;
             };
+            if let Some(detail) = self.staleness_screen(pair) {
+                outcome.stale_screened.push((pair, detail));
+                continue;
+            }
             let Ok(Some(quote)) = quote_pair(a_pools, b_pools, &self.prices_a, &self.prices_b)
             else {
                 outcome.not_evaluated.push(pair);
@@ -386,6 +531,15 @@ impl PairDirtyEvaluator {
             let t0 = Address::from_slice(&t0);
             let t1 = Address::from_slice(&t1);
             let t2 = Address::from_slice(&t2);
+            let edges = [
+                crate::gaps::pair_key(t0, t1),
+                crate::gaps::pair_key(t1, t2),
+                crate::gaps::pair_key(t2, t0),
+            ];
+            if let Some(detail) = edges.iter().find_map(|edge| self.staleness_screen(*edge)) {
+                outcome.triangle_stale_screened.push((tri, detail));
+                continue;
+            }
             let Ok(Some(quote)) = crate::gaps::quote_triangle(
                 t0,
                 t1,
@@ -1040,15 +1194,18 @@ mod tests {
     #[test]
     fn stale_but_untraded_legs_still_evaluate() {
         // A leg cached once and never re-priced carries a correct price as
-        // long as its pool has not traded: poll windows are contiguous, so
-        // "no events" means "no state change". Old legs therefore evaluate
-        // economically instead of being screened by age.
+        // long as its pool's sweep coverage is continuous: under complete
+        // local coverage "no events" means "no state change", so an old
+        // block number alone is not staleness. The live loop vouches for
+        // that continuity via `mark_swept`; with both venues marked through
+        // the tip the legs evaluate economically instead of screening.
         let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
         let mut evaluator =
             PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
-        // Legs priced at blocks 1 and 2; there is no tip tracking at all.
+        // Legs priced at blocks 1 and 2; the tip is 2 and both chunks were
+        // swept through it.
         evaluator.apply_swap(
             *b"v3",
             key_a,
@@ -1059,12 +1216,192 @@ mod tests {
             key_b,
             price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
         );
+        evaluator.set_tip(2);
+        evaluator.mark_swept(*b"v3", &a_pools, 2);
+        evaluator.mark_swept(*b"v4", &b_pools, 2);
         let mut token_prices = HashMap::new();
         token_prices.insert(token_a(), usd(1));
         evaluator.set_token_prices(token_prices);
         let pair = crate::gaps::pair_key(token_a(), token_b());
         let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
         assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+    }
+
+    #[test]
+    fn unswept_pool_screens_pair_even_when_price_is_recent() {
+        // The ring sweep means "no events observed" can also mean "we were
+        // not looking". A pool whose chunk was not swept through the tip has
+        // no coverage voucher, so its pair screens regardless of how recent
+        // the cached price looks — a missed trade is indistinguishable from
+        // an absent one.
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        let tip = 10_000u64;
+        // Both legs priced one block behind the tip — recent by any raw-age
+        // standard.
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                tip - 1,
+            ),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(
+                U256::from(1u64) << 98,
+                10_000_000_000_000_000_000_000,
+                tip - 1,
+            ),
+        );
+        evaluator.set_tip(tip);
+        // Venue B covered; venue A's chunk was NOT in this poll's ring slice.
+        evaluator.mark_swept(*b"v4", &b_pools, tip);
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+
+        // Direct evaluation path (`run_once` consumes the same screen).
+        let outcome = {
+            evaluator.mark_pool(*b"v3", key_a);
+            evaluator.run_once()
+        };
+        assert!(
+            outcome.evaluated.is_empty() && outcome.interesting.is_empty(),
+            "an unswept-leg pair must not evaluate: {outcome:?}"
+        );
+        assert_eq!(outcome.stale_screened.len(), 1, "{outcome:?}");
+        assert!(
+            outcome.stale_screened[0].1.contains("coverage gap"),
+            "screen detail must name the coverage gap: {:?}",
+            outcome.stale_screened[0].1
+        );
+
+        // Marking the missing chunk restores evaluation on the next batch.
+        evaluator.mark_swept(*b"v3", &a_pools, tip);
+        evaluator.mark_pool(*b"v3", key_a);
+        let outcome = evaluator.run_once();
+        assert_eq!(outcome.stale_screened.len(), 0, "{outcome:?}");
+        assert!(!outcome.pair_results.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn age_backstop_boundary() {
+        // Even with full coverage a price older than the backstop screens;
+        // exactly at the bound passes.
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let max_age = 500u64;
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        evaluator.set_staleness_bounds(max_age, DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS);
+        let tip = 100_000u64;
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                tip - max_age,
+            ),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, tip),
+        );
+        evaluator.set_tip(tip);
+        evaluator.mark_swept(*b"v3", &a_pools, tip);
+        evaluator.mark_swept(*b"v4", &b_pools, tip);
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+        assert!(
+            evaluator.quote_pair(pair).is_some(),
+            "age == bound must pass"
+        );
+
+        // One block older breaches the backstop despite full coverage.
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                tip - max_age - 1,
+            ),
+        );
+        let outcome = {
+            evaluator.mark_pool(*b"v3", key_a);
+            evaluator.run_once()
+        };
+        assert_eq!(outcome.stale_screened.len(), 1, "{outcome:?}");
+        assert!(
+            outcome.stale_screened[0].1.contains("leg age"),
+            "{:?}",
+            outcome.stale_screened[0].1
+        );
+    }
+
+    #[test]
+    fn leg_spread_boundary() {
+        // Priced pools whose observation blocks differ by more than the
+        // spread bound compose disjoint market states and screen; at the
+        // bound they pass.
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let spread_max = 1_000u64;
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        evaluator.set_staleness_bounds(DEFAULT_MAX_LEG_AGE_BLOCKS, spread_max);
+        let tip = 50_000u64;
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                tip - spread_max,
+            ),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, tip),
+        );
+        evaluator.set_tip(tip);
+        evaluator.mark_swept(*b"v3", &a_pools, tip);
+        evaluator.mark_swept(*b"v4", &b_pools, tip);
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+        assert!(
+            evaluator.quote_pair(pair).is_some(),
+            "spread == bound must pass"
+        );
+
+        // Widen the spread by one block: screened.
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                tip - spread_max - 1,
+            ),
+        );
+        let outcome = {
+            evaluator.mark_pool(*b"v3", key_a);
+            evaluator.run_once()
+        };
+        assert_eq!(outcome.stale_screened.len(), 1, "{outcome:?}");
+        assert!(
+            outcome.stale_screened[0].1.contains("leg spread"),
+            "{:?}",
+            outcome.stale_screened[0].1
+        );
     }
 
     #[test]

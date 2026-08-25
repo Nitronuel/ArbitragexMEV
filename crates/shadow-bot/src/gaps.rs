@@ -542,6 +542,32 @@ pub struct PoolPrice {
 /// `topic0`.
 const MAX_ADDRESS_CHUNK: usize = 999;
 
+/// Resolves which V3 address chunks one [`sweep_swap_prices`] call covers for
+/// `keys` under the same ring semantics (`skip` chunks, `take` chunks,
+/// wrapping), so callers that must know a call's *coverage* — not just its
+/// returned prices — derive it from the same selection the sweep issues.
+///
+/// `None` (or a zero count) selects every chunk: the caller swept (or intends
+/// to sweep) the whole universe. The returned slices borrow `keys`.
+///
+/// Coverage semantics: a pool whose chunk is selected is observed through the
+/// call's `to` block even when it emitted no `Swap` — absence of events under
+/// complete local coverage means unchanged reserves. A pool whose chunk is
+/// *not* selected carries no such guarantee for that window.
+#[must_use]
+pub fn swept_v3_chunks(keys: &[PoolEntry], chunk_window: Option<(u64, u64)>) -> Vec<&[PoolEntry]> {
+    let chunks: Vec<&[PoolEntry]> = keys.chunks(MAX_ADDRESS_CHUNK).collect();
+    let chunk_count = chunks.len().max(1);
+    let (skip, take) = match chunk_window {
+        Some((start_chunk, count)) if count > 0 => (
+            usize::try_from(start_chunk).map_or(0, |s| s % chunk_count),
+            usize::try_from(count).map_or(chunks.len(), |c| c.min(chunks.len())),
+        ),
+        _ => (0, chunks.len()),
+    };
+    chunks.into_iter().cycle().skip(skip).take(take).collect()
+}
+
 /// Keeps only the [`PoolEntry`]s whose normalized pair appears in *either*
 /// catalog, i.e. the cross-venue pair overlap. Used to bound the live price
 /// sweep to pools the measurement can actually price on both venues.
@@ -671,16 +697,7 @@ where
                 std::thread::sleep(request_delay);
             }
         } else {
-            let chunks: Vec<&[PoolEntry]> = keys.chunks(MAX_ADDRESS_CHUNK).collect();
-            let chunk_count = chunks.len().max(1);
-            let (skip, take) = match chunk_window {
-                Some((start_chunk, count)) if count > 0 => (
-                    usize::try_from(start_chunk).map_or(0, |s| s % chunk_count),
-                    usize::try_from(count).map_or(chunks.len(), |c| c.min(chunks.len())),
-                ),
-                _ => (0, chunks.len()),
-            };
-            for chunk in chunks.into_iter().cycle().skip(skip).take(take) {
+            for chunk in swept_v3_chunks(keys, chunk_window) {
                 let addresses: Vec<Address> = chunk.iter().map(|e| e.venue).collect();
                 let logs = reader.get_logs_windowed(
                     &LogFilter {

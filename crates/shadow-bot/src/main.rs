@@ -497,6 +497,16 @@ enum Command {
         /// `--flash-provider auto`.
         #[arg(long)]
         flash_support: Option<PathBuf>,
+        /// Backstop age bound: a cached price this many blocks behind the tip
+        /// screens the quote even when sweep coverage claims continuity (0
+        /// disables the age backstop; coverage screening always applies).
+        #[arg(long, default_value_t = dirty::DEFAULT_MAX_LEG_AGE_BLOCKS)]
+        max_leg_age_blocks: u64,
+        /// Maximum `|block_a - block_b|` across the priced candidate pools of
+        /// one quote; wider spreads compose leg prices from disjoint market
+        /// states and are screened instead of gated.
+        #[arg(long, default_value_t = dirty::DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS)]
+        max_leg_age_spread_blocks: u64,
     },
 }
 
@@ -731,6 +741,8 @@ fn main() {
             max_skew,
             flash_provider,
             flash_support,
+            max_leg_age_blocks,
+            max_leg_age_spread_blocks,
         } => run_pairs_command(&RunPairsArgs {
             a: &a,
             b: &b,
@@ -751,6 +763,8 @@ fn main() {
             max_skew,
             flash_provider: &flash_provider,
             flash_support: flash_support.as_deref(),
+            max_leg_age_blocks,
+            max_leg_age_spread_blocks,
         }),
     };
     if let Err(error) = outcome {
@@ -1815,6 +1829,10 @@ struct RunPairsArgs<'a> {
     flash_provider: &'a str,
     /// Support CSV backing `flash_provider = auto`.
     flash_support: Option<&'a std::path::Path>,
+    /// Backstop age bound for cached leg prices (blocks behind the tip).
+    max_leg_age_blocks: u64,
+    /// Maximum block spread across one quote's priced candidate pools.
+    max_leg_age_spread_blocks: u64,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -1927,6 +1945,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         );
     }
     evaluator.set_flash_selection(flash_selection);
+    evaluator.set_staleness_bounds(args.max_leg_age_blocks, args.max_leg_age_spread_blocks);
     if let Some(path) = prices_path {
         let prices = gaps::load_prices(path)?;
         println!(
@@ -1950,6 +1969,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut evals = 0usize;
     let mut interesting = 0usize;
     let mut not_evaluated = 0usize;
+    let mut stale_screened = 0usize;
     let mut triangle_evals = 0usize;
     let mut triangle_interesting = 0usize;
     let mut near_misses = 0usize;
@@ -2052,7 +2072,33 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         applied = applied.saturating_add(applied_this as u64);
         evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
         evaluator.seed_prices(profile_bytes_b, &b_entries, &priced_b)?;
+        // Stamp sweep coverage for this poll *after* both sweeps succeeded:
+        // every pool in a covered chunk is observed through `latest`, whether
+        // or not it emitted events. A pool in an unswept chunk keeps its old
+        // coverage and its pairs screen stale until its chunk comes around.
+        evaluator.set_tip(latest);
+        if profile_bytes_a == *b"v3" {
+            for chunk in gaps::swept_v3_chunks(&a_entries, v3_window) {
+                evaluator.mark_swept(profile_bytes_a, chunk, latest);
+            }
+        } else {
+            evaluator.mark_swept(profile_bytes_a, &a_entries, latest);
+        }
+        if profile_bytes_b == *b"v3" {
+            for chunk in gaps::swept_v3_chunks(&b_entries, v4_window) {
+                evaluator.mark_swept(profile_bytes_b, chunk, latest);
+            }
+        } else {
+            evaluator.mark_swept(profile_bytes_b, &b_entries, latest);
+        }
         let outcome = evaluator.run_once();
+        if !outcome.stale_screened.is_empty() || !outcome.triangle_stale_screened.is_empty() {
+            eprintln!(
+                "run-pairs: screened {} pair(s), {} triangle(s) on broken sweep coverage or leg age",
+                outcome.stale_screened.len(),
+                outcome.triangle_stale_screened.len()
+            );
+        }
         if outcome.degraded {
             eprintln!(
                 "run-pairs: dirty queue exceeded capacity; some pairs were dropped this batch"
@@ -2061,6 +2107,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         evals += outcome.evaluated.len();
         interesting += outcome.interesting.len();
         not_evaluated += outcome.not_evaluated.len();
+        stale_screened += outcome.stale_screened.len() + outcome.triangle_stale_screened.len();
         triangle_evals += outcome.triangle_evaluated.len();
         triangle_interesting += outcome.triangle_interesting.len();
         near_misses += outcome
@@ -2155,7 +2202,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         last_window = latest;
         high_water = latest;
         println!(
-            "run-pairs: poll {}-{} priced a={} b={} evals={} gated={} triangles={}/{} dirty={}",
+            "run-pairs: poll {}-{} priced a={} b={} evals={} gated={} triangles={}/{} stale_screened={} dirty={}",
             window_from,
             latest,
             priced_a.len(),
@@ -2164,6 +2211,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             outcome.interesting.len(),
             outcome.triangle_interesting.len(),
             outcome.triangle_evaluated.len(),
+            outcome.stale_screened.len() + outcome.triangle_stale_screened.len(),
             outcome.not_evaluated.len(),
         );
         std::thread::sleep(poll);
@@ -2171,13 +2219,14 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
 
     let dirty_now = evaluator.queue_len();
     println!(
-        "run-pairs: done at block {} applied={} evals={} gated={} triangles={}/{} near_miss={} provisional={} not_evaluated={} dirty={} elapsed_s={}",
+        "run-pairs: done at block {} applied={} evals={} gated={} triangles={}/{} stale_screened={} near_miss={} provisional={} not_evaluated={} dirty={} elapsed_s={}",
         last_window,
         applied,
         evals,
         interesting,
         triangle_interesting,
         triangle_evals,
+        stale_screened,
         near_misses,
         provisionals,
         not_evaluated,
