@@ -463,9 +463,11 @@ enum Command {
         /// (appends; headers written on first open). Columns:
         /// `kind,token_lo,token_hi,to_block,input,output,profit,log2_skew`,
         /// `gross_profit_usd,net_profit_usd,shortfall_usd,threshold_usd`,
-        /// `floor_ratio,optimal_unclamped,input_capacity,reason`,
-        /// `anchor_priced`. `shortfall_usd` measures how far below the gate
-        /// floor a near-miss fell (audit E4). The two
+        /// `floor_ratio,optimal_unclamped,input_capacity,reason_code`,
+        /// `reason_detail,anchor_priced`. `shortfall_usd` measures how far
+        /// below the gate floor a near-miss fell (audit E4); `reason_code`
+        /// is a stable machine token with human context in the quoted
+        /// `reason_detail` (audit A18). Appends across restarts. The two
         /// capacity columns expose the audit-S1 clamp: what the model wanted
         /// to trade vs. what one tick-spacing cell can absorb.
         /// expose the audit-S1 single-tick capacity clamp: what the model
@@ -506,6 +508,11 @@ enum Command {
         /// fails closed. The price is re-read on this cadence (~10 CU).
         #[arg(long, default_value_t = 120)]
         gas_price_max_age_secs: u64,
+        /// Request-CU ceiling for this invocation. Audit A13: previously a
+        /// hardcoded 8M unknown to the operator while other subcommands used
+        /// different values; month-to-date persistence lands with task 4.3.
+        #[arg(long, default_value_t = 8_000_000)]
+        request_cu_ceiling: u64,
         /// Maximum `|log2 skew|` a quote may carry and still be gated.
         /// Larger gaps come from degenerate near-empty pools that are not
         /// captureable; they are screened out instead of surfacing as
@@ -773,6 +780,7 @@ fn main() {
             max_capacity_overshoot,
             native_usd,
             gas_price_max_age_secs,
+            request_cu_ceiling,
             max_skew,
             flash_provider,
             flash_support,
@@ -799,6 +807,7 @@ fn main() {
             max_capacity_overshoot,
             native_usd,
             gas_price_max_age_secs,
+            request_cu_ceiling,
             max_skew,
             flash_provider: &flash_provider,
             flash_support: flash_support.as_deref(),
@@ -870,6 +879,8 @@ fn enumerate_pools_command(
     let http_url: RedactedUrl = http
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
+    // Audit A13 (debt, task 4.3): hardcoded per-command budget; month-to-date
+    // persistence and ShadowConfig sourcing are pending.
     let budget = ProviderBudget::new(24_000_000, 10_000_000);
     let retry = RetryPolicy {
         max_retries: 3,
@@ -1118,6 +1129,8 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
     let http_url: RedactedUrl = rpc
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
+    // Audit A13 (debt, task 4.3): hardcoded per-command budget; month-to-date
+    // persistence and ShadowConfig sourcing are pending.
     let budget = ProviderBudget::new(40_000, 1 << 24);
     let retry = RetryPolicy {
         max_retries: 8,
@@ -1271,6 +1284,8 @@ fn rank_activity_command(args: &RankActivityArgs<'_>) -> Result<(), String> {
         .rpc
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
+    // Audit A13 (debt, task 4.3): hardcoded per-command budget; month-to-date
+    // persistence and ShadowConfig sourcing are pending.
     let budget = ProviderBudget::new(2_000_000, 1 << 24);
     let retry = RetryPolicy {
         max_retries: 8,
@@ -1378,6 +1393,8 @@ fn verify_capture_command(args: &VerifyCaptureArgs<'_>) -> Result<(), String> {
         .rpc
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
+    // Audit A13 (debt, task 4.3): hardcoded per-command budget; month-to-date
+    // persistence and ShadowConfig sourcing are pending.
     let budget = ProviderBudget::new(200_000, 1 << 24);
     let retry = RetryPolicy {
         max_retries: 8,
@@ -1968,6 +1985,8 @@ struct RunPairsArgs<'a> {
     native_usd: U256,
     /// Gas-price staleness bound (seconds).
     gas_price_max_age_secs: u64,
+    /// Request-CU ceiling for this invocation.
+    request_cu_ceiling: u64,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -1998,13 +2017,23 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let prices_path = args.prices;
     let mut csv_out: Option<std::io::BufWriter<std::fs::File>> = None;
     if let Some(path) = csv_path {
-        let mut out =
-            std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
-        writeln!(
-            out,
-            "kind,token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,threshold_usd,floor_ratio,reason,anchor_priced"
-        )
-        .map_err(|e| e.to_string())?;
+        // Audit A14: append, never truncate — every restart previously
+        // destroyed all prior evidence despite the docs claiming append.
+        let existed = matches!(path.metadata(), Ok(meta) if meta.len() > 0);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        let mut out = std::io::BufWriter::new(file);
+        if !existed {
+            writeln!(
+                out,
+                "kind,token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,shortfall_usd,threshold_usd,floor_ratio,optimal_unclamped,input_capacity,reason_code,reason_detail,anchor_priced"
+            )
+            .map_err(|e| e.to_string())?;
+            out.flush().map_err(|e| e.to_string())?;
+        }
         csv_out = Some(out);
     }
     let profile_bytes_a: [u8; 2] = profile_a
@@ -2024,7 +2053,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let http_url: RedactedUrl = rpc_url
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
-    let budget = ProviderBudget::new(8_000_000, 1 << 24);
+    let budget = ProviderBudget::new(args.request_cu_ceiling, 1 << 24);
     let retry = RetryPolicy {
         max_retries: 8,
         initial_delay: Duration::from_millis(600),
@@ -2336,28 +2365,29 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     let hi = alloy_primitives::Address::from_slice(&pair.1);
                     writeln!(
                         out,
-                        "pair,{},{},{},{},{},{},{:.6},{},{},{},{},{:.4},{},{},{:?},{}",
-                        lo,
-                        hi,
-                        latest,
-                        quote.input,
-                        quote.output,
-                        quote.profit,
-                        quote.log2_skew,
-                        classification.gross_profit_usd,
-                        classification.estimated_net_profit_usd,
-                        classification.shortfall_usd,
-                        classification.threshold_usd,
-                        floor_ratio(
+                        "pair,{lo},{hi},{latest},{input},{output},{profit},{log2_skew:.6},{gross},{net},{shortfall},{threshold},{floor:.4},{unclamped},{capacity},{reason_code},{reason_detail},{priced}",
+                        lo = lo,
+                        hi = hi,
+                        latest = latest,
+                        input = quote.input,
+                        output = quote.output,
+                        profit = quote.profit,
+                        log2_skew = quote.log2_skew,
+                        gross = classification.gross_profit_usd,
+                        net = classification.estimated_net_profit_usd,
+                        shortfall = classification.shortfall_usd,
+                        threshold = classification.threshold_usd,
+                        floor = floor_ratio(
                             classification.estimated_net_profit_usd,
                             classification.threshold_usd
                         ),
                         // Audit-S1 single-tick capacity clamp: what the model
                         // wanted vs. what one tick-spacing cell absorbs.
-                        quote.optimal_unclamped,
-                        quote.input_capacity,
-                        classification.reason,
-                        evaluator.token_is_priced(lo),
+                        unclamped = quote.optimal_unclamped,
+                        capacity = quote.input_capacity,
+                        reason_code = code_and_detail(&classification.reason).0,
+                        reason_detail = code_and_detail(&classification.reason).1,
+                        priced = evaluator.token_is_priced(lo),
                     )?;
                 }
                 for (tri, (quote, classification)) in outcome
@@ -2370,26 +2400,27 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     let hi = alloy_primitives::Address::from_slice(&t.1);
                     writeln!(
                         out,
-                        "triangle,{},{},{},{},{},{},{:.6},{},{},{},{},{:.4},{},{},{:?},{}",
-                        lo,
-                        hi,
-                        latest,
-                        quote.input,
-                        quote.output,
-                        quote.profit,
-                        quote.log2_skew,
-                        classification.gross_profit_usd,
-                        classification.estimated_net_profit_usd,
-                        classification.shortfall_usd,
-                        classification.threshold_usd,
-                        floor_ratio(
+                        "triangle,{lo},{hi},{latest},{input},{output},{profit},{log2_skew:.6},{gross},{net},{shortfall},{threshold},{floor:.4},{unclamped},{capacity},{reason_code},{reason_detail},{priced}",
+                        lo = lo,
+                        hi = hi,
+                        latest = latest,
+                        input = quote.input,
+                        output = quote.output,
+                        profit = quote.profit,
+                        log2_skew = quote.log2_skew,
+                        gross = classification.gross_profit_usd,
+                        net = classification.estimated_net_profit_usd,
+                        shortfall = classification.shortfall_usd,
+                        threshold = classification.threshold_usd,
+                        floor = floor_ratio(
                             classification.estimated_net_profit_usd,
                             classification.threshold_usd
                         ),
-                        quote.optimal_unclamped,
-                        quote.input_capacity,
-                        classification.reason,
-                        evaluator.token_is_priced(lo),
+                        unclamped = quote.optimal_unclamped,
+                        capacity = quote.input_capacity,
+                        reason_code = code_and_detail(&classification.reason).0,
+                        reason_detail = code_and_detail(&classification.reason).1,
+                        priced = evaluator.token_is_priced(lo),
                     )?;
                 }
                 Ok(())
@@ -2397,6 +2428,14 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             if let Err(error) = write_all() {
                 eprintln!("run-pairs: CSV output disabled after write error: {error}");
                 csv_out = None;
+            } else if let Some(out) = csv_out.as_mut() {
+                // Audit A14: BufWriter's Drop ignores flush errors, so an
+                // unchecked final flush silently ate the tail of a 24h run.
+                // Flush explicitly every poll and propagate the error.
+                if let Err(error) = out.flush() {
+                    eprintln!("run-pairs: CSV flush failed; output disabled: {error}");
+                    csv_out = None;
+                }
             }
         }
         last_window = to_eff;
@@ -2431,6 +2470,23 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         since.elapsed().as_secs(),
     );
     Ok(())
+}
+
+/// Machine-readable classification code plus its free-form detail, emitted as
+/// a pre-quoted CSV field (audit A18): `{:?}` of an enum payload embedded
+/// braces, spaces and arbitrary strings unquoted — one comma away from
+/// breaking every downstream parser retroactively across a whole canary.
+fn code_and_detail(reason: &shadow::ClassificationReason) -> (String, String) {
+    let (code, detail) = match reason {
+        shadow::ClassificationReason::AboveThreshold => ("above_threshold", String::new()),
+        shadow::ClassificationReason::BelowThreshold => ("below_threshold", String::new()),
+        shadow::ClassificationReason::NotProfitable => ("not_profitable", String::new()),
+        shadow::ClassificationReason::NotEvaluated { detail } => ("not_evaluated", detail.clone()),
+        shadow::ClassificationReason::Provisional { detail } => ("provisional", detail.clone()),
+    };
+    // RFC 4180 quoting: wrap in quotes, double embedded quotes.
+    let quoted = format!("\"{}\"", detail.replace('"', "\"\""));
+    (code.to_owned(), quoted)
 }
 
 fn resolve_env_url(primary: &str, fallback: &str) -> Result<String, String> {
