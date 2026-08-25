@@ -371,11 +371,14 @@ pub fn decode_word_decimals(data: &[u8]) -> Option<u8> {
     if data.is_empty() || data.len() > 32 {
         return None;
     }
-    let mut value: u64 = 0;
-    for byte in data {
-        value = (value << 8) | u64::from(*byte);
+    // Audit A21: reject any word with non-zero bytes beyond the last — the
+    // old loop shifted through a u64 and silently kept only the final 8
+    // bytes, so `2^64` truncated to `Some(0)` and a mis-scaled price table
+    // by 10^18 would have looked valid.
+    if data.iter().rev().skip(1).any(|byte| *byte != 0) {
+        return None;
     }
-    u8::try_from(value).ok()
+    u8::try_from(*data.last().unwrap_or(&0)).ok()
 }
 
 /// `numerator × factor / denominator`, i.e. the USD per token when the
@@ -1272,8 +1275,10 @@ pub fn gap_rankings(
     let mut ranks = Vec::new();
     for (k, (pa, ca, ta, pb, cb, tb)) in per_pair {
         // `f64::MAX` marks an unobservable toll (only dynamic/zero-fee v4
-        // pools on that venue for the pair).
-        if ca == 0 || cb == 0 || !ta.is_finite() || !tb.is_finite() {
+        // pools on that venue for the pair). Audit A27: the old
+        // `!ta.is_finite()` test was dead — f64::MAX *is* finite, so pairs
+        // with no tollable pool on a venue slipped through ranked at MAX.
+        if ca == 0 || cb == 0 || ta == f64::MAX || tb == f64::MAX {
             continue;
         }
         let avg_a = pa / ca as f64;
@@ -1397,6 +1402,9 @@ pub fn single_tick_capacity(
     // r = sqrt(1.0001^spacing) = exp(spacing · ln(1.0001) / 2)
     let ratio = (f64::from(spacing) * 0.000_099_995_000_333_308_35 / 2.0).exp();
     if !ratio.is_finite() || ratio <= 1.0 {
+        return U256::ZERO;
+    }
+    if liquidity.is_zero() || sqrt_price_x96.is_zero() {
         return U256::ZERO;
     }
     let two_96 = Uint::<512, 8>::from(U256::from(1u64) << 96);
@@ -1991,10 +1999,16 @@ pub fn quote_triangle(
         return Ok(None);
     };
     let (input, output, profit) = finalize_capacity_checked(&cycle, &states, &leg_caps, unclamped)?;
-    let keep = |leg: &CycleLeg| {
-        1.0 - leg_toll(leg.entry.fee, leg.entry.fee_denominator, leg.entry.profile).unwrap_or(0.0)
+    // Audit A9: an unquotable leg must abort the triangle rather than be
+    // priced fee-free (`unwrap_or(0.0)` here was a fail-open default in a
+    // cost path).
+    let keep = |leg: &CycleLeg| -> Result<f64, String> {
+        leg_toll(leg.entry.fee, leg.entry.fee_denominator, leg.entry.profile)
+            .map(|toll| 1.0 - toll)
+            .ok_or_else(|| "triangle edge has no quotable toll".to_owned())
     };
-    let toll = 1.0 - keep(&leg01) * keep(&leg12) * keep(&leg20);
+    let keep_product = keep(&leg01)? * keep(&leg12)? * keep(&leg20)?;
+    let toll = 1.0 - keep_product;
     // Orient each leg into its cycle direction (`token_out per token_in`,
     // convention-scaled) so the product is 2^288 at parity regardless of
     // each pool's internal token ordering; the baseline is subtracted below.
@@ -3197,6 +3211,19 @@ mod tests {
             out[&token],
             U256::from(250_000_000_000_000_000_000_000_000_000_u128)
         );
+    }
+
+    #[test]
+    fn decode_word_decimals_rejects_over_wide_values() {
+        // Audit A21: the old loop shifted through a u64, silently keeping
+        // only the last 8 bytes — a `2^64` decimals return truncated to
+        // Some(0) and would have mis-scaled every price by 10^18.
+        let mut word = vec![0u8; 32];
+        word[0] = 1; // value = 2^248: far beyond u8, high byte non-zero
+        assert_eq!(decode_word_decimals(&word), None);
+        word[0] = 0;
+        word[24] = 1; // still beyond the final byte the old loop kept
+        assert_eq!(decode_word_decimals(&word), None);
     }
 
     #[test]

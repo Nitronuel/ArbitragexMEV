@@ -625,6 +625,23 @@ impl PairDirtyEvaluator {
         reference: &mut CostSnapshot,
         gas_units: u64,
     ) -> shadow::Classification {
+        // Audit A8: `NaN > x` is false, so a NaN skew silently PASSED the
+        // skew screen and gated on garbage. Reject anything non-finite
+        // before any magnitude comparison.
+        if !quote.log2_skew.is_finite() {
+            return shadow::Classification {
+                gross_profit: quote.profit,
+                gross_profit_usd: U256::ZERO,
+                flash_cost_usd: U256::ZERO,
+                gas_cost_usd: U256::ZERO,
+                estimated_net_profit_usd: U256::ZERO,
+                threshold_usd: U256::ZERO,
+                shortfall_usd: U256::ZERO,
+                reason: ClassificationReason::NotEvaluated {
+                    detail: format!("skew {} is not finite", quote.log2_skew),
+                },
+            };
+        }
         // Single-tick capacity screen (audit S1): the constant-product model
         // is exact only inside the sampled liquidity cell. A quote whose
         // optimum demands far more than any leg can absorb there is priced
@@ -1411,6 +1428,51 @@ mod tests {
         let pair = crate::gaps::pair_key(token_a(), token_b());
         let (_, classification) = evaluator.quote_pair(pair).expect("quote present");
         assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+    }
+
+    #[test]
+    fn nan_skew_is_screened_not_gated() {
+        // Audit A8: `NaN > x` is false, so a NaN skew would silently PASS
+        // the skew screen (`if skew > max` never fires) and reach the gate
+        // on garbage. Any non-finite skew must screen explicitly.
+        //
+        // Constructed directly: through the public quoting path a NaN
+        // cannot currently be produced (degenerate prices fail reserve
+        // validation first), which is precisely why the guard needs a
+        // pinned test — nothing else would notice it regressing.
+        let (a_pools, b_pools, _key_a, _key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
+        price_anchor(&mut evaluator);
+        let fake = PairQuote {
+            token_lo: token_a(),
+            token_hi: token_b(),
+            input: U256::from(WEI),
+            output: U256::from(2 * WEI),
+            profit: U256::from(WEI),
+            toll: 0.006,
+            log2_skew: f64::NAN,
+            optimal_unclamped: U256::from(WEI),
+            input_capacity: U256::from(WEI),
+        };
+        let classification = evaluator.classify_anchor(token_a(), &fake);
+        assert!(
+            matches!(&classification.reason, ClassificationReason::NotEvaluated { detail }
+                if detail.contains("not finite")),
+            "a NaN skew must screen with an explicit detail: {classification:?}"
+        );
+
+        // Infinity screens identically.
+        let mut fake = fake;
+        fake.log2_skew = f64::INFINITY;
+        let classification = evaluator.classify_anchor(token_a(), &fake);
+        assert!(matches!(
+            &classification.reason,
+            ClassificationReason::NotEvaluated { .. }
+        ));
     }
 
     #[test]

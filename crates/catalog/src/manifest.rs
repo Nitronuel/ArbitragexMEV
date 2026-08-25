@@ -160,16 +160,24 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
                 identity: format!("{identity}"),
             });
         }
+        // Audit C1/C39: the CSV dialect is ambiguous (V2 catalogs store keep
+        // rates, build-manifest output stores fee rates) — both were accepted
+        // verbatim, and a `1/1` or nanoscopic row parsed silently. Require the
+        // fraction to be plausible under at least one reading.
+        let fee = Fee::keep_rate(row.fee_numerator, row.fee_denominator)
+            .or_else(|_| Fee::fee_rate(row.fee_numerator, row.fee_denominator))
+            .map_err(|_| ManifestError::UnsupportedFee {
+                row: row_number,
+                numerator: row.fee_numerator,
+                denominator: row.fee_denominator,
+            })?;
         pools.push(CandidatePool {
             chain_id: row.chain_id,
             address,
             factory,
             token0,
             token1,
-            fee: Fee {
-                numerator: row.fee_numerator,
-                denominator: row.fee_denominator,
-            },
+            fee,
             profile,
             pool_id,
             source,
