@@ -459,7 +459,12 @@ impl PairDirtyEvaluator {
         }
         let mut reference = self.reference;
         let anchor = Address::from_slice(&pair.0);
-        self.classify_with_flash(anchor, quote, &mut reference)
+        self.classify_with_flash(
+            anchor,
+            quote,
+            &mut reference,
+            shadow::PAIR_EXECUTION_GAS_UNITS,
+        )
     }
 
     /// Marks every pair and triangle indexed by the changed pool as dirty.
@@ -607,7 +612,12 @@ impl PairDirtyEvaluator {
             return self.skew_screened(quote);
         }
         let mut reference = self.reference;
-        self.classify_with_flash(anchor, quote, &mut reference)
+        self.classify_with_flash(
+            anchor,
+            quote,
+            &mut reference,
+            shadow::TRIANGLE_EXECUTION_GAS_UNITS,
+        )
     }
 
     /// Shared classification body once skew/age screens have passed and the
@@ -618,6 +628,7 @@ impl PairDirtyEvaluator {
         anchor: Address,
         quote: &PairQuote,
         reference: &mut CostSnapshot,
+        gas_units: u64,
     ) -> shadow::Classification {
         // Single-tick capacity screen (audit S1): the constant-product model
         // is exact only inside the sampled liquidity cell. A quote whose
@@ -648,6 +659,7 @@ impl PairDirtyEvaluator {
                     gas_cost_usd: U256::ZERO,
                     estimated_net_profit_usd: U256::ZERO,
                     threshold_usd: U256::ZERO,
+                    shortfall_usd: U256::ZERO,
                     reason: shadow::ClassificationReason::NotEvaluated {
                         detail: format!(
                             "optimal input {} exceeds single-tick capacity {} by {ratio:.1}x",
@@ -674,7 +686,7 @@ impl PairDirtyEvaluator {
             output: quote.output,
             profit: quote.profit,
         };
-        let mut classification = economics.classify(&optimal, reference);
+        let mut classification = economics.classify_route(&optimal, reference, gas_units, None);
         if matches!(classification.reason, ClassificationReason::AboveThreshold)
             && !self.token_is_priced(anchor)
         {
@@ -699,6 +711,7 @@ impl PairDirtyEvaluator {
             gas_cost_usd: U256::ZERO,
             estimated_net_profit_usd: U256::ZERO,
             threshold_usd: U256::ZERO,
+            shortfall_usd: U256::ZERO,
             reason: shadow::ClassificationReason::NotEvaluated {
                 detail: format!("no flash source for anchor {anchor}"),
             },
@@ -717,6 +730,7 @@ impl PairDirtyEvaluator {
             gas_cost_usd: U256::ZERO,
             estimated_net_profit_usd: U256::ZERO,
             threshold_usd: U256::ZERO,
+            shortfall_usd: U256::ZERO,
             reason: shadow::ClassificationReason::NotEvaluated {
                 detail: format!(
                     "skew {} exceeds max {:.2}",
@@ -815,14 +829,21 @@ mod tests {
             flash_fee_rate: U256::ZERO,
             gas_cost_usd: usd(1),
             expected_win_rate: U256::from(WEI),
+            native_token_usd: U256::from(shadow::FIXED_POINT_SCALE),
+            da_fee_usd: U256::ZERO,
         }
     }
 
     fn valid_reference() -> CostSnapshot {
+        // Gas price chosen so PAIR_EXECUTION_GAS_UNITS costs exactly the
+        // historical $0.03 scalar under the route-shaped model:
+        // 300_000 units x 1e29 wei x $1 / 1e36 = 3e16 ($0.03).
         CostSnapshot {
             usd_per_token: U256::from(WEI),
             gas_price_age_valid: true,
             reference_price_valid: true,
+
+            gas_price_wei: U256::from(100_000_000_000_000_000_000_000_000_000_u128),
         }
     }
 

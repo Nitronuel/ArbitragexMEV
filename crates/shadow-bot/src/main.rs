@@ -35,17 +35,9 @@ const CYCLE_LIMITS: CycleLimits = CycleLimits {
     max_cycles_per_pool: 10_000,
 };
 
-/// Conservative gas cost of one cross-venue attempt in USD fixed-point
-/// (~$0.03, per the project budget rules). At 18 fp digits this is 3e16.
-const GAS_COST_USD: U256 = U256::from_limbs([30_000_000_000_000_000, 0, 0, 0]);
-/// Expected win rate used for the submission-gate floor (15%).
-///
-/// Operator decision 2026-08-22: raised from the original 10% to loosen the
-/// gate floor from $0.30 ($0.03/0.10) to **$0.20** ($0.03/0.15). Trade-off
-/// to remember: if the true win rate stays at 10%, each accepted submission
-/// has expected value ≈ −$0.01 instead of breakeven — acceptable for
-/// shadow-mode measurement, must be revisited before any live submission.
-const EXPECTED_WIN_RATE: U256 = U256::from_limbs([150_000_000_000_000_000, 0, 0, 0]);
+use shadow::gate_defaults::{
+    STANDARD_EXPECTED_WIN_RATE as EXPECTED_WIN_RATE, STANDARD_GAS_COST_USD as GAS_COST_USD,
+};
 
 /// Uniswap V4 `PoolManager` singleton on Base; emits all Swap logs with the
 /// pool id as topic1 (confirmed from the enumerated catalog).
@@ -470,8 +462,10 @@ enum Command {
         /// Write one row per evaluated pair/triangle per poll to this path
         /// (appends; headers written on first open). Columns:
         /// `kind,token_lo,token_hi,to_block,input,output,profit,log2_skew`,
-        /// `gross_profit_usd,net_profit_usd,threshold_usd,floor_ratio`,
-        /// `optimal_unclamped,input_capacity,reason,anchor_priced`. The two
+        /// `gross_profit_usd,net_profit_usd,shortfall_usd,threshold_usd`,
+        /// `floor_ratio,optimal_unclamped,input_capacity,reason`,
+        /// `anchor_priced`. `shortfall_usd` measures how far below the gate
+        /// floor a near-miss fell (audit E4). The two
         /// capacity columns expose the audit-S1 clamp: what the model wanted
         /// to trade vs. what one tick-spacing cell can absorb.
         /// expose the audit-S1 single-tick capacity clamp: what the model
@@ -502,6 +496,16 @@ enum Command {
         /// this factor is screened instead of gated (audit S1).
         #[arg(long, default_value_t = dirty::DEFAULT_MAX_CAPACITY_OVERSHOOT)]
         max_capacity_overshoot: f64,
+        /// USD value of one whole native token (fixed-point), converting the
+        /// live gas price into the gate's cost side. Defaults to $1 — a
+        /// placeholder until the chain's native price is supplied; the loop
+        /// prints a warning whenever the default is in effect.
+        #[arg(long, default_value_t = U256::from(shadow::FIXED_POINT_SCALE))]
+        native_usd: U256,
+        /// Maximum age (seconds) of the cached gas price before the gate
+        /// fails closed. The price is re-read on this cadence (~10 CU).
+        #[arg(long, default_value_t = 120)]
+        gas_price_max_age_secs: u64,
         /// Maximum `|log2 skew|` a quote may carry and still be gated.
         /// Larger gaps come from degenerate near-empty pools that are not
         /// captureable; they are screened out instead of surfacing as
@@ -767,6 +771,8 @@ fn main() {
             v3_chunks_per_poll,
             confirm_lag_blocks,
             max_capacity_overshoot,
+            native_usd,
+            gas_price_max_age_secs,
             max_skew,
             flash_provider,
             flash_support,
@@ -791,6 +797,8 @@ fn main() {
             v3_chunks_per_poll,
             confirm_lag_blocks,
             max_capacity_overshoot,
+            native_usd,
+            gas_price_max_age_secs,
             max_skew,
             flash_provider: &flash_provider,
             flash_support: flash_support.as_deref(),
@@ -1620,11 +1628,33 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
         flash_fee_rate: U256::ZERO,
         gas_cost_usd: GAS_COST_USD,
         expected_win_rate: EXPECTED_WIN_RATE,
+        native_token_usd: U256::from(FIXED_POINT_SCALE),
+        da_fee_usd: U256::ZERO,
     };
+    // Audit S4: the validity flags are computed, not pinned. The gas price is
+    // read once here (~10 CU); "reference current" means a USD table was
+    // actually loaded — without it every anchor is $1-fixture priced.
+    let (gas_price_wei, gas_ok) = match reader.gas_price() {
+        Ok(wei) => (wei, true),
+        Err(error) => {
+            eprintln!("quote-manifest: gas-price read failed; gate fails closed: {error}");
+            (U256::ZERO, false)
+        }
+    };
+    let mut loaded_prices = 0usize;
+    if let Some(path) = prices_path {
+        let prices = gaps::load_prices(path)?;
+        loaded_prices = prices.len();
+        println!(
+            "loaded {loaded_prices} token prices from {}",
+            path.display()
+        );
+    }
     let reference = CostSnapshot {
         usd_per_token: U256::from(FIXED_POINT_SCALE),
-        gas_price_age_valid: true,
-        reference_price_valid: true,
+        gas_price_age_valid: gas_ok,
+        reference_price_valid: loaded_prices > 0,
+        gas_price_wei,
     };
     let mut evaluator =
         dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, quotes.len().max(1));
@@ -1632,11 +1662,6 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
     evaluator.set_max_log2_skew(args.max_skew);
     if let Some(path) = prices_path {
         let prices = gaps::load_prices(path)?;
-        println!(
-            "loaded {} token prices from {}",
-            prices.len(),
-            path.display()
-        );
         evaluator.set_token_prices(prices);
     }
     evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
@@ -1924,6 +1949,10 @@ struct RunPairsArgs<'a> {
     max_leg_age_spread_blocks: u64,
     /// Capacity-overshoot factor above which quotes are screened.
     max_capacity_overshoot: f64,
+    /// USD per whole native token for gas conversion.
+    native_usd: U256,
+    /// Gas-price staleness bound (seconds).
+    gas_price_max_age_secs: u64,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -2015,16 +2044,30 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         flash_fee_rate: U256::ZERO,
         gas_cost_usd: GAS_COST_USD,
         expected_win_rate: EXPECTED_WIN_RATE,
+        native_token_usd: U256::from(FIXED_POINT_SCALE),
+        da_fee_usd: U256::ZERO,
     };
     let reference = CostSnapshot {
         usd_per_token: U256::from(FIXED_POINT_SCALE),
         gas_price_age_valid: true,
         reference_price_valid: true,
+        gas_price_wei: U256::ZERO,
     };
     let queue_capacity = a_entries.len() + b_entries.len();
     let mut evaluator =
         dirty::PairDirtyEvaluator::new(&a_entries, &b_entries, economics, queue_capacity);
     evaluator.set_reference(reference);
+    // Live gas-price state for the cost model (audit S4): fetched on a
+    // cadence bounded by --gas-price-max-age-secs; a failed or stale read
+    // fails the gate closed through CostSnapshot::gas_price_age_valid.
+    let gas_max_age = Duration::from_secs(args.gas_price_max_age_secs.max(1));
+    let mut gas_state: Option<(U256, std::time::Instant)> = None;
+    if args.native_usd == U256::from(FIXED_POINT_SCALE) {
+        eprintln!(
+            "run-pairs: WARNING --native-usd defaults to $1; gas costs are              placeholders until the native price is supplied"
+        );
+    }
+    let prices_loaded = prices_path.is_some();
     evaluator.set_max_log2_skew(args.max_skew);
     let flash_selection = build_flash_selection(args.flash_provider, args.flash_support)?;
     if matches!(flash_selection, shadow::flash_loan::FlashSelection::None)
@@ -2158,6 +2201,34 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         evaluator.set_tip(to_eff);
         evaluator.mark_swept_keys(profile_bytes_a, &covered_a);
         evaluator.mark_swept_keys(profile_bytes_b, &covered_b);
+
+        // Refresh the gas price when its cache ages past the bound. A read
+        // failure keeps the old value, which then goes stale naturally and
+        // fails the gate closed (audit S4: no more pinned-open validity).
+        if gas_state.is_none_or(|(_, at)| at.elapsed() >= gas_max_age) {
+            match reader.gas_price() {
+                Ok(price_wei) => gas_state = Some((price_wei, std::time::Instant::now())),
+                Err(TransportError::Transient(message)) => {
+                    eprintln!("run-pairs: transient gas-price read; keeping cache: {message}");
+                }
+                Err(error) => {
+                    eprintln!("run-pairs: gas-price read failed; keeping cache: {error}");
+                }
+            }
+        }
+        let (gas_price_wei, gas_age_valid) = match gas_state {
+            Some((wei, at)) => (wei, at.elapsed() < gas_max_age),
+            None => (U256::ZERO, false),
+        };
+        evaluator.set_reference(CostSnapshot {
+            usd_per_token: U256::from(FIXED_POINT_SCALE),
+            // Honest proxy for "reference route current": the USD table was
+            // actually loaded — without it every anchor is $1-fixture priced
+            // and gating is meaningless (audit S4).
+            reference_price_valid: prices_loaded,
+            gas_price_age_valid: gas_age_valid,
+            gas_price_wei,
+        });
         let outcome = evaluator.run_once();
         if !outcome.stale_screened.is_empty() || !outcome.triangle_stale_screened.is_empty() {
             eprintln!(
@@ -2250,7 +2321,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     let hi = alloy_primitives::Address::from_slice(&pair.1);
                     writeln!(
                         out,
-                        "pair,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{},{},{:?},{}",
+                        "pair,{},{},{},{},{},{},{:.6},{},{},{},{},{:.4},{},{},{:?},{}",
                         lo,
                         hi,
                         latest,
@@ -2260,6 +2331,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                         quote.log2_skew,
                         classification.gross_profit_usd,
                         classification.estimated_net_profit_usd,
+                        classification.shortfall_usd,
                         classification.threshold_usd,
                         floor_ratio(
                             classification.estimated_net_profit_usd,
@@ -2283,7 +2355,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     let hi = alloy_primitives::Address::from_slice(&t.1);
                     writeln!(
                         out,
-                        "triangle,{},{},{},{},{},{},{:.6},{},{},{},{:.4},{},{},{:?},{}",
+                        "triangle,{},{},{},{},{},{},{:.6},{},{},{},{},{:.4},{},{},{:?},{}",
                         lo,
                         hi,
                         latest,
@@ -2293,6 +2365,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                         quote.log2_skew,
                         classification.gross_profit_usd,
                         classification.estimated_net_profit_usd,
+                        classification.shortfall_usd,
                         classification.threshold_usd,
                         floor_ratio(
                             classification.estimated_net_profit_usd,
@@ -2945,15 +3018,21 @@ fn run(
 ) -> Result<(), String> {
     let config = ShadowConfig::load(config_path).map_err(|error| error.to_string())?;
     let now_ms = unix_millis();
+    // Audit A15: the disabled gate is now a *named* decision in
+    // shadow::gate_defaults — `interesting=` counts every profitable cycle
+    // because gas is dust and the win rate is 100%.
     let economics = Economics {
         flash_fee_rate: U256::ZERO,
-        gas_cost_usd: U256::from(1_000),
-        expected_win_rate: U256::from(FIXED_POINT_SCALE),
+        gas_cost_usd: shadow::gate_defaults::MEASUREMENT_GAS_COST_WEI,
+        expected_win_rate: shadow::gate_defaults::MEASUREMENT_EXPECTED_WIN_RATE,
+        native_token_usd: U256::from(FIXED_POINT_SCALE),
+        da_fee_usd: U256::ZERO,
     };
     let reference = CostSnapshot {
         usd_per_token: U256::from(FIXED_POINT_SCALE),
         gas_price_age_valid: true,
         reference_price_valid: true,
+        gas_price_wei: U256::ZERO,
     };
     if let Some(manifest_path) = manifest_path {
         run_live_command(

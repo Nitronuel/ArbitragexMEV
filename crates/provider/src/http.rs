@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -233,6 +233,35 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
             params: json!([address_hex(address), hex_block(block)]),
         })?;
         quantity(&response.result)
+    }
+
+    /// Reads the current network gas price in wei per gas unit
+    /// (`eth_gasPrice`).
+    ///
+    /// The result is parsed as a hex QUANTITY string — not byte data — so a
+    /// minimally encoded value like `"0x1"` decodes correctly (the `balance()`
+    /// path's defect, audit B6, is deliberately not replicated here).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response
+    /// failures.
+    pub fn gas_price(&self) -> Result<U256, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_gasPrice".to_owned(),
+            params: json!([]),
+        })?;
+        let text = response
+            .result
+            .as_str()
+            .ok_or(TransportError::InvalidResponse)?;
+        let digits = text
+            .strip_prefix("0x")
+            .ok_or(TransportError::InvalidResponse)?;
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(TransportError::InvalidResponse);
+        }
+        U256::from_str_radix(digits, 16).map_err(|_| TransportError::InvalidResponse)
     }
 
     /// Reads one historical block hash by number.

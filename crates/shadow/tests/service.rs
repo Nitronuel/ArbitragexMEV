@@ -20,6 +20,8 @@ fn economics() -> Economics {
         flash_fee_rate: U256::ZERO,
         gas_cost_usd: U256::from(1_000),
         expected_win_rate: scale,
+        native_token_usd: U256::from(shadow::FIXED_POINT_SCALE),
+        da_fee_usd: U256::ZERO,
     }
 }
 
@@ -28,6 +30,8 @@ fn reference() -> CostSnapshot {
         usd_per_token: U256::from(FIXED_POINT_SCALE),
         gas_price_age_valid: true,
         reference_price_valid: true,
+
+        gas_price_wei: U256::from(1),
     }
 }
 

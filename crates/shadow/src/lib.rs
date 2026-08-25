@@ -1,4 +1,5 @@
 pub mod economics;
+pub use economics::gate_defaults;
 pub mod evaluator;
 pub mod flash_loan;
 pub mod live;
@@ -8,7 +9,8 @@ pub mod service;
 pub mod smoke;
 
 pub use economics::{
-    Classification, ClassificationReason, CostSnapshot, Economics, FIXED_POINT_SCALE,
+    BASE_TX_GAS_UNITS, Classification, ClassificationReason, CostSnapshot, Economics,
+    FIXED_POINT_SCALE, PAIR_EXECUTION_GAS_UNITS, PER_HOP_GAS_UNITS, TRIANGLE_EXECUTION_GAS_UNITS,
 };
 pub use evaluator::{DirtyEvaluator, RunOutcome};
 pub use live::{EndReason, LiveReport, run_live};

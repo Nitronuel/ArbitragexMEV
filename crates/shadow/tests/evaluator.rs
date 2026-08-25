@@ -7,6 +7,7 @@ use shadow::{ClassificationReason, CostSnapshot, DirtyEvaluator, Economics, FIXE
 use state::{CanonicalPosition, StateMachine, SyncLog};
 use storage::Storage;
 use tempfile::TempDir;
+use v2_math::OptimalQuote;
 
 const LIMITS: CycleLimits = CycleLimits {
     max_cycles: 1_000,
@@ -94,6 +95,8 @@ fn interesting_economics() -> Economics {
         flash_fee_rate: U256::ZERO,
         gas_cost_usd: usd(1),
         expected_win_rate: U256::from(WEI),
+        native_token_usd: U256::from(shadow::FIXED_POINT_SCALE),
+        da_fee_usd: U256::ZERO,
     }
 }
 
@@ -102,6 +105,8 @@ fn valid_reference() -> CostSnapshot {
         usd_per_token: U256::from(WEI),
         gas_price_age_valid: true,
         reference_price_valid: true,
+
+        gas_price_wei: U256::from(1),
     }
 }
 
@@ -215,6 +220,8 @@ fn stale_gas_or_reference_prices_prevent_classification() {
         usd_per_token: U256::from(WEI),
         gas_price_age_valid: false,
         reference_price_valid: true,
+
+        gas_price_wei: U256::from(1),
     });
     evaluator.mark_pool(PoolId(0));
     let outcome = evaluator.run_once(1_000);
@@ -228,6 +235,8 @@ fn stale_gas_or_reference_prices_prevent_classification() {
         usd_per_token: U256::from(WEI),
         gas_price_age_valid: true,
         reference_price_valid: false,
+
+        gas_price_wei: U256::from(1),
     });
     evaluator.mark_pool(PoolId(0));
     let outcome = evaluator.run_once(1_000);
@@ -285,6 +294,8 @@ fn gate_uses_gas_cost_divided_by_expected_win_rate() {
         flash_fee_rate: U256::ZERO,
         gas_cost_usd: usd(30),
         expected_win_rate: U256::from(10 * WEI / 100),
+        native_token_usd: U256::from(shadow::FIXED_POINT_SCALE),
+        da_fee_usd: U256::ZERO,
     };
     let reference = valid_reference();
 
@@ -324,6 +335,8 @@ fn classification_fails_closed_on_stale_or_invalid_inputs() {
         flash_fee_rate: U256::ZERO,
         gas_cost_usd: usd(30),
         expected_win_rate: U256::from(10 * WEI / 100),
+        native_token_usd: U256::from(shadow::FIXED_POINT_SCALE),
+        da_fee_usd: U256::ZERO,
     };
     let quote = OptimalQuoteFixture {
         input: tokens(400),
@@ -343,6 +356,8 @@ fn classification_fails_closed_on_stale_or_invalid_inputs() {
 
     let stale_reference = CostSnapshot {
         reference_price_valid: false,
+
+        gas_price_wei: U256::from(1),
         ..valid_reference()
     };
     assert!(matches!(
@@ -361,6 +376,8 @@ fn classification_fails_closed_on_stale_or_invalid_inputs() {
 
     let zero_win_rate = Economics {
         expected_win_rate: U256::ZERO,
+        native_token_usd: U256::from(shadow::FIXED_POINT_SCALE),
+        da_fee_usd: U256::ZERO,
         ..economics
     };
     assert!(matches!(
@@ -392,4 +409,122 @@ impl From<OptimalQuoteFixture> for v2_math::OptimalQuote {
             profit: fixture.profit,
         }
     }
+}
+
+#[test]
+fn classify_route_derives_gas_from_live_price_and_shape() {
+    // Audit S4: the cost side comes from units x live gas price x native USD,
+    // not a scalar. 300k pair-units at 1e30 wei and $1 native = $0.03.
+    let economics = Economics {
+        flash_fee_rate: U256::ZERO,
+        gas_cost_usd: U256::ZERO,
+        expected_win_rate: U256::from(150_000_000_000_000_000u128), // 15%
+        native_token_usd: U256::from(WEI),
+        da_fee_usd: U256::ZERO,
+    };
+    let snapshot = CostSnapshot {
+        usd_per_token: U256::from(WEI),
+        gas_price_age_valid: true,
+        reference_price_valid: true,
+        gas_price_wei: U256::from(100_000_000_000_000_000_000_000_000_000_u128),
+    };
+    let quote = OptimalQuote {
+        input: U256::from(WEI / 10), // 0.1 tokens borrowed (flash fee zero)
+        output: U256::from(WEI),     // 1.0 back -> gross $1
+        profit: U256::from(WEI - WEI / 10),
+    };
+    let class = economics.classify_route(&quote, &snapshot, shadow::PAIR_EXECUTION_GAS_UNITS, None);
+    assert_eq!(class.gas_cost_usd, U256::from(30_000_000_000_000_000u128)); // $0.03 exactly
+    // Threshold = gas / win rate = $0.03/0.15 = $0.20.
+    assert_eq!(class.threshold_usd, U256::from(200_000_000_000_000_000u128)); // $0.20
+    assert_eq!(class.reason, ClassificationReason::AboveThreshold);
+    assert_eq!(class.shortfall_usd, U256::ZERO);
+
+    // A triangle pays more gas than a pair — never priced as one.
+    let tri = economics.classify_route(
+        &quote,
+        &snapshot,
+        shadow::TRIANGLE_EXECUTION_GAS_UNITS,
+        None,
+    );
+    assert!(
+        tri.gas_cost_usd > class.gas_cost_usd,
+        "triangle gas {} must exceed pair gas {}",
+        tri.gas_cost_usd,
+        class.gas_cost_usd
+    );
+}
+
+#[test]
+fn classify_route_fails_closed_on_stale_or_missing_gas_inputs() {
+    let economics = Economics {
+        flash_fee_rate: U256::ZERO,
+        gas_cost_usd: U256::ZERO,
+        expected_win_rate: U256::from(WEI),
+        native_token_usd: U256::from(WEI),
+        da_fee_usd: U256::ZERO,
+    };
+    let quote = OptimalQuote {
+        input: U256::from(WEI),
+        output: U256::from(2 * WEI),
+        profit: U256::from(WEI),
+    };
+    let stale = CostSnapshot {
+        usd_per_token: U256::from(WEI),
+        gas_price_age_valid: false,
+        reference_price_valid: true,
+        gas_price_wei: U256::from(1),
+    };
+    assert!(matches!(
+        economics
+            .classify_route(&quote, &stale, 300_000, None)
+            .reason,
+        ClassificationReason::NotEvaluated { .. }
+    ));
+    let unset = CostSnapshot {
+        usd_per_token: U256::from(WEI),
+        gas_price_age_valid: true,
+        reference_price_valid: true,
+        gas_price_wei: U256::ZERO,
+    };
+    assert!(matches!(
+        economics
+            .classify_route(&quote, &unset, 300_000, None)
+            .reason,
+        ClassificationReason::NotEvaluated { .. }
+    ));
+}
+
+#[test]
+fn classify_route_charges_the_da_fee_and_reports_shortfall() {
+    // The data-availability term is wired end-to-end (audit S4/Part VI):
+    // currently zero by decision, but a verified value drops in without
+    // restructuring. Shortfall measures how far below the floor a near-miss
+    // fell (audit E4).
+    let economics = Economics {
+        flash_fee_rate: U256::ZERO,
+        gas_cost_usd: U256::ZERO,
+        expected_win_rate: U256::from(WEI), // 100% -> threshold == total cost
+        native_token_usd: U256::from(WEI),
+        da_fee_usd: usd(2),
+    };
+    let snapshot = CostSnapshot {
+        usd_per_token: U256::from(WEI),
+        gas_price_age_valid: true,
+        reference_price_valid: true,
+        // Pair gas becomes exactly $0.10: 300k x 1e30 x $1 / 1e36.
+        gas_price_wei: U256::from(1_000_000_000_000_000_000_000_000_000_000_u128),
+    };
+    // Gross $0.10 against $0.10 gas + $2 DA -> unprofitable by the DA term.
+    let quote = OptimalQuote {
+        input: U256::ZERO,
+        output: U256::from(WEI / 10),
+        profit: U256::from(WEI / 10),
+    };
+    let class = economics.classify_route(&quote, &snapshot, shadow::PAIR_EXECUTION_GAS_UNITS, None);
+    let total_cost = class.gas_cost_usd + economics.da_fee_usd;
+    assert!(total_cost > quote.profit, "DA term must push it under");
+    assert_eq!(class.reason, ClassificationReason::NotProfitable);
+    // Shortfall = total cost - gross (audit E4).
+    assert_eq!(class.shortfall_usd, total_cost - U256::from(WEI / 10));
 }
