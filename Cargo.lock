@@ -3340,7 +3340,9 @@ name = "simulation"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "provider",
  "revm",
+ "serde_json",
  "thiserror",
 ]
 
