@@ -29,6 +29,7 @@ pub fn optimal_input(
     if !(2..=4).contains(&cycle.hops.len()) {
         return Err(MathError::InvalidCycleLength);
     }
+    validate_route(cycle)?;
 
     let (a, b, c) = coefficients(cycle, states)?;
     if a <= b {
@@ -228,4 +229,48 @@ fn coefficients(cycle: &Cycle, states: &[PoolState]) -> Result<(Wide, Wide, Wide
 
 fn widen(value: U256) -> Wide {
     Wide::from_limbs_slice(value.as_limbs())
+}
+
+/// Rejects a cycle whose hops do not form a closed route: each hop must take
+/// its `token_in` from the previous hop's `token_out`, the first hop must
+/// start at the cycle's anchor, and the last hop must return to it.
+///
+/// Without this guard a structurally impossible cycle — legs drawn from two
+/// different token pairs, for instance — prices silently and reports P&L for
+/// a route that cannot exist (audit finding S7).
+///
+/// # Errors
+///
+/// Returns [`MathError::DiscontinuousRoute`] naming the first broken seam.
+pub fn validate_route(cycle: &Cycle) -> Result<(), MathError> {
+    let Some(first) = cycle.hops.first() else {
+        return Err(MathError::InvalidCycleLength);
+    };
+    if first.token_in != cycle.anchor {
+        return Err(MathError::DiscontinuousRoute(
+            0,
+            format!("anchor {}", cycle.anchor),
+            format!("{}", first.token_in),
+        ));
+    }
+    for (index, pair) in cycle.hops.windows(2).enumerate() {
+        if pair[0].token_out != pair[1].token_in {
+            return Err(MathError::DiscontinuousRoute(
+                index + 1,
+                format!("{}", pair[0].token_out),
+                format!("{}", pair[1].token_in),
+            ));
+        }
+    }
+    if let Some(last) = cycle.hops.last()
+        && last.token_out != cycle.anchor
+    {
+        let index = cycle.hops.len().saturating_sub(1);
+        return Err(MathError::DiscontinuousRoute(
+            index,
+            format!("{}", last.token_out),
+            format!("anchor {}", cycle.anchor),
+        ));
+    }
+    Ok(())
 }

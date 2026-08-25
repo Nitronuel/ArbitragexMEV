@@ -307,6 +307,13 @@ enum Command {
         /// Gas spend per attempt, USD fixed-point.
         #[arg(long, default_value_t = U256::from(30_000_000_000_000_000_u64))]
         gas_usd: U256,
+        /// Captured pair override (both required together) for captures
+        /// written before watch-gates recorded `token_lo`/`token_hi`.
+        #[arg(long)]
+        token_lo: Option<Address>,
+        /// Pair override, second half.
+        #[arg(long)]
+        token_hi: Option<Address>,
     },
     /// Expands a selected-pairs CSV into a concrete-pool manifest, merging the
     /// pools from two enumerated catalogs that carry the selected pairs
@@ -655,6 +662,8 @@ fn main() {
             rpc,
             prices,
             gas_usd,
+            token_lo,
+            token_hi,
         } => verify_capture_command(&VerifyCaptureArgs {
             capture: &capture,
             manifest: &manifest,
@@ -662,6 +671,8 @@ fn main() {
             rpc: &rpc,
             prices: &prices,
             gas_usd,
+            token_lo,
+            token_hi,
         }),
         Command::BuildManifest {
             a,
@@ -1320,6 +1331,11 @@ struct VerifyCaptureArgs<'a> {
     rpc: &'a str,
     prices: &'a PathBuf,
     gas_usd: U256,
+    /// Captured pair override (`--token-lo`/`--token-hi`), for captures
+    /// written before `watch-gates.sh` recorded the pair. Either both or
+    /// neither.
+    token_lo: Option<Address>,
+    token_hi: Option<Address>,
 }
 
 /// Re-quotes one pinned capture against fresh chain reads and prints its
@@ -1357,10 +1373,62 @@ fn verify_capture_command(args: &VerifyCaptureArgs<'_>) -> Result<(), String> {
         domain::ROBINHOOD_CHAIN_ID,
     );
 
-    let (legs_a, legs_b) = gaps::restrict_to_manifest(args.manifest, *b"v3", *b"v4")?;
-    if legs_a.is_empty() || legs_b.is_empty() {
+    let (manifest_v3, manifest_v4) = gaps::restrict_to_manifest(args.manifest, *b"v3", *b"v4")?;
+    if manifest_v3.is_empty() || manifest_v4.is_empty() {
         return Err("manifest has no pools for one of the venues".to_owned());
     }
+
+    // Resolve the captured pair. The re-quote must price the opportunity the
+    // canary actually recorded — previously this command passed the whole
+    // manifest to quote_pair, whose best-leg picked two unrelated pools and
+    // reported P&L for a cycle that did not exist (audit finding S7).
+    let capture_lo = capture["token_lo"].as_str();
+    let capture_hi = capture["token_hi"].as_str();
+    let (lo, hi) = match (capture_lo, capture_hi, args.token_lo, args.token_hi) {
+        (Some(lo), Some(hi), _, _) => (
+            lo.parse::<Address>()
+                .map_err(|e| format!("capture token_lo malformed: {e}"))?,
+            hi.parse::<Address>()
+                .map_err(|e| format!("capture token_hi malformed: {e}"))?,
+        ),
+        (None, None, Some(lo), Some(hi)) => (lo, hi),
+        (Some(_), None, _, _) | (None, Some(_), _, _) => {
+            return Err("capture has only one of token_lo/token_hi".to_owned());
+        }
+        (_, _, Some(_), None) | (_, _, None, Some(_)) => {
+            return Err("--token-lo and --token-hi must be passed together".to_owned());
+        }
+        (None, None, None, None) => {
+            return Err(
+                "capture lacks token_lo/token_hi (pre-0.3 watch-gates format); \
+                 pass --token-lo/--token-hi from the canary CSV's gated row"
+                    .to_owned(),
+            );
+        }
+    };
+    let want = gaps::pair_key(lo, hi);
+    let scoped_pair = |entries: &[gaps::PoolEntry]| -> Vec<gaps::PoolEntry> {
+        entries
+            .iter()
+            .filter(|e| gaps::pair_key(e.token0, e.token1) == want)
+            .copied()
+            .collect()
+    };
+    let legs_a = scoped_pair(&manifest_v3);
+    let legs_b = scoped_pair(&manifest_v4);
+    if legs_a.is_empty() || legs_b.is_empty() {
+        return Err(format!(
+            "captured pair {lo:#}/{hi:#} is absent from the manifest on \
+             at least one venue; cannot re-quote"
+        ));
+    }
+    println!(
+        "verify-capture: captured pair {:#} / {:#} ({} v3 pools, {} v4 pools)",
+        Address::from_slice(&want.0),
+        Address::from_slice(&want.1),
+        legs_a.len(),
+        legs_b.len()
+    );
 
     // Re-read chain truth at the pinned block: latest Swap-implied price per
     // leg within the lookback window.
@@ -2083,6 +2151,45 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                 outcome.stale_screened.len(),
                 outcome.triangle_stale_screened.len()
             );
+        }
+        // One line per gate-passing row, carrying the pair identity: this is
+        // what watch-gates.sh parses into capture files, so verify-capture
+        // can re-quote the recorded opportunity instead of an arbitrary pair.
+        for (pair, (_quote, classification)) in outcome.evaluated.iter().zip(&outcome.pair_results)
+        {
+            if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+                println!(
+                    "run-pairs: GATED pair token_lo={} token_hi={} net_usd={} floor_ratio={:.4}",
+                    Address::from_slice(&pair.0),
+                    Address::from_slice(&pair.1),
+                    classification.estimated_net_profit_usd,
+                    floor_ratio(
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd
+                    ),
+                );
+            }
+        }
+        for (tri, (quote, classification)) in outcome
+            .triangle_evaluated
+            .iter()
+            .zip(&outcome.triangle_results)
+        {
+            if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+                let t = evaluator.triangle(*tri);
+                println!(
+                    "run-pairs: GATED triangle tokens={},{},{} skew={:.6} net_usd={} floor_ratio={:.4}",
+                    Address::from_slice(&t.0),
+                    Address::from_slice(&t.1),
+                    Address::from_slice(&t.2),
+                    quote.log2_skew,
+                    classification.estimated_net_profit_usd,
+                    floor_ratio(
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd
+                    ),
+                );
+            }
         }
         if outcome.degraded {
             eprintln!(

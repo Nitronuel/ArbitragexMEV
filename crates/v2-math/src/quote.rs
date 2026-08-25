@@ -12,6 +12,8 @@ pub enum MathError {
     Overflow,
     #[error("cycle must contain between two and four hops")]
     InvalidCycleLength,
+    #[error("cycle route is discontinuous at hop {0}: {1} does not flow into {2}")]
+    DiscontinuousRoute(usize, String, String),
     #[error("pool state {0} is missing")]
     MissingPoolState(u32),
 }

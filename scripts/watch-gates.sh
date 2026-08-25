@@ -22,13 +22,25 @@ tip() {
 }
 
 echo "watch-gates: tailing $log"
+# Gate-passing rows carry their pair identity on separate "GATED pair" lines
+# emitted just before each poll summary; buffer the most recent one so the
+# capture records which opportunity gated. Triangle gates have no single
+# pair — verify-capture needs --token-lo/--token-hi for those.
+last_pair_lo=
+last_pair_hi=
 tail -n 0 -F "$log" | while read -r line; do
   case "$line" in
+    *"GATED pair "*)
+      last_pair_lo=$(printf '%s' "$line" | grep -oE 'token_lo=[0-9a-fA-Fx]+' | head -1 | cut -d= -f2)
+      last_pair_hi=$(printf '%s' "$line" | grep -oE 'token_hi=[0-9a-fA-Fx]+' | head -1 | cut -d= -f2)
+      continue ;;
     *gated=*) : ;;          # a poll line — fall through to extraction
     *) continue ;;          # anything else
   esac
   gated=$(printf '%s' "$line" | grep -oE 'gated=[0-9]+' | head -1 | cut -d= -f2)
   [ "${gated:-0}" -gt 0 ] || continue
+  tok_lo=$last_pair_lo
+  tok_hi=$last_pair_hi
   blk=$(printf '%s' "$line" | grep -oE 'poll [0-9]+' | grep -oE '[0-9]+' | tail -1)
   tip_now=$(tip)
   file="$dir/gate-$(date -u +%Y%m%dT%H%M%S)-blk${tip_now}.json"
@@ -42,8 +54,9 @@ tail -n 0 -F "$log" | while read -r line; do
       continue
     fi
   fi
-  printf '{"detected_at_utc":"%s","poll_from_block":%s,"tip_block":%s,"gated":%s,"log_line":"%s"}\n' \
+  printf '{"detected_at_utc":"%s","poll_from_block":%s,"tip_block":%s,"gated":%s,"token_lo":"%s","token_hi":"%s","log_line":"%s"}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${blk:-0}" "$tip_now" "$gated" \
+    "$tok_lo" "$tok_hi" \
     "$(printf '%s' "$line" | tr '"' "'")" >"$file"
   echo "watch-gates: CAPTURED $file (episode at tip $tip_now)"
 done

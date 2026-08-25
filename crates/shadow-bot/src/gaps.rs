@@ -1375,6 +1375,26 @@ pub fn oriented_pair_skew(
     (qb / qa).log2().abs()
 }
 
+/// Rejects a cross-venue quote whose two selected legs are not the same
+/// normalized token pair.
+///
+/// `best_leg` picks each venue's cheapest priced pool independently, so
+/// mismatched inputs would silently compose a cycle across two unrelated
+/// token pairs — structurally unpriceable, yet the optimiser would return a
+/// number for it (audit finding S7). Hard-error instead of quoting.
+fn ensure_same_pair(leg_a: &PoolEntry, leg_b: &PoolEntry) -> Result<(), String> {
+    let pair_a = pair_key(leg_a.token0, leg_a.token1);
+    if pair_a == pair_key(leg_b.token0, leg_b.token1) {
+        Ok(())
+    } else {
+        Err(format!(
+            "quote_pair: legs are not the same pair (venue A {:#?}, venue B {:#?})",
+            (leg_a.token0, leg_a.token1),
+            (leg_b.token0, leg_b.token1)
+        ))
+    }
+}
+
 pub fn quote_pair(
     a_entries: &[PoolEntry],
     b_entries: &[PoolEntry],
@@ -1406,6 +1426,7 @@ pub fn quote_pair(
     let (leg_b, leg_price_b, toll_b) =
         best_leg(b_entries, prices_b).ok_or("venue B has no priced leg")?;
 
+    ensure_same_pair(&leg_a, &leg_b)?;
     let pair = pair_key(leg_a.token0, leg_a.token1);
     let anchor = Address::from_slice(&pair.0);
     let other = Address::from_slice(&pair.1);
@@ -2627,6 +2648,70 @@ mod tests {
             },
         );
         assert!(quote_pair(&a_entries, &b_entries, &pa, &pb).is_err());
+    }
+
+    #[test]
+    fn quote_pair_rejects_mismatched_pair_legs() {
+        // Audit S7: venue A priced on pair (a,b), venue B priced on pair
+        // (a,c). best_leg selects each venue's cheapest priced pool
+        // independently; before the guard this composed a cycle across two
+        // unrelated pairs and priced it.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let a = "0x1000000000000000000000000000000000000000";
+        let b = "0x2000000000000000000000000000000000000000";
+        let c = "0x3000000000000000000000000000000000000000";
+        let p3 = dir.path().join("v3.csv");
+        let p4 = dir.path().join("v4.csv");
+        {
+            let mut f = std::fs::File::create(&p3).unwrap();
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0xfa00000000000000000000000000000000000001,0x1111111111111111111111111111111111111111,{a},{b},3000,1000000,v3,,\n"
+            )
+            .unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&p4).unwrap();
+            let id = "44".repeat(32);
+            write!(
+                f,
+                "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+                 4663,0x8366a39CC670B4001A1121B8F6A443A643e40951,0x2222222222222222222222222222222222222222,{b},{c},2500,1000000,v4,0x{id},\n"
+            )
+            .unwrap();
+        }
+        let m3 = load_catalog(&p3).unwrap();
+        let m4 = load_catalog(&p4).unwrap();
+        let a_entries: Vec<_> = m3.into_values().collect();
+        let b_entries: Vec<_> = m4.into_values().collect();
+
+        let mut pa = HashMap::new();
+        pa.insert(
+            a_entries[0].venue.into_word().into(),
+            PoolPrice {
+                sqrt: U256::from(1u64) << 97,
+                liquidity: U256::from(1_000_000_000u64),
+                block: 1,
+            },
+        );
+        let mut pb = HashMap::new();
+        pb.insert(
+            b_entries[0].id,
+            PoolPrice {
+                sqrt: U256::from(1u64) << 98,
+                liquidity: U256::from(1_000_000_000u64),
+                block: 1,
+            },
+        );
+
+        let error = quote_pair(&a_entries, &b_entries, &pa, &pb)
+            .expect_err("mismatched-pair legs must hard-error");
+        assert!(
+            error.contains("not the same pair"),
+            "guard detail must name the violation: {error}"
+        );
     }
 
     #[test]

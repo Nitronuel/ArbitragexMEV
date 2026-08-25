@@ -173,3 +173,55 @@ fn optimal_input_terminates_on_smaller_hang_cases() {
         assert!(t.elapsed().as_secs() < 15, "r1b=2^{r1b_log} is stuck");
     }
 }
+
+#[test]
+fn optimal_input_rejects_discontinuous_route() {
+    // Audit S7: a cycle whose legs come from two different token pairs is
+    // structurally unpriceable, yet previously produced a quote silently.
+    let anchor = Address::repeat_byte(1);
+    let mid = Address::repeat_byte(2);
+    let unrelated = Address::repeat_byte(3);
+    let broken = Cycle {
+        id: CycleId(0),
+        anchor,
+        hops: vec![
+            CycleHop {
+                pool_id: PoolId(0),
+                token_in: anchor,
+                token_out: mid,
+                fee: FEE,
+                zero_for_one: true,
+            },
+            CycleHop {
+                pool_id: PoolId(1),
+                token_in: unrelated,
+                token_out: anchor,
+                fee: FEE,
+                zero_for_one: true,
+            },
+        ],
+    };
+    let states = [
+        state(U256::from(1_000_000u64), U256::from(1_000_000u64)),
+        state(U256::from(1_000_000u64), U256::from(1_000_000u64)),
+    ];
+    let error = optimal_input(&broken, &states).unwrap_err();
+    assert!(
+        matches!(error, v2_math::MathError::DiscontinuousRoute(1, _, _)),
+        "expected DiscontinuousRoute at hop 1, got {error:?}"
+    );
+
+    // A route that starts off-anchor is equally invalid.
+    let mut wrong_anchor = pair_cycle();
+    wrong_anchor.anchor = unrelated;
+    let error = optimal_input(&wrong_anchor, &states).unwrap_err();
+    assert!(
+        matches!(error, v2_math::MathError::DiscontinuousRoute(0, _, _)),
+        "expected DiscontinuousRoute at hop 0, got {error:?}"
+    );
+
+    // The well-formed cycle still prices (equal reserves → no profit here,
+    // but crucially no route error; profitability itself is covered by the
+    // property tests).
+    assert!(optimal_input(&pair_cycle(), &states).unwrap().is_none());
+}
