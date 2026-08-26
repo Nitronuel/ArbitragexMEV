@@ -232,6 +232,7 @@ fn run_pipeline(
     let cycle_count = graph.cycles.len();
 
     let evaluator_storage = Storage::open_with_limit(storage_path, database_limit_bytes)?;
+    // Use default retention for now; caller may override via with_retention if config available.
     let mut machine = StateMachine::new(verified.len());
     let states: Vec<(PoolId, U256, U256)> = verified
         .iter()

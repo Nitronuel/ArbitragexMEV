@@ -108,6 +108,23 @@ impl PoolStateStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub stale_timeout: std::time::Duration,
+    pub recovery_gap_limit: u64,
+    pub retention_blocks: u64,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            stale_timeout: std::time::Duration::from_secs(60),
+            recovery_gap_limit: 1_000,
+            retention_blocks: 127,
+        }
+    }
+}
+
 pub struct StateMachine {
     store: PoolStateStore,
     readiness: Readiness,
@@ -115,11 +132,17 @@ pub struct StateMachine {
     committed_block: Option<u64>,
     next_version: u64,
     removed_seen: HashSet<(PoolId, CanonicalPosition, B256)>,
+    retention: RetentionPolicy,
 }
 
 impl StateMachine {
     #[must_use]
     pub fn new(pool_count: usize) -> Self {
+        Self::with_retention(pool_count, RetentionPolicy::default())
+    }
+
+    #[must_use]
+    pub fn with_retention(pool_count: usize, retention: RetentionPolicy) -> Self {
         Self {
             store: PoolStateStore::new(pool_count),
             readiness: Readiness::Bootstrapping,
@@ -127,6 +150,7 @@ impl StateMachine {
             committed_block: None,
             next_version: 0,
             removed_seen: HashSet::new(),
+            retention,
         }
     }
 
@@ -250,7 +274,7 @@ impl StateMachine {
         source: &R,
     ) -> Result<(), StateError> {
         self.mark_stale("recovery in progress");
-        if elapsed > Duration::from_mins(1) {
+        if elapsed > self.retention.stale_timeout {
             self.mark_stale("recovery timeout");
             return Err(StateError::RecoveryTimeout);
         }
@@ -260,7 +284,7 @@ impl StateMachine {
             return Err(StateError::RecoveryHeadBehind { committed, head });
         }
         let gap = head - committed;
-        if gap > 1_000 {
+        if gap > self.retention.recovery_gap_limit {
             self.mark_stale("recovery gap exceeds limit");
             return Err(StateError::RecoveryGap { gap });
         }
@@ -270,7 +294,7 @@ impl StateMachine {
         // permanently unrepairable. Reach one retention window down —
         // replaying already-known logs is harmless (Duplicate/IgnoredOld),
         // and removals-first ordering (C8) handles the branch switch.
-        let backfill_from = committed.saturating_sub(RECOVERY_LOOKBACK_BLOCKS);
+        let backfill_from = committed.saturating_sub(self.retention.retention_blocks);
         let mut logs = Vec::new();
         let mut start = backfill_from;
         loop {
@@ -479,7 +503,7 @@ impl StateMachine {
         let latest = self.store.checkpoints[index]
             .last()
             .map_or(0, |checkpoint| checkpoint.position.block_number);
-        let earliest = latest.saturating_sub(127);
+        let earliest = latest.saturating_sub(self.retention.retention_blocks);
         let first_retained = self.store.checkpoints[index]
             .iter()
             .position(|checkpoint| checkpoint.position.block_number >= earliest)
