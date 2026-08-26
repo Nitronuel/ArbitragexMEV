@@ -18,6 +18,19 @@ pub struct HttpResponse {
     pub response_bytes: usize,
 }
 
+/// Builds the JSON-RPC `topics[0]` value: a single topic, or an array when
+/// alternates are present.
+fn topics_param(topic0: B256, alternates: &[B256]) -> Value {
+    if alternates.is_empty() {
+        json!(format!("0x{topic0:x}"))
+    } else {
+        let all: Vec<String> = std::iter::once(format!("0x{topic0:x}"))
+            .chain(alternates.iter().map(|t| format!("0x{t:x}")))
+            .collect();
+        json!(all)
+    }
+}
+
 /// Providers signal oversized log queries with varying messages; all known
 /// shapes name the result count or the log size (audit B12).
 fn is_result_cap_error(error: &TransportError) -> bool {
@@ -48,6 +61,11 @@ pub struct LogFilter {
     pub to_block: u64,
     pub addresses: Vec<Address>,
     pub topic0: B256,
+    /// Extra first-position topics accepted in addition to `topic0`
+    /// (JSON-RPC `topics[0]` array). Empty = exact match only.
+    /// Audit task 1.3: the ring sweep accepts Swap + liquidity-change
+    /// events so cache invalidation sees Mint/Burn without a Swap.
+    pub topic0_alternates: Vec<B256>,
 }
 
 pub trait HttpBackend {
@@ -350,7 +368,10 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
                     "fromBlock": format!("0x{start:x}"),
                     "toBlock": format!("0x{end:x}"),
                     "address": filter.addresses,
-                    "topics": [filter.topic0],
+                    "topics": [topics_param(
+                        filter.topic0,
+                        &filter.topic0_alternates,
+                    )],
                 }]),
             })?;
             let chunk = response

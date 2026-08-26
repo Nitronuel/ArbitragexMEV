@@ -2235,6 +2235,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         let covered_b = sweep_b.covered_keys;
         let applied_this = priced_a.len() + priced_b.len();
         applied = applied.saturating_add(applied_this as u64);
+        evaluator.invalidate_prices(profile_bytes_a, &sweep_a.invalidated_keys);
+        evaluator.invalidate_prices(profile_bytes_b, &sweep_b.invalidated_keys);
         evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
         evaluator.seed_prices(profile_bytes_b, &b_entries, &priced_b)?;
         // Stamp sweep coverage *after* both sweeps succeeded. The ring
@@ -2671,6 +2673,7 @@ fn spawn_http_sidecar(
                             to_block: latest,
                             addresses: filter.addresses.clone(),
                             topic0: filter.topic0,
+                            topic0_alternates: Vec::new(),
                         },
                         2_000,
                     );

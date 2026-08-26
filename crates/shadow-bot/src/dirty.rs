@@ -355,6 +355,23 @@ impl PairDirtyEvaluator {
         }
     }
 
+    /// Drops cached prices for `keys` on `profile` (audit task 1.3): a
+    /// Mint/Burn without a Swap means sampled liquidity changed invisibly,
+    /// so the stale entry is removed rather than quoted. The pool returns
+    /// to the quotable set at its next Swap.
+    pub fn invalidate_prices(&mut self, profile: [u8; 2], keys: &[[u8; 32]]) {
+        let prices = if profile == self.profile_b {
+            &mut self.prices_b
+        } else if profile == self.profile_a {
+            &mut self.prices_a
+        } else {
+            return;
+        };
+        for key in keys {
+            prices.remove(key);
+        }
+    }
+
     /// Same as [`Self::mark_swept`] but takes precomputed pool keys with
     /// their individual covered-through blocks — the shape
     /// [`crate::gaps::RingSweepOutcome::covered_keys`] reports when catch-up

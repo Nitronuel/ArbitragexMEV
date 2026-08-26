@@ -158,6 +158,7 @@ where
                 to_block: end,
                 addresses: vec![venue.address],
                 topic0: venue.topic,
+                topic0_alternates: Vec::new(),
             },
             pace.window,
         )?;

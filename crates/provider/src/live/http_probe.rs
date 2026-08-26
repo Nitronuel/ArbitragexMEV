@@ -71,6 +71,7 @@ impl<R: HttpBackend, S: Sleeper> LiveHttpProbe<R, S> {
             to_block: latest,
             addresses: self.addresses.clone(),
             topic0: sync_topic(),
+            topic0_alternates: Vec::new(),
         };
         let values = self.reader.get_logs(&filter).map_err(to_stream)?;
         // Audit B11: undecodable logs previously vanished silently — 100%

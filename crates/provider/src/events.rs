@@ -34,6 +34,39 @@ pub fn v4_swap_topic() -> B256 {
     keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)")
 }
 
+/// The two RHC V3 liquidity-change topics (audit task 1.3).
+///
+/// RHC's V3 fork emits **non-canonical** liquidity events: neither hash
+/// equals the canonical Uniswap V3 `Mint`/`Burn` topics despite the
+/// verified contract ABI showing the canonical shapes (consistent with the
+/// chain's non-standard pool init-code — see audit Part VI.0 3c). Values
+/// are taken from live logs 2026-08-26 (`eth_getLogs` over catalog pools);
+/// exact Mint-vs-Burn assignment is unconfirmed and irrelevant for cache
+/// invalidation — either event means cached virtual reserves went stale.
+#[must_use]
+pub fn v3_mint_topic() -> B256 {
+    B256::from([
+        0x0c, 0x39, 0x6c, 0xd9, 0x89, 0xa3, 0x9f, 0x44, 0x59, 0xb5, 0xfa, 0x1a, 0xed, 0x6a, 0x9a,
+        0x8d, 0xcd, 0xbc, 0x45, 0x90, 0x8a, 0xcf, 0xd6, 0x7e, 0x02, 0x8c, 0xd5, 0x68, 0xda, 0x98,
+        0x98, 0x2c,
+    ])
+}
+
+#[must_use]
+pub fn v3_burn_topic() -> B256 {
+    B256::from([
+        0x70, 0x93, 0x53, 0x38, 0xe6, 0x97, 0x75, 0x45, 0x6a, 0x85, 0xdd, 0xef, 0x22, 0x6c, 0x39,
+        0x5f, 0xb6, 0x68, 0xb6, 0x3f, 0xa0, 0x11, 0x5f, 0x5f, 0x20, 0x61, 0x0b, 0x38, 0x8e, 0x6c,
+        0xa9, 0xc0,
+    ])
+}
+
+/// V4 `ModifyLiquidity` — the V4 Mint/Burn equivalent (observed live).
+#[must_use]
+pub fn v4_modify_liquidity_topic() -> B256 {
+    keccak256("ModifyLiquidity(bytes32,address,int24,int24,int256,uint256)")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V2PairCreated {
     pub token0: Address,
@@ -381,6 +414,51 @@ mod tests {
         assert_eq!(parsed.tick, 200);
     }
 
+    #[test]
+    fn topic0_values_match_canonical_deployments_and_live_chain() {
+        // Audit B38: only two of five were pinned; a wrong topic0 presents
+        // as "no opportunities found". Values verified against live RHC
+        // logs 2026-08-26 (eth_getLogs on the catalog pool/PoolManager)
+        // and cast sig-event/keccak.
+        assert_eq!(
+            hex_of(v2_pair_created_topic()),
+            "0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
+        );
+        assert_eq!(
+            hex_of(v3_pool_created_topic()),
+            "783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"
+        );
+        assert_eq!(
+            hex_of(v3_swap_topic()),
+            "c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+        );
+        assert_eq!(
+            hex_of(v4_swap_topic()),
+            "40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
+        );
+        assert_eq!(
+            hex_of(v4_initialize_topic()),
+            "dd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
+        );
+        // Liquidity-change events (task 1.3): observed live at 40x/14x per
+        // 256-block window on the PoolManager.
+        assert_eq!(
+            hex_of(v3_mint_topic()),
+            "0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c"
+        );
+        assert_eq!(
+            hex_of(v3_burn_topic()),
+            "70935338e69775456a85ddef226c395fb668b63fa0115f5f20610b388e6ca9c0"
+        );
+        assert_eq!(
+            hex_of(v4_modify_liquidity_topic()),
+            "f29efab2cc6f754bd298db4305708beb05a1278f40e21cbd10a972df4c57e91b"
+        );
+    }
+
+    fn hex_of(t: B256) -> String {
+        alloy_primitives::hex::encode(t)
+    }
     #[test]
     fn decodes_v4_swap() {
         let mut data = vec![0u8; 192];

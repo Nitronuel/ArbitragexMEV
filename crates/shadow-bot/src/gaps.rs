@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use provider::{
     ChainReader, HttpBackend, LogFilter, RawLogEnvelope, Sleeper, TransportError, decode_v3_swap,
     decode_v4_swap, v3_swap_topic, v4_swap_topic,
@@ -659,6 +659,7 @@ where
                         to_block: end,
                         addresses: vec![pool_manager],
                         topic0: topic,
+                        topic0_alternates: Vec::new(),
                     },
                     window,
                 )?;
@@ -675,6 +676,7 @@ where
                             to_block: end,
                             addresses,
                             topic0: topic,
+                            topic0_alternates: Vec::new(),
                         },
                         window,
                     )?;
@@ -768,6 +770,12 @@ pub struct RingSweepOutcome {
     /// covered — including pools that emitted no events. Feeds the evaluator's
     /// coverage voucher (`PairDirtyEvaluator::mark_swept_keys`).
     pub covered_keys: Vec<([u8; 32], u64)>,
+    /// Pools whose cached virtual reserves went stale: a liquidity-change
+    /// event arrived without a Swap, so sampled `liquidity`
+    /// changed invisibly (audit task 1.3). The caller must drop these from
+    /// its price cache; conservative cost is losing one pool's quotes until
+    /// its next Swap.
+    pub invalidated_keys: Vec<[u8; 32]>,
 }
 
 /// Incremental Swap-price sweep with **per-chunk high-water marks**.
@@ -798,7 +806,7 @@ pub struct RingSweepOutcome {
 ///
 /// Returns a [`TransportError`] on an empty filter or a transport/budget
 /// failure; already-covered progress is retained in `chunk_water`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn sweep_swap_prices_ring<B, S>(
     reader: &ChainReader<B, S>,
     profile: [u8; 2],
@@ -867,15 +875,47 @@ where
             // failure keeps every completed window's logs AND advances the
             // water mark through the last contiguously covered block, so
             // paid work is neither re-fetched nor skipped.
+            // Audit task 1.3: accept liquidity-change events alongside
+            // Swaps so a Mint/Burn without an intervening Swap still marks
+            // the pool's cached price stale instead of quoting reserves
+            // that silently changed.
+            let alternates: Vec<B256> = if profile == *b"v4" {
+                vec![provider::v4_modify_liquidity_topic()]
+            } else {
+                vec![provider::v3_mint_topic(), provider::v3_burn_topic()]
+            };
             let progress = reader.get_logs_with_progress(
                 &LogFilter {
                     from_block: from,
                     to_block: to_c,
                     addresses: addresses.clone(),
                     topic0: topic,
+                    topic0_alternates: alternates.clone(),
                 },
                 window,
             );
+            let liquidity_topics: HashSet<[u8; 32]> = alternates.iter().map(|t| t.0).collect();
+            // Pull liquidity-event keys out of the raw logs before swap
+            // ingestion ignores them.
+            let mut invalidated: Vec<[u8; 32]> = Vec::new();
+            for raw in &progress.logs {
+                let Ok(envelope) = RawLogEnvelope::from_rpc_value(raw) else {
+                    continue;
+                };
+                if envelope
+                    .topics
+                    .first()
+                    .is_some_and(|t| liquidity_topics.contains(&t.0))
+                {
+                    let key = if profile == *b"v4" {
+                        envelope.topics.get(1).map_or([0u8; 32], |t| t.0)
+                    } else {
+                        envelope.address.into_word().into()
+                    };
+                    invalidated.push(key);
+                }
+            }
+            outcome.invalidated_keys.extend(invalidated);
             ingest(
                 &progress.logs,
                 if profile == *b"v4" {
@@ -943,6 +983,7 @@ where
                     to_block: end,
                     addresses: vec![pool_manager],
                     topic0: topic,
+                    topic0_alternates: Vec::new(),
                 },
                 window,
             )?;
@@ -968,6 +1009,7 @@ where
                         to_block: end,
                         addresses,
                         topic0: topic,
+                        topic0_alternates: Vec::new(),
                     },
                     window,
                 )?;
