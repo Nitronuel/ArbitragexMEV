@@ -863,54 +863,37 @@ where
             } else {
                 chunk.iter().map(|e| e.venue).collect()
             };
-            let mut start = from;
-            let mut covered_through = water;
-            loop {
-                let end = start.saturating_add(window.saturating_sub(1)).min(to_c);
-                let logs = reader.get_logs_windowed(
-                    &LogFilter {
-                        from_block: start,
-                        to_block: end,
-                        addresses: addresses.clone(),
-                        topic0: topic,
-                    },
-                    window,
-                );
-                match logs {
-                    Ok(logs) => {
-                        ingest(
-                            &logs,
-                            if profile == *b"v4" {
-                                ids.as_ref()
-                            } else {
-                                None
-                            },
-                        );
-                        covered_through = end;
-                        if end == to_c {
-                            break;
-                        }
-                        start = end + 1;
-                    }
-                    Err(error) => {
-                        // Keep the windows that succeeded, retry the rest:
-                        // advance the water mark through the last covered
-                        // block and record those pools' coverage before
-                        // propagating.
-                        chunk_water[c] = covered_through;
-                        if covered_through >= from {
-                            outcome
-                                .covered_keys
-                                .extend(chunk.iter().map(|e| (pool_key(e), covered_through)));
-                        }
-                        return Err(error);
-                    }
-                }
+            // Audit B12/B13: progress-returning fetch — a mid-range
+            // failure keeps every completed window's logs AND advances the
+            // water mark through the last contiguously covered block, so
+            // paid work is neither re-fetched nor skipped.
+            let progress = reader.get_logs_with_progress(
+                &LogFilter {
+                    from_block: from,
+                    to_block: to_c,
+                    addresses: addresses.clone(),
+                    topic0: topic,
+                },
+                window,
+            );
+            ingest(
+                &progress.logs,
+                if profile == *b"v4" {
+                    ids.as_ref()
+                } else {
+                    None
+                },
+            );
+            let covered_through = progress.last_covered_block.max(water);
+            chunk_water[c] = covered_through;
+            if covered_through >= from {
+                outcome
+                    .covered_keys
+                    .extend(chunk.iter().map(|e| (pool_key(e), covered_through)));
             }
-            chunk_water[c] = to_c;
-            outcome
-                .covered_keys
-                .extend(chunk.iter().map(|e| (pool_key(e), to_c)));
+            if let Some(error) = progress.error {
+                return Err(error);
+            }
             if !request_delay.is_zero() {
                 std::thread::sleep(request_delay);
             }

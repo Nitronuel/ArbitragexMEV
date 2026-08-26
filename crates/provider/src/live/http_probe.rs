@@ -22,6 +22,8 @@ struct PollState {
     queue: VecDeque<RawLogEnvelope>,
     /// Highest block already fetched through (inclusive).
     high_water: u64,
+    /// Cumulative logs that arrived but failed to decode (audit B11).
+    decode_failures: u64,
     last_poll: Option<Instant>,
 }
 
@@ -52,6 +54,7 @@ impl<R: HttpBackend, S: Sleeper> LiveHttpProbe<R, S> {
             state: RefCell::new(PollState {
                 queue: VecDeque::new(),
                 high_water: start_block,
+                decode_failures: 0,
                 last_poll: None,
             }),
         }
@@ -70,19 +73,43 @@ impl<R: HttpBackend, S: Sleeper> LiveHttpProbe<R, S> {
             topic0: sync_topic(),
         };
         let values = self.reader.get_logs(&filter).map_err(to_stream)?;
-        let mut envelopes = Vec::with_capacity(values.len());
-        for value in values {
-            if let Ok(envelope) = RawLogEnvelope::from_rpc_value(&value) {
-                envelopes.push(envelope);
-            }
+        // Audit B11: undecodable logs previously vanished silently — 100%
+        // decode failure looked identical to "no activity", the worst
+        // failure mode to debug. Count both sides and escalate when every
+        // log in a non-empty response failed to decode.
+        let (envelopes, decode_failures) = decode_all(&values);
+        {
+            let mut state = self.state.borrow_mut();
+            state.decode_failures += decode_failures as u64;
+            state.high_water = latest;
         }
-        self.state.borrow_mut().high_water = latest;
+        if !values.is_empty() && envelopes.is_empty() {
+            return Err(StreamError::Decode(format!(
+                "all {} logs in window {}..{latest} failed to decode",
+                values.len(),
+                high_water + 1
+            )));
+        }
         if envelopes.is_empty() {
             return Ok(false);
         }
         self.state.borrow_mut().queue.extend(envelopes);
         Ok(true)
     }
+}
+
+/// Splits raw log values into decoded envelopes and a failure count
+/// (audit B11).
+fn decode_all(values: &[serde_json::Value]) -> (Vec<RawLogEnvelope>, usize) {
+    let mut envelopes = Vec::with_capacity(values.len());
+    let mut failures = 0usize;
+    for value in values {
+        match RawLogEnvelope::from_rpc_value(value) {
+            Ok(envelope) => envelopes.push(envelope),
+            Err(_) => failures += 1,
+        }
+    }
+    (envelopes, failures)
 }
 
 impl<R: HttpBackend, S: Sleeper> WsProbe for LiveHttpProbe<R, S> {

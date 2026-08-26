@@ -123,10 +123,24 @@ impl ProviderBudget {
     }
 }
 
+/// Local CU costs per JSON-RPC method (audit B16).
+///
+/// Re-based 2026-08-26 against the provider's published table: `eth_getLogs`
+/// was undercounted at 60 vs 75, and the `_ => 10` fallback priced every
+/// other method at the *cheapest* known value — getBalance/getStorageAt/
+/// getTransactionCount actually cost 19/17/26 — so real spend outran local
+/// accounting by up to 2.6×. The fallback is now the maximum known cost:
+/// unpriced methods fail closed instead of hiding spend.
 fn method_cost(method: &str) -> u64 {
     match method {
-        "eth_call" => 26,
-        "eth_getLogs" => 60,
-        _ => 10,
+        "eth_getBalance" => 19,
+        "eth_getStorageAt" => 17,
+        "eth_blockNumber" | "eth_gasPrice" | "eth_chainId" => 10,
+        // Reads sharing the mid-tier cost.
+        "eth_call" | "eth_getTransactionCount" | "eth_getBlockByNumber" => 26,
+        // `eth_getLogs` — and every unpriced method, fail closed (audit
+        // B16): unknown methods are priced at the most expensive known
+        // cost until measured.
+        _ => 75,
     }
 }

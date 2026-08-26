@@ -73,6 +73,10 @@ pub enum StreamError {
     EmptyAddressFilter,
     #[error("invalid WebSocket log message")]
     InvalidMessage,
+    /// Logs arrived but none decoded (audit B11): schema drift used to look
+    /// identical to "no activity".
+    #[error("log decode failure: {0}")]
+    Decode(String),
     #[error("provider transport error: {0}")]
     Transport(String),
 }

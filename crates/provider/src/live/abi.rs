@@ -53,8 +53,11 @@ pub fn decode_reserves(result: &Bytes) -> Option<(U256, U256)> {
         return None;
     }
     Some((
-        U256::from_be_slice(&result[..32]),
-        U256::from_be_slice(&result[32..64]),
+        // Audit B7: slices are already bounded to 32 bytes each here, but
+        // use the non-panicking constructor so a future slice change cannot
+        // abort the process on provider-controlled input.
+        U256::try_from_be_slice(&result[..32]).unwrap_or(U256::ZERO),
+        U256::try_from_be_slice(&result[32..64]).unwrap_or(U256::ZERO),
     ))
 }
 

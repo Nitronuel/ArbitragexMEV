@@ -58,7 +58,11 @@ impl HttpBackend for LiveHttp {
         let response_bytes = text.len();
         let value: Value =
             serde_json::from_str(&text).map_err(|_| TransportError::InvalidResponse)?;
-        if let Some(error) = value.get("error") {
+        // Audit B9: some gateways emit `"error": null` alongside a result;
+        // `get("error")` returns Some(&Null) and the request was previously
+        // misclassified Permanent with the baffling message
+        // "JSON-RPC error: null".
+        if let Some(error) = value.get("error").filter(|e| !e.is_null()) {
             if is_transient_json_rpc_error(error) {
                 return Err(TransportError::Transient(format!(
                     "JSON-RPC error: {error}"
@@ -83,26 +87,67 @@ impl HttpBackend for LiveHttp {
 /// condition that should be retried (a public gateway proxying to a busy,
 /// timed-out, or unreachable internal node), not a terminal application error.
 fn is_transient_json_rpc_error(error: &Value) -> bool {
+    // Audit B8: classify on the error CODE first — provider throttling is
+    // delivered as -32005 (or a 429-mapped code) with message text that the
+    // old substring list never matched, so pure rate-limiting was classified
+    // Permanent and aborted runs. Then fall back to message patterns
+    // covering both Alchemy and public-gateway phrasing.
+    const TRANSIENT_PATTERNS: [&str; 15] = [
+        "context deadline exceeded",
+        "timeout",
+        "timed out",
+        "overloaded",
+        "too many requests",
+        "connection refused",
+        "connection reset",
+        "dial tcp",
+        "eof",
+        // Audit B8 additions: provider throttle + gateway phrasing.
+        "capacity",
+        "rate limit",
+        "limit exceeded",
+        "try again",
+        "temporarily",
+        "unavailable",
+    ];
+    let code = error.get("code").and_then(Value::as_i64);
+    if code == Some(-32005) || code == Some(429) {
+        return true;
+    }
     let message = error
         .get("message")
         .and_then(|m| m.as_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    message.contains("context deadline exceeded")
-        || message.contains("timeout")
-        || message.contains("timed out")
-        || message.contains("overloaded")
-        || message.contains("too many requests")
-        || message.contains("connection refused")
-        || message.contains("connection reset")
-        || message.contains("dial tcp")
-        || message.contains("eof")
+    TRANSIENT_PATTERNS
+        .iter()
+        .any(|pattern| message.contains(pattern))
 }
 
 #[cfg(test)]
 mod tests {
     use super::is_transient_json_rpc_error;
     use serde_json::json;
+
+    #[test]
+    fn provider_throttle_codes_and_messages_are_transient() {
+        // Audit B8: Alchemy's compute-unit throttle arrives as -32005 with
+        // message text the old substring list never matched — it was
+        // classified Permanent and aborted runs on pure throttling.
+        assert!(is_transient_json_rpc_error(&json!({
+            "code": -32005,
+            "message": "Your app has exceeded its compute units per second capacity."
+        })));
+        assert!(is_transient_json_rpc_error(&json!({
+            "code": 429,
+            "message": "rate limit exceeded"
+        })));
+        // Public-gateway phrasing.
+        assert!(is_transient_json_rpc_error(&json!({
+            "code": -32000,
+            "message": "service temporarily unavailable"
+        })));
+    }
 
     #[test]
     fn timeout_json_rpc_error_is_transient() {
