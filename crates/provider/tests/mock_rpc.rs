@@ -144,6 +144,7 @@ fn chunks_logs_by_ten_blocks_with_explicit_filters() {
             to_block: 34,
             addresses: vec![address],
             topic0: sync_topic(),
+            topic0_alternates: Vec::new(),
         })
         .unwrap();
     let requests = requests.borrow();

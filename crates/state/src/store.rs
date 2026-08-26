@@ -275,9 +275,17 @@ impl StateMachine {
             }
             start = end + 1;
         }
-        logs.sort_by_key(|log| (log.position, !log.removed));
-        for log in logs {
-            self.apply_ordered(&log)?;
+        // Audit C8: per-position interleaving breaks multi-log reorgs -
+        // truncating at block N drops checkpoints above it, so a later
+        // removal at N+1 fails permanently and recovery never converges.
+        // Apply ALL removals in descending position order first (rolling
+        // back to the common ancestor), then all additions ascending.
+        let mut removals: Vec<_> = logs.iter().filter(|log| log.removed).collect();
+        removals.sort_by_key(|log| std::cmp::Reverse(log.position));
+        let mut additions: Vec<_> = logs.iter().filter(|log| !log.removed).collect();
+        additions.sort_by_key(|log| log.position);
+        for log in removals.iter().chain(additions.iter()) {
+            self.apply_ordered(log)?;
         }
 
         let reconciled: BTreeMap<_, _> = source
@@ -301,6 +309,13 @@ impl StateMachine {
         self.committed_block = Some(head);
         self.readiness = Readiness::Ready;
         Ok(())
+    }
+
+    /// Highest block such that every block at or below it is committed
+    /// (audit task 4.5 observability).
+    #[must_use]
+    pub fn committed_block(&self) -> Option<u64> {
+        self.committed_block
     }
 
     #[must_use]
@@ -359,17 +374,28 @@ impl StateMachine {
             log_index: log.position.log_index,
             version: StateVersion(self.next_version),
         };
+        // Audit C12: forget the prior removal of this exact log - otherwise
+        // a branch flip-flop (remove, re-apply, remove again) silently
+        // no-ops the second rollback and orphaned state survives as
+        // canonical with readiness Ready.
+        self.removed_seen
+            .remove(&(log.pool_id, log.position, log.block_hash));
         self.store.states[index] = Some(state.clone());
         self.store.checkpoints[index].push(Checkpoint {
             position: log.position,
             block_hash: log.block_hash,
             state,
         });
-        self.committed_block = Some(
-            self.committed_block
-                .unwrap_or_default()
-                .max(log.position.block_number),
-        );
+        // Audit C10: while Stale, applying must not advance the committed
+        // head - recover() starts from committed_block, so advancing past a
+        // stale window makes the gap unrequestable forever.
+        if matches!(self.readiness, Readiness::Ready) {
+            self.committed_block = Some(
+                self.committed_block
+                    .unwrap_or_default()
+                    .max(log.position.block_number),
+            );
+        }
         self.prune(index);
         Ok(ApplyOutcome::Applied)
     }
@@ -392,9 +418,15 @@ impl StateMachine {
         let rollback = self.store.checkpoints[index]
             .iter()
             .rposition(|checkpoint| checkpoint.position < log.position)
-            .ok_or(StateError::MissingRollbackCheckpoint {
-                pool_id: log.pool_id,
-                position: log.position,
+            .ok_or_else(|| {
+                // Audit C9: this path previously failed open - readiness
+                // stayed Ready while the rollback silently did not happen,
+                // so callers kept pricing against orphaned reserves.
+                self.mark_stale("rollback checkpoint outside retention");
+                StateError::MissingRollbackCheckpoint {
+                    pool_id: log.pool_id,
+                    position: log.position,
+                }
             })?;
         let restored = self.store.checkpoints[index][rollback].state.clone();
         self.store.checkpoints[index].truncate(rollback + 1);
@@ -407,6 +439,15 @@ impl StateMachine {
             ..restored
         });
         self.removed_seen.insert(removed_key);
+        // Audit C10: the rolled-back window is precisely what a recovery
+        // must re-fetch; leaving committed_block above it made the gap
+        // permanently unrequestable.
+        self.committed_block = Some(
+            self.committed_block
+                .map_or(restored.block_number, |committed| {
+                    committed.min(restored.block_number)
+                }),
+        );
         Ok(ApplyOutcome::RolledBack)
     }
 
