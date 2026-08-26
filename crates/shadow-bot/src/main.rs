@@ -2284,8 +2284,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         // One line per gate-passing row, carrying the pair identity: this is
         // what watch-gates.sh parses into capture files, so verify-capture
         // can re-quote the recorded opportunity instead of an arbitrary pair.
-        for (_pair, (quote, classification)) in
-            outcome.evaluated.iter().zip(&outcome.pair_results)
+        for (_pair, (quote, classification)) in outcome.evaluated.iter().zip(&outcome.pair_results)
         {
             if matches!(classification.reason, ClassificationReason::AboveThreshold) {
                 // Print the quote's CHOSEN anchor (task 0.6), which need not
@@ -2362,7 +2361,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             // A CSV I/O failure must not kill the whole 24h window: log it
             // once and disable further CSV output, keeping the poller alive.
             let mut write_all = || -> std::io::Result<()> {
-                for (pair, (quote, classification)) in
+                for (_pair, (quote, classification)) in
                     outcome.evaluated.iter().zip(&outcome.pair_results)
                 {
                     let lo = quote.token_lo;
