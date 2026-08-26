@@ -2586,8 +2586,10 @@ fn merged_probe_stats(slots: &[WsProbeSlot]) -> ws_probe::ProbeStats {
 }
 
 fn resolve_probe_endpoints() -> Result<(RedactedUrl, RedactedUrl), String> {
-    let ws_endpoint = resolve_env_url("ALCHEMY_RHC_WS_URL", "ROBINHOOD_WS_RPC_URL")?;
-    let http_endpoint = resolve_env_url("ALCHEMY_RHC_HTTP_URL", "ROBINHOOD_HTTP_RPC_URL")?;
+    // Audit task 4.11 endpoint split: public RHC is the documented default;
+    // Alchemy is the opt-in override for archive-heavy work.
+    let ws_endpoint = resolve_env_url("ROBINHOOD_WS_RPC_URL", "ALCHEMY_RHC_WS_URL")?;
+    let http_endpoint = resolve_env_url("ROBINHOOD_HTTP_RPC_URL", "ALCHEMY_RHC_HTTP_URL")?;
     let ws_url = ws_endpoint
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;

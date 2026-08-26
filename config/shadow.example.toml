@@ -12,3 +12,10 @@ request_cu_ceiling = 24000000
 websocket_bytes_ceiling = 5000000000
 database_limit_bytes = 10000000000
 manifest_path = "data/pools-rhc.csv"
+# Endpoint split (audit task 4.11): the public RHC endpoint is the default
+# for all polling, sweeps and enumeration; it is rate-limited but free.
+# Set ALCHEMY_RHC_HTTP_URL (and WSS if ever needed) only when a command
+# needs archive-depth reads — old-capture verification, quoter calls,
+# fork-simulation storage. Continuous polling on Alchemy would cost
+# ~73M CU/month against a 30M free tier; see audit Part VI.0/VI.1 and
+# task 4.11 for the routing rule.
