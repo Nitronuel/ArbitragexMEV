@@ -142,6 +142,27 @@ impl ShadowConfig {
                 if !(2..=4).contains(&self.max_hops) {
                     return Err(ConfigError::InvalidMaxHops(self.max_hops));
                 }
+                if self.pool_cap == 0 {
+                    return Err(ConfigError::InvalidPoolCap(self.pool_cap));
+                }
+                if self.stale_timeout_seconds == 0 {
+                    return Err(ConfigError::InvalidStaleTimeout(self.stale_timeout_seconds));
+                }
+                if self.recovery_gap_blocks == 0 {
+                    return Err(ConfigError::InvalidRecoveryGap(self.recovery_gap_blocks));
+                }
+                if self.request_cu_ceiling == 0 {
+                    return Err(ConfigError::InvalidRequestCuCeiling(self.request_cu_ceiling));
+                }
+                if self.websocket_bytes_ceiling == 0 {
+                    return Err(ConfigError::InvalidWebsocketBytesCeiling(
+                        self.websocket_bytes_ceiling,
+                    ));
+                }
+                if self.database_limit_bytes == 0 {
+                    return Err(ConfigError::InvalidDatabaseLimit(self.database_limit_bytes));
+                }
+                // dirty_lag_milliseconds may be zero (no lag) — allowed.
                 Ok(chain)
             })
     }
@@ -169,6 +190,18 @@ pub enum ConfigError {
     InvalidChainId(u64),
     #[error("max_hops must be in 2..=4, got {0}")]
     InvalidMaxHops(u8),
+    #[error("pool_cap must be > 0, got {0}")]
+    InvalidPoolCap(u32),
+    #[error("stale_timeout_seconds must be > 0, got {0}")]
+    InvalidStaleTimeout(u64),
+    #[error("recovery_gap_blocks must be > 0, got {0}")]
+    InvalidRecoveryGap(u64),
+    #[error("request_cu_ceiling must be > 0, got {0}")]
+    InvalidRequestCuCeiling(u64),
+    #[error("websocket_bytes_ceiling must be > 0, got {0}")]
+    InvalidWebsocketBytesCeiling(u64),
+    #[error("database_limit_bytes must be > 0, got {0}")]
+    InvalidDatabaseLimit(u64),
     #[error("{variable} is not a valid URL: {source}")]
     InvalidUrl {
         variable: &'static str,

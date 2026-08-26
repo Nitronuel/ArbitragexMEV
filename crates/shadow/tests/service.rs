@@ -12,6 +12,7 @@ use tempfile::TempDir;
 const LIMITS: CycleLimits = CycleLimits {
     max_cycles: 1_000,
     max_cycles_per_pool: 1_000,
+    max_hops: 4,
 };
 
 fn economics() -> Economics {

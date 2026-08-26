@@ -33,6 +33,7 @@ const QUEUE_CAPACITY: usize = 100_000;
 const CYCLE_LIMITS: CycleLimits = CycleLimits {
     max_cycles: 1_000_000,
     max_cycles_per_pool: 10_000,
+    max_hops: 4,
 };
 
 use shadow::gate_defaults::{
@@ -3177,7 +3178,11 @@ fn run_snapshot_command(
         reference,
         db,
         QUEUE_CAPACITY,
-        CYCLE_LIMITS,
+        CycleLimits {
+            max_cycles: CYCLE_LIMITS.max_cycles,
+            max_cycles_per_pool: CYCLE_LIMITS.max_cycles_per_pool,
+            max_hops: config.max_hops,
+        },
         config.request_cu_ceiling,
         config.websocket_bytes_ceiling,
     )
@@ -3268,7 +3273,11 @@ fn run_live_command(
         reference,
         db,
         QUEUE_CAPACITY,
-        CYCLE_LIMITS,
+        CycleLimits {
+            max_cycles: CYCLE_LIMITS.max_cycles,
+            max_cycles_per_pool: CYCLE_LIMITS.max_cycles_per_pool,
+            max_hops: config.max_hops,
+        },
         config.request_cu_ceiling,
         config.websocket_bytes_ceiling,
     )

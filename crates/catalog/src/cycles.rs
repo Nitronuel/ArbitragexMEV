@@ -16,6 +16,7 @@ use crate::{
 pub struct CycleLimits {
     pub max_cycles: usize,
     pub max_cycles_per_pool: usize,
+    pub max_hops: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +120,7 @@ fn walk(
             path.pop();
             continue;
         }
-        if path.len() == 3 || !used_tokens.insert(edge.token_out) {
+        if path.len() + 1 >= usize::from(limits.max_hops) || !used_tokens.insert(edge.token_out) {
             continue;
         }
         used_pools.insert(edge.pool_id);

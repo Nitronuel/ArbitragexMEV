@@ -420,7 +420,8 @@ mod tests {
             ::catalog::CycleLimits {
                 max_cycles: 1_000_000,
                 max_cycles_per_pool: 10_000,
-            },
+                            max_hops: 4,
+},
             1_000_000,
             1_000_000,
         )
