@@ -268,6 +268,7 @@ mod tests {
             transaction_index: 0,
             log_index: 0,
             removed: false,
+            block_hash: B256::ZERO,
         }
     }
 

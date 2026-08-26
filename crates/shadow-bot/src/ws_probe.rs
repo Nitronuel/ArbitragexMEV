@@ -484,6 +484,7 @@ mod tests {
             transaction_index: tx,
             log_index: log,
             removed: false,
+            block_hash: alloy_primitives::B256::ZERO,
         };
         let mut deduper = LogDeduper::new();
         assert!(!deduper.is_duplicate(&envelope(100, 1, 2)));

@@ -247,7 +247,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    use alloy_primitives::{Address, Bytes, U256};
+    use alloy_primitives::{Address, B256, Bytes, U256};
     use catalog::{CatalogRpc, RpcError};
 
     use super::run_live;
@@ -365,6 +365,7 @@ mod tests {
             transaction_index: 0,
             log_index,
             removed: false,
+            block_hash: B256::ZERO,
         })
     }
 
@@ -410,7 +411,6 @@ mod tests {
             Duration::from_millis(1),
             stop,
             max_items,
-            alloy_primitives::B256::ZERO,
             &mut probe,
             1_700_000_000_000,
             economics(),
@@ -471,6 +471,7 @@ mod tests {
             transaction_index: 0,
             log_index: 0,
             removed: false,
+            block_hash: B256::ZERO,
         };
         envelope.address = Address::repeat_byte(0x99);
         let stop = AtomicBool::new(true);
