@@ -887,13 +887,13 @@ mod tests {
     fn valid_reference() -> CostSnapshot {
         // Gas price chosen so PAIR_EXECUTION_GAS_UNITS costs exactly the
         // historical $0.03 scalar under the route-shaped model:
-        // 300_000 units x 1e29 wei x $1 / 1e36 = 3e16 ($0.03).
+        // 300_000 units x 1e11 wei = 3e16 ETH-wei; x $1 / 1e18 -> 3e16.
         CostSnapshot {
             usd_per_token: U256::from(WEI),
             gas_price_age_valid: true,
             reference_price_valid: true,
 
-            gas_price_wei: U256::from(100_000_000_000_000_000_000_000_000_000_u128),
+            gas_price_wei: U256::from(100_000_000_000_u128),
         }
     }
 

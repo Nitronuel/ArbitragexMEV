@@ -2284,14 +2284,18 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         // One line per gate-passing row, carrying the pair identity: this is
         // what watch-gates.sh parses into capture files, so verify-capture
         // can re-quote the recorded opportunity instead of an arbitrary pair.
-        for (pair, (_quote, classification)) in outcome.evaluated.iter().zip(&outcome.pair_results)
+        for (_pair, (quote, classification)) in
+            outcome.evaluated.iter().zip(&outcome.pair_results)
         {
             if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+                // Print the quote's CHOSEN anchor (task 0.6), which need not
+                // match canonical pair order.
                 println!(
-                    "run-pairs: GATED pair token_lo={} token_hi={} net_usd={} floor_ratio={:.4}",
-                    Address::from_slice(&pair.0),
-                    Address::from_slice(&pair.1),
+                    "run-pairs: GATED pair token_lo={} token_hi={} net_usd={} threshold_usd={} floor_ratio={:.4}",
+                    quote.token_lo,
+                    quote.token_hi,
                     classification.estimated_net_profit_usd,
+                    classification.threshold_usd,
                     floor_ratio(
                         classification.estimated_net_profit_usd,
                         classification.threshold_usd
@@ -2361,8 +2365,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                 for (pair, (quote, classification)) in
                     outcome.evaluated.iter().zip(&outcome.pair_results)
                 {
-                    let lo = alloy_primitives::Address::from_slice(&pair.0);
-                    let hi = alloy_primitives::Address::from_slice(&pair.1);
+                    let lo = quote.token_lo;
+                    let hi = quote.token_hi;
                     writeln!(
                         out,
                         "pair,{lo},{hi},{latest},{input},{output},{profit},{log2_skew:.6},{gross},{net},{shortfall},{threshold},{floor:.4},{unclamped},{capacity},{reason_code},{reason_detail},{priced}",

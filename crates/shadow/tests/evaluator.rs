@@ -426,7 +426,7 @@ fn classify_route_derives_gas_from_live_price_and_shape() {
         usd_per_token: U256::from(WEI),
         gas_price_age_valid: true,
         reference_price_valid: true,
-        gas_price_wei: U256::from(100_000_000_000_000_000_000_000_000_000_u128),
+        gas_price_wei: U256::from(100_000_000_000_u128),
     };
     let quote = OptimalQuote {
         input: U256::from(WEI / 10), // 0.1 tokens borrowed (flash fee zero)
@@ -512,8 +512,8 @@ fn classify_route_charges_the_da_fee_and_reports_shortfall() {
         usd_per_token: U256::from(WEI),
         gas_price_age_valid: true,
         reference_price_valid: true,
-        // Pair gas becomes exactly $0.10: 300k x 1e30 x $1 / 1e36.
-        gas_price_wei: U256::from(1_000_000_000_000_000_000_000_000_000_000_u128),
+        // Pair gas becomes exactly $0.10: 300k x 3.33e11 wei = 1e17 ETH-wei.
+        gas_price_wei: U256::from(333_333_333_333_u128),
     };
     // Gross $0.10 against $0.10 gas + $2 DA -> unprofitable by the DA term.
     let quote = OptimalQuote {

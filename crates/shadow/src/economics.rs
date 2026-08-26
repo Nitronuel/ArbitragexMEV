@@ -262,11 +262,14 @@ impl Economics {
             return not_evaluated(quote, "native or gas price unset; gas cost unknown");
         }
 
-        // units × wei × (usd/native) / scale² → USD fixed-point.
+        // `units × wei` is an ETH-wei cost; one scale division converts it
+        // to USD fixed-point via the native price. (A previous draft divided
+        // by scale², flooring every real gas price to zero and silently
+        // gating at free gas.)
         let Some(gas_cost_usd) = U256::from(gas_units)
             .checked_mul(snapshot.gas_price_wei)
             .and_then(|v| v.checked_mul(self.native_token_usd))
-            .and_then(|v| v.checked_div(scale.checked_mul(scale).unwrap_or(U256::MAX)))
+            .and_then(|v| v.checked_div(scale))
         else {
             return not_evaluated(quote, "gas cost conversion overflow");
         };
