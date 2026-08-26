@@ -872,6 +872,7 @@ mod tests {
             sqrt,
             liquidity: U256::from(liquidity),
             block,
+            observed_fee: None,
         }
     }
 

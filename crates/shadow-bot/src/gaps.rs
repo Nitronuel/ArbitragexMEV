@@ -91,6 +91,35 @@ pub fn leg_toll(fee: u32, fee_denominator: u32, profile: [u8; 2]) -> Option<f64>
     Some(toll)
 }
 
+/// Toll for one priced pool: the catalog fee when quotable, else the
+/// **observed** fee from the pool's most recent V4 swap (audit task 3.1).
+///
+/// This is what re-admits the ~101k dynamic/zero-fee v4 pools that
+/// `leg_toll` alone excludes: their hooks set the fee per swap, and every
+/// swap event reports the fee actually charged. The observation rides in
+/// [`PoolPrice`], so the same staleness screens that bound prices bound it;
+/// a hook can still change the fee between swaps, so any submission built
+/// on an observed fee must pass simulation first (Phase 2).
+///
+/// `None` = unquotable (no catalog fee AND no observed fee).
+#[must_use]
+pub fn effective_leg_toll(entry: &PoolEntry, price: &PoolPrice) -> Option<f64> {
+    match leg_toll(entry.fee, entry.fee_denominator, entry.profile) {
+        Some(toll) => Some(toll),
+        None if entry.profile == *b"v4" => {
+            let observed = f64::from(price.observed_fee?);
+            let denominator = f64::from(entry.fee_denominator.max(1));
+            let toll = observed / denominator;
+            if observed <= 0.0 || toll > MAX_QUOTABLE_FEE {
+                None
+            } else {
+                Some(toll)
+            }
+        }
+        None => None,
+    }
+}
+
 /// One enumerated pool kept in a form the measurement can price and toll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolEntry {
@@ -530,6 +559,13 @@ pub struct PoolPrice {
     /// be reduced to virtual constant-product reserves at the sampled price.
     pub liquidity: U256,
     pub block: u64,
+    /// Fee actually charged by the pool's most recent V4 swap (audit task
+    /// 3.1). `None` for v3 rows and for v4 rows whose swap predates the
+    /// field. Lets dynamic/zero-fee v4 pools re-enter quoting with an
+    /// observed toll instead of being excluded wholesale — subject to the
+    /// same age screens as the price, and to simulation confirmation before
+    /// any submission (a hook can change the fee between swaps).
+    pub observed_fee: Option<u32>,
 }
 
 /// Sweeps `Swap` events for a bounded set of pool keys over one inclusive
@@ -728,16 +764,23 @@ fn swap_price_ingest(
                     decode_v3_swap(&envelope).map(|s| (s.sqrt_price_x96, s.liquidity)),
                 )
             };
+            let observed_fee = if profile == *b"v4" {
+                decode_v4_swap(&envelope).map(|swap| swap.fee)
+            } else {
+                None
+            };
             if let (Some(key), Some((sqrt, liquidity))) = (key, parsed) {
                 let entry = latest.entry(key).or_insert(PoolPrice {
                     sqrt,
                     liquidity,
                     block: 0,
+                    observed_fee: None,
                 });
                 if envelope.block_number >= entry.block {
                     entry.sqrt = sqrt;
                     entry.liquidity = liquidity;
                     entry.block = envelope.block_number;
+                    entry.observed_fee = observed_fee;
                 }
             }
         }
@@ -990,6 +1033,9 @@ where
                 sqrt,
                 liquidity,
                 block: u64::MAX,
+                // slot0 carries no fee; a dynamic pool refreshed here stays
+                // excluded from tolling until its next Swap re-observes one.
+                observed_fee: None,
             },
         );
     }
@@ -1314,7 +1360,10 @@ pub fn gap_rankings(
                     continue;
                 };
                 let k = pair_key(entry.token0, entry.token1);
-                let Some(toll) = leg_toll(entry.fee, entry.fee_denominator, entry.profile) else {
+                // Task 3.1: priced v4 dynamic-fee pools re-enter via their
+                // observed swap fee.
+                let Some(toll) = effective_leg_toll(entry, prices.get(&pool_key(entry)).unwrap())
+                else {
                     continue;
                 };
                 // Orient each pool's price into the canonical pair direction
@@ -1768,7 +1817,10 @@ pub fn quote_pair_anchored(
             let Some(price) = prices.get(&pool_key(entry)) else {
                 continue;
             };
-            let Some(toll) = leg_toll(entry.fee, entry.fee_denominator, entry.profile) else {
+            // Task 3.1: priced v4 dynamic-fee pools re-enter via their
+            // observed swap fee.
+            let Some(toll) = effective_leg_toll(entry, prices.get(&pool_key(entry)).unwrap())
+            else {
                 continue;
             };
             if best.as_ref().is_none_or(|(_, _, t)| toll < *t) {
@@ -1965,10 +2017,11 @@ fn cheapest_leg_in(
     let mut best: Option<(CycleLeg, f64)> = None;
     for (entries, prices) in [(a_pools, prices_a), (b_pools, prices_b)] {
         for entry in entries {
-            let Some(toll) = leg_toll(entry.fee, entry.fee_denominator, entry.profile) else {
+            let Some(price) = prices.get(&pool_key(entry)) else {
                 continue;
             };
-            let Some(price) = prices.get(&pool_key(entry)) else {
+            // Task 3.1: priced v4 dynamic-fee pools re-enter via observed fee.
+            let Some(toll) = effective_leg_toll(entry, price) else {
                 continue;
             };
             if best.as_ref().is_none_or(|(_, t)| toll < *t) {
@@ -2104,7 +2157,8 @@ pub fn quote_triangle(
     // priced fee-free (`unwrap_or(0.0)` here was a fail-open default in a
     // cost path).
     let keep = |leg: &CycleLeg| -> Result<f64, String> {
-        leg_toll(leg.entry.fee, leg.entry.fee_denominator, leg.entry.profile)
+        // Task 3.1: observed-fee fallback for v4 dynamic pools.
+        effective_leg_toll(&leg.entry, &leg.price)
             .map(|toll| 1.0 - toll)
             .ok_or_else(|| "triangle edge has no quotable toll".to_owned())
     };
@@ -2272,6 +2326,50 @@ mod tests {
     }
 
     #[test]
+    fn effective_leg_toll_readmits_v4_dynamic_pools_via_observed_fee() {
+        // Audit task 3.1 / S6: dynamic-fee v4 pools (~101k rows) were
+        // excluded wholesale even though every swap event reports the fee
+        // actually charged.
+        let mut entry = catalog_entry(*b"v4", Address::repeat_byte(1), [7u8; 32]);
+        entry.fee = V4_DYNAMIC_FEE_FLAG; // hook-set fee sentinel
+        entry.fee_denominator = 1_000_000;
+        let mut price = PoolPrice {
+            sqrt: U256::from(1u64) << 96,
+            liquidity: U256::from(1u64),
+            block: 1,
+            observed_fee: None,
+        };
+        assert_eq!(
+            effective_leg_toll(&entry, &price),
+            None,
+            "no observation yet: still excluded"
+        );
+
+        // Observed 30 bps -> quotable at exactly that toll.
+        price.observed_fee = Some(3_000);
+        let toll = effective_leg_toll(&entry, &price).expect("observed");
+        assert!((toll - 0.003).abs() < 1e-9);
+
+        // Observed zero means the hook charged nothing — legitimate free leg.
+        price.observed_fee = Some(0);
+        assert_eq!(
+            effective_leg_toll(&entry, &price),
+            None,
+            "free pools stay excluded from toll math but are not errors"
+        );
+
+        // Absurd observed fee stays rejected by the band.
+        price.observed_fee = Some(900_000);
+        assert_eq!(effective_leg_toll(&entry, &price), None);
+
+        // Canonical catalog fees still take the legacy path untouched.
+        entry.profile = *b"v3";
+        entry.fee = 3_000;
+        entry.fee_denominator = 1_000_000;
+        assert_eq!(effective_leg_toll(&entry, &price), Some(0.003));
+    }
+
+    #[test]
     fn leg_toll_handles_dynamic_sentinels() {
         assert_eq!(leg_toll(10_000, 1_000_000, *b"v3"), Some(0.01));
         assert_eq!(leg_toll(50, 1_000_000, *b"v3"), Some(0.00005));
@@ -2288,6 +2386,7 @@ mod tests {
             sqrt,
             liquidity: U256::from(1_000_000_u64),
             block: 1,
+            observed_fee: None,
         };
         let lo: Address = "0x1000000000000000000000000000000000000000"
             .parse()
@@ -2605,6 +2704,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 97,
                 liquidity: U256::from(1_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         let mut pb = HashMap::new();
@@ -2614,6 +2714,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 98,
                 liquidity: U256::from(1_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         let summary = gap_distribution(&a_entries, &b_entries, &pa, &pb);
@@ -2672,6 +2773,7 @@ mod tests {
                 sqrt: U256::from(2u64.pow(48) << 1),
                 liquidity: U256::from(1_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         // The v4 pool quotes (b, a): the same 4.0 canonical price of a/b
@@ -2684,6 +2786,7 @@ mod tests {
                 sqrt: U256::from(1u64 << 47),
                 liquidity: U256::from(1_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         let summary = gap_distribution(&a_entries, &b_entries, &pa, &pb);
@@ -2974,6 +3077,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 97,
                 liquidity: U256::from(1_000_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         let mut pb = HashMap::new();
@@ -2983,6 +3087,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 98,
                 liquidity: U256::from(1_000_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
 
@@ -3041,6 +3146,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 97,
                 liquidity: U256::from(1_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         assert!(quote_pair(&a_entries, &b_entries, &pa, &pb).is_err());
@@ -3090,6 +3196,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 97,
                 liquidity: U256::from(1_000_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         let mut pb = HashMap::new();
@@ -3099,6 +3206,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 98,
                 liquidity: U256::from(1_000_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
 
@@ -3153,6 +3261,7 @@ mod tests {
                     sqrt: U256::from(1u64) << 97,
                     liquidity: U256::from(1_000_000_000u64),
                     block: 1,
+                    observed_fee: None,
                 },
             );
         }
@@ -3163,6 +3272,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 98,
                 liquidity: U256::from(1_000_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
 
@@ -3225,6 +3335,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 97,
                 liquidity: U256::from(1_000_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         let mut pb = HashMap::new();
@@ -3234,6 +3345,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 98,
                 liquidity: U256::from(1_000_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
 
@@ -3267,6 +3379,7 @@ mod tests {
                 sqrt,
                 liquidity,
                 block: 1,
+                observed_fee: None,
             },
         );
         prices
@@ -3351,6 +3464,7 @@ mod tests {
                 sqrt: two_96,
                 liquidity: U256::from(1_000_000_000_000_u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         priced.insert(
@@ -3359,6 +3473,7 @@ mod tests {
                 sqrt: two_96.checked_mul(U256::from(1_000_000_u64)).unwrap(),
                 liquidity: U256::from(1_000_000_000_000_u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         let out = derive_usd_prices(&[], &[e6, e18], &HashMap::new(), &priced);
@@ -3389,6 +3504,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 97,
                 liquidity: U256::from(1_000_000_000_000_u64),
                 block: 7,
+                observed_fee: None,
             },
         );
         // Same price both venues: zero skew, but a cross-venue round trip
@@ -3402,6 +3518,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 96,
                 liquidity: U256::from(1_000_000_000_000_u64),
                 block: 7,
+                observed_fee: None,
             },
         );
         let ledger = verify_capture_ledger(
@@ -3502,6 +3619,7 @@ mod tests {
                     sqrt: U256::from(1u64) << 97,
                     liquidity,
                     block: 1,
+                    observed_fee: None,
                 },
             );
         }
@@ -3551,6 +3669,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 97,
                 liquidity: U256::from(1_000_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
         priced.insert(
@@ -3559,6 +3678,7 @@ mod tests {
                 sqrt: U256::from(1u64) << 98,
                 liquidity: U256::from(1_000_000_000u64),
                 block: 1,
+                observed_fee: None,
             },
         );
 
