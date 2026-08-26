@@ -291,6 +291,56 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
     ///
     /// Returns an error for transport, budget, or malformed-response
     /// failures.
+    /// Reads a V3/V4 pool's `slot0()` — `(sqrtPriceX96, tick, ...)` packed
+    /// return — returning the price root and tick (audit task 1.3 refresh).
+    ///
+    /// Selector `0x3850c7bd`; verified working against live RHC pools.
+    ///
+    /// # Errors
+    ///
+    /// Transport, budget, or malformed-response failures.
+    pub fn pool_slot0(&self, pool: Address) -> Result<(U256, i32), TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_call".to_owned(),
+            params: json!([{"to": address_hex(pool), "data": "0x3850c7bd"}, "latest"]),
+        })?;
+        let raw = result_bytes(&response.result)?;
+        if raw.len() < 64 {
+            return Err(TransportError::InvalidResponse);
+        }
+        let sqrt = U256::try_from_be_slice(&raw[..32]).ok_or(TransportError::InvalidResponse)?;
+        // int24 occupies the low 3 bytes of the word (right-aligned,
+        // big-endian); sign-extend the top bit of byte 31's high nibble.
+        let b29 = raw[61];
+        let b30 = raw[62];
+        let b31 = raw[63];
+        if raw[60] != 0 || raw[59] != 0 || raw[58] != 0 {
+            return Err(TransportError::InvalidResponse);
+        }
+        let sign = if b29 & 0x80 != 0 { 0xff_u8 } else { 0x00_u8 };
+        let tick = i32::from_be_bytes([sign, b29, b30, b31]);
+        Ok((sqrt, tick))
+    }
+
+    /// Reads a V3/V4 pool's in-range `liquidity()` (selector `0x1a686502`).
+    ///
+    /// # Errors
+    ///
+    /// Transport, budget, or malformed-response failures.
+    /// # Errors
+    ///
+    /// Transport, budget, or malformed-response failures.
+    pub fn pool_liquidity(&self, pool: Address) -> Result<U256, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_call".to_owned(),
+            params: json!([{"to": address_hex(pool), "data": "0x1a686502"}, "latest"]),
+        })?;
+        quantity_u256(&response.result)
+    }
+
+    /// # Errors
+    ///
+    /// Transport, budget, or malformed-response failures.
     pub fn gas_price(&self) -> Result<U256, TransportError> {
         let response = self.execute(&RpcRequest {
             method: "eth_gasPrice".to_owned(),

@@ -950,6 +950,52 @@ where
 ///
 /// # Errors
 ///
+/// Refetches fresh `slot0`/`liquidity` for pools invalidated by a
+/// liquidity-change event (audit task 1.3 completion): instead of pausing
+/// quotes until the pool's next Swap, one eth_call pair restores the cache
+/// immediately. Returns only pools that refreshed successfully; failures
+/// simply stay paused.
+///
+/// Bounded by `max_refetch` so a liquidity-change storm cannot dominate
+/// poll CU spend. `block` is stamped as [`u64::MAX`] — the freshest possible
+/// observation, immune to age screens.
+#[allow(clippy::doc_markdown)]
+pub fn refetch_invalidated_prices<B, S>(
+    reader: &ChainReader<B, S>,
+    entries: &[PoolEntry],
+    keys: &[[u8; 32]],
+    max_refetch: usize,
+) -> HashMap<[u8; 32], PoolPrice>
+where
+    B: HttpBackend,
+    S: Sleeper,
+{
+    let mut refreshed = HashMap::new();
+    for key in keys.iter().take(max_refetch) {
+        let Some(entry) = entries.iter().find(|e| pool_key(e) == *key) else {
+            continue;
+        };
+        let (Ok((sqrt, _tick)), Ok(liquidity)) = (
+            reader.pool_slot0(entry.venue),
+            reader.pool_liquidity(entry.venue),
+        ) else {
+            continue;
+        };
+        if sqrt.is_zero() || liquidity.is_zero() {
+            continue;
+        }
+        refreshed.insert(
+            *key,
+            PoolPrice {
+                sqrt,
+                liquidity,
+                block: u64::MAX,
+            },
+        );
+    }
+    refreshed
+}
+
 /// Returns a [`TransportError`] on an empty filter or a transport/budget
 /// failure.
 #[allow(clippy::too_many_arguments)]

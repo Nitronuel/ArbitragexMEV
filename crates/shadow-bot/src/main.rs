@@ -513,6 +513,10 @@ enum Command {
         /// different values; month-to-date persistence lands with task 4.3.
         #[arg(long, default_value_t = 8_000_000)]
         request_cu_ceiling: u64,
+        /// Per-poll cap on slot0/liquidity refreshes for pools invalidated
+        /// by Mint/Burn (audit task 1.3 completion); overflow stays paused.
+        #[arg(long, default_value_t = 50)]
+        max_price_refreshes: usize,
         /// Maximum `|log2 skew|` a quote may carry and still be gated.
         /// Larger gaps come from degenerate near-empty pools that are not
         /// captureable; they are screened out instead of surfacing as
@@ -781,6 +785,7 @@ fn main() {
             native_usd,
             gas_price_max_age_secs,
             request_cu_ceiling,
+            max_price_refreshes,
             max_skew,
             flash_provider,
             flash_support,
@@ -808,6 +813,7 @@ fn main() {
             native_usd,
             gas_price_max_age_secs,
             request_cu_ceiling,
+            max_price_refreshes,
             max_skew,
             flash_provider: &flash_provider,
             flash_support: flash_support.as_deref(),
@@ -1987,6 +1993,8 @@ struct RunPairsArgs<'a> {
     gas_price_max_age_secs: u64,
     /// Request-CU ceiling for this invocation.
     request_cu_ceiling: u64,
+    /// Per-poll cap on invalidated-price refreshes.
+    max_price_refreshes: usize,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -2237,6 +2245,23 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         applied = applied.saturating_add(applied_this as u64);
         evaluator.invalidate_prices(profile_bytes_a, &sweep_a.invalidated_keys);
         evaluator.invalidate_prices(profile_bytes_b, &sweep_b.invalidated_keys);
+        // Task 1.3 completion: immediately restore invalidated pools from a
+        // fresh slot0/liquidity eth_call pair instead of pausing them until
+        // their next Swap. Capped per poll; overflow stays paused.
+        let refreshed_a = gaps::refetch_invalidated_prices(
+            &reader,
+            &a_entries,
+            &sweep_a.invalidated_keys,
+            args.max_price_refreshes,
+        );
+        let refreshed_b = gaps::refetch_invalidated_prices(
+            &reader,
+            &b_entries,
+            &sweep_b.invalidated_keys,
+            args.max_price_refreshes,
+        );
+        evaluator.seed_prices(profile_bytes_a, &a_entries, &refreshed_a)?;
+        evaluator.seed_prices(profile_bytes_b, &b_entries, &refreshed_b)?;
         evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;
         evaluator.seed_prices(profile_bytes_b, &b_entries, &priced_b)?;
         // Stamp sweep coverage *after* both sweeps succeeded. The ring
