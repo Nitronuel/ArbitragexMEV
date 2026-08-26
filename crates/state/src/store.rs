@@ -265,8 +265,14 @@ impl StateMachine {
             return Err(StateError::RecoveryGap { gap });
         }
 
+        // Audit C7: reorgs by definition invalidate blocks AT or BELOW the
+        // committed head; starting the fetch at `committed` made them
+        // permanently unrepairable. Reach one retention window down —
+        // replaying already-known logs is harmless (Duplicate/IgnoredOld),
+        // and removals-first ordering (C8) handles the branch switch.
+        let backfill_from = committed.saturating_sub(RECOVERY_LOOKBACK_BLOCKS);
         let mut logs = Vec::new();
-        let mut start = committed;
+        let mut start = backfill_from;
         loop {
             let end = start.saturating_add(9).min(head);
             logs.extend(source.logs(start, end)?);
@@ -302,8 +308,20 @@ impl StateMachine {
                 .as_ref()
                 .ok_or(StateError::UnknownPool(pool_id))?;
             if (actual.reserve0, actual.reserve1) != *expected {
-                self.mark_stale("reserve reconciliation mismatch");
-                return Err(StateError::ReconciliationMismatch(pool_id));
+                // Audit C11: the pinned-head reserves ARE the authority.
+                // Previously they were discarded and the mismatch returned,
+                // leaving no path back to Ready. Re-bootstrap from the
+                // fetched truth: checkpoints collapse to one synthetic at
+                // `head`, stale-branch history is dropped wholesale, and the
+                // removed-seen set clears with it.
+                let states: Vec<(PoolId, U256, U256)> = reconciled
+                    .iter()
+                    .map(|(pool_id, (r0, r1))| (*pool_id, *r0, *r1))
+                    .collect();
+                self.removed_seen.clear();
+                self.buffered.clear();
+                self.bootstrap(head, states)?;
+                return Ok(());
             }
         }
         self.committed_block = Some(head);
@@ -332,6 +350,12 @@ impl StateMachine {
             .unwrap_or_default()
     }
 }
+
+/// How far below the committed head a recovery backfill reaches (audit
+/// C7): reorgs invalidate blocks at or below the head, so repair requires
+/// re-fetching history the old logic never requested. Matches the
+/// checkpoint retention depth.
+pub const RECOVERY_LOOKBACK_BLOCKS: u64 = 127;
 
 impl StateMachine {
     fn apply_ordered(&mut self, log: &SyncLog) -> Result<ApplyOutcome, StateError> {

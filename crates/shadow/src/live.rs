@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 use catalog::{
     CatalogRpc, CycleLimits, FactorySpec, compile_cycles, parse_manifest, verify_catalog,
 };
@@ -85,7 +85,6 @@ pub fn run_live<P: WsProbe>(
     drain_grace: Duration,
     stop: &AtomicBool,
     max_items: usize,
-    block_hash: B256,
     build_probe: &mut impl FnMut(&[Address]) -> Result<P, StreamError>,
     now_ms: u64,
     economics: Economics,
@@ -163,13 +162,7 @@ pub fn run_live<P: WsProbe>(
         match probe.next(stream, poll)? {
             Some(StreamItem::Log(envelope)) => {
                 report.sync_observed += 1;
-                apply_envelope(
-                    &mut evaluator,
-                    &envelope,
-                    &address_to_pool,
-                    block_hash,
-                    &mut report,
-                )?;
+                apply_envelope(&mut evaluator, &envelope, &address_to_pool, &mut report)?;
             }
             Some(StreamItem::Disconnected(kind)) => break 'serve EndReason::Disconnected(kind),
             None => {}
@@ -180,13 +173,7 @@ pub fn run_live<P: WsProbe>(
     if !matches!(ended, EndReason::Disconnected(_)) {
         while let Some(StreamItem::Log(envelope)) = probe.next(stream, drain_grace)? {
             report.sync_observed += 1;
-            apply_envelope(
-                &mut evaluator,
-                &envelope,
-                &address_to_pool,
-                block_hash,
-                &mut report,
-            )?;
+            apply_envelope(&mut evaluator, &envelope, &address_to_pool, &mut report)?;
         }
     }
     report.ended = ended;
@@ -219,9 +206,13 @@ fn apply_envelope(
     evaluator: &mut DirtyEvaluator,
     envelope: &RawLogEnvelope,
     address_to_pool: &HashMap<Address, PoolId>,
-    block_hash: B256,
     report: &mut LiveReport,
 ) -> Result<(), ServiceError> {
+    // Audit C14: the per-log hash comes from the log payload — the old
+    // caller-supplied constant (B256::ZERO in practice) made every log at
+    // every height share one hash, disabling duplicate detection and
+    // rollback matching entirely, and killed the process on the first
+    // benign reorg.
     let Some(&pool_id) = address_to_pool.get(&envelope.address) else {
         report.unknown_pool += 1;
         return Ok(());
@@ -236,7 +227,7 @@ fn apply_envelope(
         pool_id,
         reserve0,
         reserve1,
-        block_hash,
+        block_hash: envelope.block_hash,
         position: CanonicalPosition {
             block_number: envelope.block_number,
             transaction_index: envelope.transaction_index,

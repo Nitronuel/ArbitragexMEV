@@ -51,6 +51,11 @@ pub struct RawLogEnvelope {
     pub transaction_index: u64,
     pub log_index: u64,
     pub removed: bool,
+    /// Hash of the block containing the log (audit B4): the state machine
+    /// keys duplicate detection and rollback matching on it. Absent on
+    /// pending logs — parsed as ZERO there, which the confirmed-path
+    /// decoders never produce.
+    pub block_hash: B256,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +122,11 @@ impl LogStream {
             block_number: quantity(log, "blockNumber")?,
             transaction_index: quantity(log, "transactionIndex")?,
             log_index: quantity(log, "logIndex")?,
+            block_hash: log
+                .get("blockHash")
+                .and_then(Value::as_str)
+                .and_then(|h| <B256 as std::str::FromStr>::from_str(h).ok())
+                .unwrap_or_default(),
             removed: log.get("removed").and_then(Value::as_bool).unwrap_or(false),
         }))
     }
@@ -155,6 +165,11 @@ impl RawLogEnvelope {
             block_number: quantity(value, "blockNumber")?,
             transaction_index: quantity(value, "transactionIndex")?,
             log_index: quantity(value, "logIndex")?,
+            block_hash: value
+                .get("blockHash")
+                .and_then(Value::as_str)
+                .and_then(|h| <B256 as std::str::FromStr>::from_str(h).ok())
+                .unwrap_or_default(),
             removed: value
                 .get("removed")
                 .and_then(Value::as_bool)

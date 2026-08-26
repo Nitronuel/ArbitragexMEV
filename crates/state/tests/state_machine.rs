@@ -146,7 +146,25 @@ fn recovery_uses_ten_block_chunks_and_requires_reconciliation() {
     machine
         .recover(111, Duration::from_secs(1), &source)
         .unwrap();
-    assert_eq!(*source.ranges.borrow(), vec![(100, 109), (110, 111)]);
+    // Audit C7: the backfill reaches one retention window (127 blocks)
+    // below the committed head so reorgs at/below it are repairable.
+    assert_eq!(
+        *source.ranges.borrow(),
+        vec![
+            (0, 9),
+            (10, 19),
+            (20, 29),
+            (30, 39),
+            (40, 49),
+            (50, 59),
+            (60, 69),
+            (70, 79),
+            (80, 89),
+            (90, 99),
+            (100, 109),
+            (110, 111)
+        ]
+    );
     assert_eq!(reserves(&machine).0, U256::from(1_200));
     assert_eq!(machine.readiness(), &Readiness::Ready);
 }
@@ -240,11 +258,13 @@ fn recovery_rejects_timeout_oversized_gap_and_bad_reconciliation() {
     };
     let mut machine = ready_machine(100);
     machine.disconnect("test");
-    assert!(matches!(
-        machine.recover(100, Duration::from_secs(1), &bad),
-        Err(StateError::ReconciliationMismatch(PoolId(0)))
-    ));
-    assert!(matches!(machine.readiness(), Readiness::Stale { .. }));
+    // Audit C11: the fetched reserves ARE the authority — a mismatch now
+    // auto-rebootstraps from them instead of leaving no path back to Ready.
+    machine
+        .recover(100, Duration::from_secs(1), &bad)
+        .expect("reconciliation mismatch heals via re-bootstrap");
+    assert!(matches!(machine.readiness(), Readiness::Ready));
+    assert_eq!(reserves(&machine).0, U256::from(999));
 
     let mut machine = ready_machine(100);
     machine.disconnect("test");

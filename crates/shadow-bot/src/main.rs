@@ -3262,7 +3262,6 @@ fn run_live_command(
         Duration::from_millis(drain_ms),
         &stop.flag,
         max_items_usize,
-        alloy_primitives::B256::ZERO,
         &mut build_probe,
         unix_millis(),
         economics,
