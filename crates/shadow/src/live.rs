@@ -90,6 +90,7 @@ pub fn run_live<P: WsProbe>(
     economics: Economics,
     reference: CostSnapshot,
     storage_path: &Path,
+    database_limit_bytes: u64,
     queue_capacity: usize,
     limits: CycleLimits,
     request_cu_ceiling: u64,
@@ -110,7 +111,7 @@ pub fn run_live<P: WsProbe>(
     let graph = compile_cycles(&verified, anchors, limits)?;
     let cycle_count = graph.cycles.len();
 
-    let evaluator_storage = Storage::open(storage_path)?;
+    let evaluator_storage = Storage::open_with_limit(storage_path, database_limit_bytes)?;
     let mut machine = StateMachine::new(verified.len());
     let states: Vec<(PoolId, U256, U256)> = verified
         .iter()
@@ -180,7 +181,7 @@ pub fn run_live<P: WsProbe>(
 
     let outcome = evaluator.run_once(now_ms);
 
-    let mut admin_storage = Storage::open(storage_path)?;
+    let mut admin_storage = Storage::open_with_limit(storage_path, database_limit_bytes)?;
     let started = now_ms.saturating_sub(60_000);
     admin_storage.record_health_interval(&HealthInterval {
         started_at_unix_milliseconds: started,
@@ -416,6 +417,7 @@ mod tests {
             economics(),
             reference(),
             &db,
+            10_000_000_000,
             1_000,
             ::catalog::CycleLimits {
                 max_cycles: 1_000_000,

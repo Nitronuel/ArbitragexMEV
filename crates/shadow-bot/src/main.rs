@@ -3177,6 +3177,7 @@ fn run_snapshot_command(
         economics,
         reference,
         db,
+        config.database_limit_bytes,
         QUEUE_CAPACITY,
         CycleLimits {
             max_cycles: CYCLE_LIMITS.max_cycles,
@@ -3272,6 +3273,7 @@ fn run_live_command(
         economics,
         reference,
         db,
+        config.database_limit_bytes,
         QUEUE_CAPACITY,
         CycleLimits {
             max_cycles: CYCLE_LIMITS.max_cycles,

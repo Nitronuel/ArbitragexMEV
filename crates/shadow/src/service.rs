@@ -118,6 +118,7 @@ pub fn observe_catalog(
     economics: Economics,
     reference: CostSnapshot,
     storage_path: &Path,
+    database_limit_bytes: u64,
     queue_capacity: usize,
     limits: CycleLimits,
     request_cu_ceiling: u64,
@@ -135,6 +136,7 @@ pub fn observe_catalog(
         economics,
         reference,
         storage_path,
+        database_limit_bytes,
         queue_capacity,
         limits,
         request_cu_ceiling,
@@ -155,6 +157,7 @@ pub fn observe_snapshot(
     economics: Economics,
     reference: CostSnapshot,
     storage_path: &Path,
+    database_limit_bytes: u64,
     queue_capacity: usize,
     limits: CycleLimits,
     request_cu_ceiling: u64,
@@ -199,6 +202,7 @@ pub fn observe_snapshot(
         economics,
         reference,
         storage_path,
+        database_limit_bytes,
         queue_capacity,
         limits,
         request_cu_ceiling,
@@ -217,6 +221,7 @@ fn run_pipeline(
     economics: Economics,
     reference: CostSnapshot,
     storage_path: &Path,
+    database_limit_bytes: u64,
     queue_capacity: usize,
     limits: CycleLimits,
     request_cu_ceiling: u64,
@@ -226,7 +231,7 @@ fn run_pipeline(
     let graph = compile_cycles(verified, anchors, limits)?;
     let cycle_count = graph.cycles.len();
 
-    let evaluator_storage = Storage::open(storage_path)?;
+    let evaluator_storage = Storage::open_with_limit(storage_path, database_limit_bytes)?;
     let mut machine = StateMachine::new(verified.len());
     let states: Vec<(PoolId, U256, U256)> = verified
         .iter()
@@ -244,7 +249,7 @@ fn run_pipeline(
         DirtyEvaluator::new(graph, machine, economics, queue_capacity, evaluator_storage);
     evaluator.set_reference(reference);
 
-    let mut admin_storage = Storage::open(storage_path)?;
+    let mut admin_storage = Storage::open_with_limit(storage_path, database_limit_bytes)?;
     for log in events {
         evaluator.apply_log(log.clone())?;
         evaluator.mark_pool(log.pool_id);
