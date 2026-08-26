@@ -11,6 +11,7 @@ use alloy_primitives::{Address, U256};
 use catalog::{CycleLimits, parse_manifest};
 use clap::{Parser, Subcommand};
 use domain::ShadowConfig;
+use shadow::RetentionPolicy;
 use enumerate::{CrawlPace, Venue, sweep_venue};
 use provider::{
     ChainReader, LiveHttp, LiveHttpProbe, LiveRpc, LiveWsClient, LogStream, ProviderBudget,
@@ -3178,6 +3179,11 @@ fn run_snapshot_command(
         reference,
         db,
         config.database_limit_bytes,
+        RetentionPolicy {
+            stale_timeout: std::time::Duration::from_secs(config.stale_timeout_seconds),
+            recovery_gap_limit: config.recovery_gap_blocks,
+            retention_blocks: 127,
+        },
         QUEUE_CAPACITY,
         CycleLimits {
             max_cycles: CYCLE_LIMITS.max_cycles,
@@ -3192,7 +3198,7 @@ fn run_snapshot_command(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_live_command(
     config: &ShadowConfig,
     manifest_path: &std::path::Path,
@@ -3274,6 +3280,11 @@ fn run_live_command(
         reference,
         db,
         config.database_limit_bytes,
+        RetentionPolicy {
+            stale_timeout: std::time::Duration::from_secs(config.stale_timeout_seconds),
+            recovery_gap_limit: config.recovery_gap_blocks,
+            retention_blocks: 127,
+        },
         QUEUE_CAPACITY,
         CycleLimits {
             max_cycles: CYCLE_LIMITS.max_cycles,

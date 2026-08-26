@@ -91,6 +91,7 @@ pub fn run_live<P: WsProbe>(
     reference: CostSnapshot,
     storage_path: &Path,
     database_limit_bytes: u64,
+    retention: state::RetentionPolicy,
     queue_capacity: usize,
     limits: CycleLimits,
     request_cu_ceiling: u64,
@@ -112,7 +113,7 @@ pub fn run_live<P: WsProbe>(
     let cycle_count = graph.cycles.len();
 
     let evaluator_storage = Storage::open_with_limit(storage_path, database_limit_bytes)?;
-    let mut machine = StateMachine::new(verified.len());
+    let mut machine = StateMachine::with_retention(verified.len(), retention);
     let states: Vec<(PoolId, U256, U256)> = verified
         .iter()
         .map(|pool| {
@@ -418,6 +419,7 @@ mod tests {
             reference(),
             &db,
             10_000_000_000,
+            state::RetentionPolicy::default(),
             1_000,
             ::catalog::CycleLimits {
                 max_cycles: 1_000_000,

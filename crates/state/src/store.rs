@@ -118,7 +118,7 @@ pub struct RetentionPolicy {
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            stale_timeout: std::time::Duration::from_secs(60),
+            stale_timeout: std::time::Duration::from_mins(1),
             recovery_gap_limit: 1_000,
             retention_blocks: 127,
         }
@@ -379,8 +379,6 @@ impl StateMachine {
 /// C7): reorgs invalidate blocks at or below the head, so repair requires
 /// re-fetching history the old logic never requested. Matches the
 /// checkpoint retention depth.
-pub const RECOVERY_LOOKBACK_BLOCKS: u64 = 127;
-
 impl StateMachine {
     fn apply_ordered(&mut self, log: &SyncLog) -> Result<ApplyOutcome, StateError> {
         let index = self.pool_index(log.pool_id)?;

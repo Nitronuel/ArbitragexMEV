@@ -119,6 +119,7 @@ pub fn observe_catalog(
     reference: CostSnapshot,
     storage_path: &Path,
     database_limit_bytes: u64,
+    retention: state::RetentionPolicy,
     queue_capacity: usize,
     limits: CycleLimits,
     request_cu_ceiling: u64,
@@ -137,6 +138,7 @@ pub fn observe_catalog(
         reference,
         storage_path,
         database_limit_bytes,
+        retention,
         queue_capacity,
         limits,
         request_cu_ceiling,
@@ -158,6 +160,7 @@ pub fn observe_snapshot(
     reference: CostSnapshot,
     storage_path: &Path,
     database_limit_bytes: u64,
+    retention: state::RetentionPolicy,
     queue_capacity: usize,
     limits: CycleLimits,
     request_cu_ceiling: u64,
@@ -203,6 +206,7 @@ pub fn observe_snapshot(
         reference,
         storage_path,
         database_limit_bytes,
+        retention,
         queue_capacity,
         limits,
         request_cu_ceiling,
@@ -222,6 +226,7 @@ fn run_pipeline(
     reference: CostSnapshot,
     storage_path: &Path,
     database_limit_bytes: u64,
+    retention: state::RetentionPolicy,
     queue_capacity: usize,
     limits: CycleLimits,
     request_cu_ceiling: u64,
@@ -233,7 +238,7 @@ fn run_pipeline(
 
     let evaluator_storage = Storage::open_with_limit(storage_path, database_limit_bytes)?;
     // Use default retention for now; caller may override via with_retention if config available.
-    let mut machine = StateMachine::new(verified.len());
+    let mut machine = StateMachine::with_retention(verified.len(), retention);
     let states: Vec<(PoolId, U256, U256)> = verified
         .iter()
         .map(|pool| {
