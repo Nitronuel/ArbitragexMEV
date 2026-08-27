@@ -441,11 +441,10 @@ mod tests {
     /// The `entries` array must outlive the returned closure (it is borrowed).
     fn code_for(entries: &[(Address, TokenSpec)]) -> impl Fn(Address) -> Bytecode + '_ {
         move |address| {
-            entries
-                .iter()
-                .find(|(a, _)| *a == address)
-                .map(|(_, spec)| token_bytecode(*spec))
-                .unwrap_or_else(|| Bytecode::new_legacy(alloy_primitives::Bytes::new()))
+            entries.iter().find(|(a, _)| *a == address).map_or_else(
+                || Bytecode::new_legacy(alloy_primitives::Bytes::new()),
+                |(_, spec)| token_bytecode(*spec),
+            )
         }
     }
 

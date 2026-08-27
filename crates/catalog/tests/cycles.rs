@@ -171,8 +171,8 @@ fn fails_before_exceeding_cycle_and_per_pool_limits() {
             CycleLimits {
                 max_cycles: 1,
                 max_cycles_per_pool: 10,
-                            max_hops: 4,
-},
+                max_hops: 4,
+            },
         ),
         Err(CycleError::CycleLimit { limit: 1 })
     ));
@@ -183,8 +183,8 @@ fn fails_before_exceeding_cycle_and_per_pool_limits() {
             CycleLimits {
                 max_cycles: 10,
                 max_cycles_per_pool: 1,
-                            max_hops: 4,
-},
+                max_hops: 4,
+            },
         ),
         Err(CycleError::PerPoolLimit { limit: 1, .. })
     ));

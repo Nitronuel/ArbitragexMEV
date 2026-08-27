@@ -42,35 +42,36 @@ fn ready_machine() -> StateMachine {
     machine
 }
 
+// Audit C8: with per-position interleaved replay, removing 102 after
+// truncating at 101 failed permanently ("RemovedLogMismatch") and
+// recovery never converged. Removals-first-descending fixes it.
+struct C8Source;
+impl RecoverySource for C8Source {
+    fn logs(&self, _from: u64, _to: u64) -> Result<Vec<SyncLog>, StateError> {
+        Ok(vec![
+            removal(101, 0, 0),
+            sync(101, 1, 0, 1_050, 950),
+            removal(102, 0, 0),
+            sync(102, 1, 0, 1_150, 850),
+        ])
+    }
+    fn reserves(&self, _block: u64) -> Result<Vec<ReconciledState>, StateError> {
+        Ok(vec![ReconciledState {
+            pool_id: POOL,
+            reserve0: U256::from(1_150u64),
+            reserve1: U256::from(850u64),
+        }])
+    }
+}
+
 #[test]
 fn multi_log_reorg_recovery_converges() {
-    // Audit C8: with per-position interleaved replay, removing 102 after
-    // truncating at 101 failed permanently ("RemovedLogMismatch") and
-    // recovery never converged. Removals-first-descending fixes it.
     let mut machine = ready_machine();
     machine.apply(sync(101, 0, 0, 1_100, 900)).unwrap();
     machine.apply(sync(102, 0, 0, 1_200, 800)).unwrap();
 
-    struct Source;
-    impl RecoverySource for Source {
-        fn logs(&self, _from: u64, _to: u64) -> Result<Vec<SyncLog>, StateError> {
-            Ok(vec![
-                removal(101, 0, 0),
-                sync(101, 1, 0, 1_050, 950),
-                removal(102, 0, 0),
-                sync(102, 1, 0, 1_150, 850),
-            ])
-        }
-        fn reserves(&self, _block: u64) -> Result<Vec<ReconciledState>, StateError> {
-            Ok(vec![ReconciledState {
-                pool_id: POOL,
-                reserve0: U256::from(1_150u64),
-                reserve1: U256::from(850u64),
-            }])
-        }
-    }
     machine
-        .recover(103, Duration::ZERO, &Source)
+        .recover(103, Duration::ZERO, &C8Source)
         .unwrap_or_else(|e| panic!("multi-log reorg recovery must converge, got {e:?}"));
     assert!(matches!(machine.readiness(), Readiness::Ready));
 }
@@ -122,7 +123,7 @@ fn rollback_lowers_committed_block_so_recovery_refetches_the_gap() {
     machine.apply(removal(151, 0, 0)).unwrap();
     let committed = machine.committed_block();
     assert!(
-        committed.map_or(false, |c| c <= 150),
+        committed.is_some_and(|c| c <= 150),
         "committed must drop to the restored checkpoint, got {committed:?}"
     );
 }

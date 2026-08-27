@@ -11,13 +11,13 @@ use alloy_primitives::{Address, U256};
 use catalog::{CycleLimits, parse_manifest};
 use clap::{Parser, Subcommand};
 use domain::ShadowConfig;
-use shadow::RetentionPolicy;
 use enumerate::{CrawlPace, Venue, sweep_venue};
 use provider::{
     ChainReader, LiveHttp, LiveHttpProbe, LiveRpc, LiveWsClient, LogStream, ProviderBudget,
     RedactedUrl, RetryPolicy, StreamItem, SubscriptionFilter, ThreadSleeper, TransportError,
     WsProbe,
 };
+use shadow::RetentionPolicy;
 use shadow::{
     ClassificationReason, CostSnapshot, Economics, FIXED_POINT_SCALE, ServiceReport,
     ServiceSnapshot, daily_report, observe_snapshot, replay_observation, run_live, run_smoke,
@@ -1511,15 +1511,36 @@ fn verify_capture_command(args: &VerifyCaptureArgs<'_>) -> Result<(), String> {
     let table = gaps::load_prices(args.prices)?;
     let entries_a: Vec<_> = legs_a.clone();
     let entries_b: Vec<_> = legs_b.clone();
-    let Some(quote) = gaps::quote_pair(&entries_a, &entries_b, &prices_a, &prices_b)? else {
-        return Err("no priced leg on both venues at the pinned block".to_owned());
+    // Audit S3a/A3: pick the anchor the way the live evaluator does — a
+    // priced token outranks an unpriced one, ties break to the lower
+    // address. verify-capture assumes the legacy zero-fee flash selection
+    // (every token borrowable at 0%), so executability reduces to "priced";
+    // a canary run with an explicit flash-support set may legitimately
+    // disagree with this choice, and the ledger then names its anchor.
+    let priced = |token: &Address| table.get(token).is_some_and(|usd| !usd.is_zero());
+    let preferred_anchor = if priced(&lo) || !priced(&hi) { lo } else { hi };
+    println!(
+        "verify-capture: anchor {preferred_anchor:#} (lo priced={}, hi priced={})",
+        priced(&lo),
+        priced(&hi)
+    );
+    let Some(quote) = gaps::quote_pair_anchored(
+        &entries_a,
+        &entries_b,
+        &prices_a,
+        &prices_b,
+        Some(preferred_anchor),
+    )?
+    else {
+        return Err("no captureable cycle at the pinned block".to_owned());
     };
-    let usd_per_anchor = *table
-        .get(&quote.token_lo)
-        .ok_or_else(|| format!("anchor {} unpriced in the table", quote.token_lo))?;
-    if usd_per_anchor.is_zero() {
-        return Err(format!("anchor {} priced at zero", quote.token_lo));
+    if !priced(&quote.token_lo) {
+        return Err(format!(
+            "anchor {} unpriced or zero-priced in the table",
+            quote.token_lo
+        ));
     }
+    let usd_per_anchor = table[&quote.token_lo];
 
     let ledger = gaps::verify_capture_ledger(
         &entries_a,
@@ -3172,10 +3193,7 @@ fn run_snapshot_command(
     let snapshot: ServiceSnapshot =
         serde_json::from_slice(&fs::read(snapshot_path).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
-    let budget = ProviderBudget::new(
-        config.request_cu_ceiling,
-        config.websocket_bytes_ceiling,
-    );
+    let budget = ProviderBudget::new(config.request_cu_ceiling, config.websocket_bytes_ceiling);
     let report = observe_snapshot(
         snapshot,
         now_ms,

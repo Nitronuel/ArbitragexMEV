@@ -1,7 +1,7 @@
-//! Verifies pool_slot0 decoding against a live RHC response captured
+//! Verifies `pool_slot0` decoding against a live RHC response captured
 //! 2026-08-26 (audit task 1.3 refresh path).
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::U256;
 
 #[test]
 fn decodes_captured_slot0_word_layout() {

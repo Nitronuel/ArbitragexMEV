@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn subscriptions_split_venues_and_dedup_singleton() {
-        let csv = format!("{ROW}{}{}", row(V3_POOL_A, "v3"), row(V3_POOL_B, "v3"),)
+        let csv = format!("{ROW}{}{}", row(V3_POOL_A, "v3"), row(V3_POOL_B, "v3"))
             + &row_with_pool_id(
                 V4_SINGLETON,
                 "v4",
@@ -406,9 +406,9 @@ mod tests {
     fn backoff_doubles_and_caps_at_two_seconds() {
         assert_eq!(backoff_delay(0), Duration::from_millis(250));
         assert_eq!(backoff_delay(1), Duration::from_millis(500));
-        assert_eq!(backoff_delay(2), Duration::from_millis(1000));
-        assert_eq!(backoff_delay(3), Duration::from_millis(2000));
-        assert_eq!(backoff_delay(10), Duration::from_millis(2000));
+        assert_eq!(backoff_delay(2), Duration::from_secs(1));
+        assert_eq!(backoff_delay(3), Duration::from_secs(2));
+        assert_eq!(backoff_delay(10), Duration::from_secs(2));
     }
 
     #[test]
@@ -495,10 +495,14 @@ mod tests {
 
     #[test]
     fn stats_merge_duplicates() {
-        let mut a = ProbeStats::default();
-        a.duplicates = 2;
-        let mut b = ProbeStats::default();
-        b.duplicates = 3;
+        let mut a = ProbeStats {
+            duplicates: 2,
+            ..ProbeStats::default()
+        };
+        let b = ProbeStats {
+            duplicates: 3,
+            ..ProbeStats::default()
+        };
         a.merge(&b);
         assert_eq!(a.duplicates, 5);
     }

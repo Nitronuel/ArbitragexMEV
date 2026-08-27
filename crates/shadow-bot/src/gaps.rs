@@ -355,18 +355,13 @@ pub fn verify_capture_ledger(
     usd_per_anchor: U256,
     gas_cost_usd: U256,
 ) -> Result<CaptureLedger, String> {
-    let Some(quote) = quote_pair(a, b, prices_a, prices_b)? else {
+    let Some(quote) = quote_pair_anchored(a, b, prices_a, prices_b, Some(anchor))? else {
         return Err("pair has no priced leg on both venues at the pinned block".to_owned());
     };
     let scale = U256::from(shadow::FIXED_POINT_SCALE);
-    // The quote is denominated in the anchor (token_lo); convert like the
-    // economics path does.
-    if quote.token_lo != anchor {
-        return Err(format!(
-            "quote anchor {} does not match expected {anchor}",
-            quote.token_lo
-        ));
-    }
+    // The anchored quote denominates in the anchor (token_lo) by
+    // construction; convert like the economics path does.
+    debug_assert_eq!(quote.token_lo, anchor);
     let gross_usd = quote
         .profit
         .checked_mul(usd_per_anchor)
@@ -2418,15 +2413,16 @@ mod tests {
         );
 
         // Sorted-vs-sorted at parity: zero skew.
-        assert_eq!(
+        assert!(
             oriented_pair_skew(
                 &venue_a,
                 &price(parity),
                 &venue_b_sorted,
                 &price(parity),
                 lo
-            ),
-            0.0
+            )
+            .abs()
+                < 1e-9
         );
         // Opposite order at parity must ALSO be zero — the old raw-ratio
         // skew reported ~192 here and screened every native pair.
@@ -2452,6 +2448,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn price_out_derives_xyk_ratio() {
         let sqrt = U256::from(1u64 << 48);
         assert!((price_out(sqrt) - 1.0).abs() < 1e-9);
@@ -2980,7 +2977,10 @@ mod tests {
         let cap1 = single_tick_capacity(sqrt, liquidity, ts, false);
         let expect0 = 1.497_677_5e19;
         let expect1 = 6.008_708_1e19;
+        // The 1% tolerance dwarfs f64 mantissa loss at these magnitudes.
+        #[allow(clippy::cast_precision_loss)]
         let got0 = cap0.to::<u128>() as f64;
+        #[allow(clippy::cast_precision_loss)]
         let got1 = cap1.to::<u128>() as f64;
         assert!(
             (got0 - expect0).abs() / expect0 < 0.01,
@@ -3478,7 +3478,7 @@ mod tests {
         );
         let out = derive_usd_prices(&[], &[e6, e18], &HashMap::new(), &priced);
         // Implied human price: P = V * 10^d_tok / 1e36. Both legs are at $1.
-        let implied = |v: U256, d: u32| f64_of(v) * 10f64.powi(d as i32) / 1e36;
+        let implied = |v: U256, d: u32| f64_of(v) * 10f64.powi(d.cast_signed()) / 1e36;
         assert!(
             (implied(out[&six_dec], 6) - 1.0).abs() < 1e-6
                 && (implied(out[&eighteen_dec], 18) - 1.0).abs() < 1e-6,
@@ -3540,7 +3540,7 @@ mod tests {
         );
         assert!(ledger.net_usd_aave < ledger.net_usd_none);
         assert_eq!(ledger.token_lo, tok);
-        assert_eq!(ledger.log2_skew > 0.0, true);
+        assert!(ledger.log2_skew > 0.0);
         // A missing opposite-venue leg must fail closed.
         assert!(
             verify_capture_ledger(
@@ -3839,13 +3839,13 @@ mod tests {
     }
 
     fn swap_log(address: Address, topic1: Option<[u8; 32]>) -> serde_json::Value {
-        let mut topics = vec![v3_swap_topic()];
+        let mut log_topics = vec![v3_swap_topic()];
         if let Some(id) = topic1 {
-            topics.push(alloy_primitives::B256::new(id));
+            log_topics.push(alloy_primitives::B256::new(id));
         }
         serde_json::json!({
             "address": format!("{address:?}"),
-            "topics": topics,
+            "topics": log_topics,
             "data": "0x00",
             "blockNumber": "0x10",
             "transactionIndex": "0x1",

@@ -20,5 +20,5 @@ pub use service::{
     ReplayError, ReplayResult, ServiceError, ServiceReport, ServiceSnapshot, SnapshotPool,
     observe_catalog, observe_snapshot, replay_observation,
 };
-pub use state::RetentionPolicy;
 pub use smoke::{SmokeReport, run_smoke};
+pub use state::RetentionPolicy;

@@ -383,18 +383,16 @@ mod tests {
         // The "contract": MSTORE(0, 0x2a) then RETURN(0, 32) — a deterministic
         // 32-byte answer proving code was fetched from the fork and executed.
         // Only the target carries code; the caller must stay a plain account.
-        use std::sync::Arc;
-        let contract = Address::repeat_byte(0xcc);
-        let contract_hex = format!("0x{}", alloy_primitives::hex::encode(contract));
+        use std::sync::{Arc, Mutex};
         struct FnBackend {
             contract_hex: String,
-            seen: Arc<RefCell<usize>>,
+            seen: Arc<Mutex<usize>>,
         }
         impl HttpBackend for FnBackend {
             fn request(&self, request: &RpcRequest) -> Result<HttpResponse, TransportError> {
                 match request.method.as_str() {
                     "eth_getCode" => {
-                        *self.seen.borrow_mut() += 1;
+                        *self.seen.lock().unwrap() += 1;
                         let target = request.params[0].as_str().unwrap_or_default();
                         Ok(HttpResponse {
                             result: Value::String(
@@ -417,7 +415,9 @@ mod tests {
                 }
             }
         }
-        let seen = Arc::new(RefCell::new(0_usize));
+        let contract = Address::repeat_byte(0xcc);
+        let contract_hex = format!("0x{}", alloy_primitives::hex::encode(contract));
+        let seen = Arc::new(Mutex::new(0_usize));
         let reader = ChainReader::new(
             FnBackend {
                 contract_hex,
@@ -442,11 +442,11 @@ mod tests {
         .expect("database constructs");
         let result = tx.result.expect("execution succeeds");
         let output = result.output().expect("contract returned data");
-        let mut expected = vec![0u8; 32];
+        let mut expected = [0u8; 32];
         expected[31] = 0x2a;
         assert_eq!(output.as_ref(), &expected[..]);
         // Code was served from the fork (revm may re-validate the caller, so
         // only a lower bound holds).
-        assert!(*seen.borrow() >= 1);
+        assert!(*seen.lock().unwrap() >= 1);
     }
 }

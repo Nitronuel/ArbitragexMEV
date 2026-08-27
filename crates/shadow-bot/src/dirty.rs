@@ -1631,7 +1631,7 @@ mod tests {
         evaluator.set_tip(tip);
         // Venue B covered; venue A's chunk was NOT in this poll's ring slice.
         evaluator.mark_swept(*b"v4", &b_pools, tip);
-        let pair = crate::gaps::pair_key(token_a(), token_b());
+        let _pair = crate::gaps::pair_key(token_a(), token_b());
 
         // Direct evaluation path (`run_once` consumes the same screen).
         let outcome = {

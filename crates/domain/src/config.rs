@@ -152,7 +152,9 @@ impl ShadowConfig {
                     return Err(ConfigError::InvalidRecoveryGap(self.recovery_gap_blocks));
                 }
                 if self.request_cu_ceiling == 0 {
-                    return Err(ConfigError::InvalidRequestCuCeiling(self.request_cu_ceiling));
+                    return Err(ConfigError::InvalidRequestCuCeiling(
+                        self.request_cu_ceiling,
+                    ));
                 }
                 if self.websocket_bytes_ceiling == 0 {
                     return Err(ConfigError::InvalidWebsocketBytesCeiling(
