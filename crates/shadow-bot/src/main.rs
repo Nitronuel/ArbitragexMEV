@@ -3172,6 +3172,10 @@ fn run_snapshot_command(
     let snapshot: ServiceSnapshot =
         serde_json::from_slice(&fs::read(snapshot_path).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
+    let budget = ProviderBudget::new(
+        config.request_cu_ceiling,
+        config.websocket_bytes_ceiling,
+    );
     let report = observe_snapshot(
         snapshot,
         now_ms,
@@ -3190,8 +3194,7 @@ fn run_snapshot_command(
             max_cycles_per_pool: CYCLE_LIMITS.max_cycles_per_pool,
             max_hops: config.max_hops,
         },
-        config.request_cu_ceiling,
-        config.websocket_bytes_ceiling,
+        &budget,
     )
     .map_err(|error| error.to_string())?;
     print_report(&report);
@@ -3291,8 +3294,7 @@ fn run_live_command(
             max_cycles_per_pool: CYCLE_LIMITS.max_cycles_per_pool,
             max_hops: config.max_hops,
         },
-        config.request_cu_ceiling,
-        config.websocket_bytes_ceiling,
+        &budget,
     )
     .map_err(|error| error.to_string())?;
 

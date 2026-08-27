@@ -55,6 +55,7 @@ fn observe_snapshot_records_and_replays_matching_observations() {
     let snapshot = load_snapshot();
     let (_directory, db) = setup();
 
+    let budget = provider::ProviderBudget::new(24_000_000, 5_000_000_000);
     let report = shadow::observe_snapshot(
         snapshot,
         20_669_u64 * 86_400_000,
@@ -65,8 +66,7 @@ fn observe_snapshot_records_and_replays_matching_observations() {
         state::RetentionPolicy::default(),
         1_000,
         LIMITS,
-        24_000_000,
-        5_000_000_000,
+        &budget,
     )
     .unwrap();
 
@@ -101,6 +101,7 @@ fn observe_catalog_wires_verification_graph_and_evaluation() {
     let anchors: HashSet<Address> = [Address::repeat_byte(1)].into_iter().collect();
 
     let (_directory, db) = setup();
+    let budget = provider::ProviderBudget::new(24_000_000, 5_000_000_000);
     let report = shadow::observe_catalog(
         two_factory_manifest(4663).as_bytes(),
         &factories,
@@ -119,8 +120,7 @@ fn observe_catalog_wires_verification_graph_and_evaluation() {
         state::RetentionPolicy::default(),
         1_000,
         LIMITS,
-        24_000_000,
-        5_000_000_000,
+        &budget,
     )
     .unwrap();
 
@@ -145,6 +145,7 @@ fn observe_catalog_fails_closed_on_wrong_chain_and_invalid_manifest() {
         .collect();
     let anchors: HashSet<Address> = [Address::repeat_byte(1)].into_iter().collect();
     let (_directory, db) = setup();
+    let budget = provider::ProviderBudget::new(24_000_000, 5_000_000_000);
 
     let invalid_chain = shadow::observe_catalog(
         two_factory_manifest(1).as_bytes(),
@@ -164,8 +165,7 @@ fn observe_catalog_fails_closed_on_wrong_chain_and_invalid_manifest() {
         state::RetentionPolicy::default(),
         1_000,
         LIMITS,
-        24_000_000,
-        5_000_000_000,
+        &budget,
     )
     .unwrap_err();
     assert!(matches!(invalid_chain, ServiceError::Manifest(_)));
@@ -188,8 +188,7 @@ fn observe_catalog_fails_closed_on_wrong_chain_and_invalid_manifest() {
         state::RetentionPolicy::default(),
         1_000,
         LIMITS,
-        24_000_000,
-        5_000_000_000,
+        &budget,
     )
     .unwrap_err();
     assert!(matches!(

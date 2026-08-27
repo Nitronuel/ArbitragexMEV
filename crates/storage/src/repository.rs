@@ -254,10 +254,10 @@ impl Storage {
               websocket_accounted_bytes)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(hour_unix) DO UPDATE SET
-               request_cu = excluded.request_cu,
-               http_response_bytes = excluded.http_response_bytes,
-               websocket_delivered_bytes = excluded.websocket_delivered_bytes,
-               websocket_accounted_bytes = excluded.websocket_accounted_bytes",
+               request_cu = provider_usage.request_cu + excluded.request_cu,
+               http_response_bytes = provider_usage.http_response_bytes + excluded.http_response_bytes,
+               websocket_delivered_bytes = provider_usage.websocket_delivered_bytes + excluded.websocket_delivered_bytes,
+               websocket_accounted_bytes = provider_usage.websocket_accounted_bytes + excluded.websocket_accounted_bytes",
             params![
                 integer(hour_unix, "hour_unix")?,
                 integer(usage.request_cu, "request_cu")?,

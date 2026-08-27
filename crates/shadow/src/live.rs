@@ -94,8 +94,7 @@ pub fn run_live<P: WsProbe>(
     retention: state::RetentionPolicy,
     queue_capacity: usize,
     limits: CycleLimits,
-    request_cu_ceiling: u64,
-    websocket_bytes_ceiling: u64,
+    budget: &ProviderBudget,
 ) -> Result<LiveReport, ServiceError> {
     let candidates = parse_manifest(manifest)?;
     let factories: Vec<FactorySpec> = candidates
@@ -190,7 +189,6 @@ pub fn run_live<P: WsProbe>(
         state: "READY".to_owned(),
         reason: "live observation window".to_owned(),
     })?;
-    let budget = ProviderBudget::new(request_cu_ceiling, websocket_bytes_ceiling);
     admin_storage.record_usage(now_ms / 3_600_000, budget.snapshot())?;
 
     report.evaluated = outcome.evaluated.len();
@@ -424,10 +422,9 @@ mod tests {
             ::catalog::CycleLimits {
                 max_cycles: 1_000_000,
                 max_cycles_per_pool: 10_000,
-                            max_hops: 4,
-},
-            1_000_000,
-            1_000_000,
+                max_hops: 4,
+            },
+            &provider::ProviderBudget::new(1_000_000, 1_000_000),
         )
         .unwrap()
     }

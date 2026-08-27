@@ -122,8 +122,7 @@ pub fn observe_catalog(
     retention: state::RetentionPolicy,
     queue_capacity: usize,
     limits: CycleLimits,
-    request_cu_ceiling: u64,
-    websocket_bytes_ceiling: u64,
+    budget: &ProviderBudget,
 ) -> Result<ServiceReport, ServiceError> {
     let candidates = catalog::parse_manifest(manifest)?;
     let verified = verify_catalog(candidates, factories, block, rpc)?;
@@ -141,8 +140,7 @@ pub fn observe_catalog(
         retention,
         queue_capacity,
         limits,
-        request_cu_ceiling,
-        websocket_bytes_ceiling,
+        budget,
         quarantined,
     )
 }
@@ -163,8 +161,7 @@ pub fn observe_snapshot(
     retention: state::RetentionPolicy,
     queue_capacity: usize,
     limits: CycleLimits,
-    request_cu_ceiling: u64,
-    websocket_bytes_ceiling: u64,
+    budget: &ProviderBudget,
 ) -> Result<ServiceReport, ServiceError> {
     let mut verified = Vec::with_capacity(snapshot.pools.len());
     for (index, pool) in snapshot.pools.into_iter().enumerate() {
@@ -209,8 +206,7 @@ pub fn observe_snapshot(
         retention,
         queue_capacity,
         limits,
-        request_cu_ceiling,
-        websocket_bytes_ceiling,
+        budget,
         0,
     )
 }
@@ -229,8 +225,7 @@ fn run_pipeline(
     retention: state::RetentionPolicy,
     queue_capacity: usize,
     limits: CycleLimits,
-    request_cu_ceiling: u64,
-    websocket_bytes_ceiling: u64,
+    budget: &ProviderBudget,
     quarantined: usize,
 ) -> Result<ServiceReport, ServiceError> {
     let graph = compile_cycles(verified, anchors, limits)?;
@@ -269,7 +264,6 @@ fn run_pipeline(
         state: "READY".to_owned(),
         reason: "offline fixture window".to_owned(),
     })?;
-    let budget = ProviderBudget::new(request_cu_ceiling, websocket_bytes_ceiling);
     admin_storage.record_usage(now_ms / 3_600_000, budget.snapshot())?;
 
     Ok(ServiceReport {
