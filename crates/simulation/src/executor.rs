@@ -1460,3 +1460,129 @@ mod gate_probes {
         }
     }
 }
+
+#[cfg(test)]
+mod router_swap_test {
+    use crate::fork::ForkDb;
+    use alloy_primitives::{Address, Bytes, U256, keccak256};
+    use revm::bytecode::Bytecode;
+    use revm::context::TxEnv;
+    use revm::database::CacheDB;
+    use revm::handler::{ExecuteCommitEvm, MainBuilder};
+    use revm::primitives::hardfork::SpecId;
+
+    fn mapping_slot(key: [u8; 20], slot: U256) -> U256 {
+        let mut buf = [0u8; 64];
+        buf[12..32].copy_from_slice(&key);
+        buf[32..64].copy_from_slice(&slot.to_be_bytes::<32>());
+        U256::from_be_bytes(keccak256(buf).0)
+    }
+
+    #[test]
+    #[ignore = "live: router swap replay, run with --ignored"]
+    fn router_swap_replay() {
+        use provider::{ChainReader, LiveHttp, ProviderBudget, RetryPolicy, ThreadSleeper};
+        let rpc = std::env::var("ROBINHOOD_HTTP_RPC_URL")
+            .unwrap_or_else(|_| "https://rpc.mainnet.chain.robinhood.com".to_owned());
+        let reader = ChainReader::new(
+            LiveHttp::new(rpc.parse().unwrap()),
+            ThreadSleeper,
+            ProviderBudget::new(60_000, 1 << 24),
+            RetryPolicy {
+                max_retries: 6,
+                initial_delay: std::time::Duration::from_secs(2),
+                max_delay: std::time::Duration::from_secs(30),
+            },
+            4663,
+        );
+        reader.validate_chain_id().unwrap();
+        // Block of the real router swap tx we decoded
+        let block = 47_918_280_u64;
+        let router: Address = "0x65050a9b7e5075a2ba5ced7b1b64ee66262c40dc"
+            .parse()
+            .unwrap();
+        let weth: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+            .parse()
+            .unwrap();
+        let exec = Address::with_last_byte(0xEE);
+        // Find WETH balances slot via the V3 pool that holds WETH
+        let pool_v3: Address = "0x52e65b17fb6e5ba00ed806f37afcd2daa50271ca"
+            .parse()
+            .unwrap();
+        let bal_of = |token: Address, who: Address| -> U256 {
+            let mut cd = Vec::with_capacity(36);
+            cd.extend_from_slice(&0x70a0_8231_u32.to_be_bytes());
+            cd.extend_from_slice(&who.into_word().0);
+            let out = match reader.call(token, &Bytes::from(cd), block) {
+                Ok(o) => o,
+                Err(e) if e.to_string().contains("not found") => {
+                    eprintln!("SKIP: history pruned at block {block}: {e}");
+                    return U256::ZERO;
+                }
+                Err(e) => panic!("balanceOf failed: {e}"),
+            };
+            U256::from_be_slice(&out)
+        };
+        let pool_bal = bal_of(weth, pool_v3);
+        println!("pool V3 WETH balance {pool_bal}");
+        let mut slot_found = None;
+        for s in 0..30u64 {
+            let k = mapping_slot(pool_v3.into_array(), U256::from(s));
+            match reader.storage_at(weth, k, block) {
+                Ok(v) if v == pool_bal && !v.is_zero() => {
+                    slot_found = Some(U256::from(s));
+                    println!("WETH slot {s}");
+                    break;
+                }
+                Err(e) if e.to_string().contains("not found") => {
+                    eprintln!("SKIP: history pruned at block {block}: {e}");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let Some(slot) = slot_found else {
+            eprintln!("SKIP: WETH slot not found");
+            return;
+        };
+        // Need real tx calldata - fetch it
+        let tx_hash = "0x8bf3f2f25c05e6f8d5fc2ae865aac50a2859060612fa9221f523a94dbe9f799b";
+        // For now, just call the router with the exact calldata from the real tx
+        // We fetch via RPC
+        let c = std::process::Command::new("curl").args(["-s","--max-time","15","-X","POST","-H","Content-Type: application/json","--data", &format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionByHash\",\"params\":[\"{tx_hash}\"]}}"), "https://rpc.mainnet.chain.robinhood.com"]).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&c.stdout).unwrap();
+        let input = v["result"]["input"].as_str().unwrap().to_string();
+        println!("calldata len {}", input.len());
+        // fund exec with 1 ETH worth of WETH
+        let amount = U256::from(250_000_000_000_000_000u64);
+        let mut db = CacheDB::new(crate::fork::ForkDb::new(reader, block));
+        db.insert_account_info(
+            exec,
+            revm::state::AccountInfo::from_bytecode(Bytecode::new_legacy(Bytes::new())),
+        );
+        // seed exec WETH
+        let exec_key = mapping_slot(exec.into_array(), slot);
+        db.insert_account_storage(weth, exec_key, amount).unwrap();
+        let tx = TxEnv::builder()
+            .caller(exec)
+            .kind(alloy_primitives::TxKind::Call(router))
+            .data(Bytes::from(
+                alloy_primitives::hex::decode(input.trim_start_matches("0x")).unwrap(),
+            ))
+            .gas_limit(5_000_000)
+            .build()
+            .unwrap();
+        let mut evm = <crate::engine::SimContext<CacheDB<ForkDb<LiveHttp, ThreadSleeper>>>>::new(
+            db,
+            SpecId::PRAGUE,
+        )
+        .modify_cfg_chained(|cfg| {
+            cfg.disable_nonce_check = true;
+            cfg.disable_eip3607 = true;
+        })
+        .build_mainnet();
+        let res = evm.transact_commit(tx).unwrap();
+        println!("router swap result: {res:?}");
+        assert!(res.is_success());
+    }
+}
