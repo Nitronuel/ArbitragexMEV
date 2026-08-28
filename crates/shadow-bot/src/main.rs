@@ -537,6 +537,13 @@ enum Command {
         /// `--flash-provider auto`.
         #[arg(long)]
         flash_support: Option<PathBuf>,
+        /// Simulation gate (audit task 2.3): a candidate may gate only after
+        /// a passing route simulation. The route simulator is currently
+        /// unavailable for the RHC fork's V4 leg (non-standard swap ABI,
+        /// 2026-08-27 finding), so enabling this screens every gate-passing
+        /// candidate fail-closed and counts the screenings separately.
+        #[arg(long, default_value_t = false)]
+        simulate: bool,
         /// Backstop age bound: a cached price this many blocks behind the tip
         /// screens the quote even when sweep coverage claims continuity (0
         /// disables the age backstop; coverage screening always applies).
@@ -791,6 +798,7 @@ fn main() {
             max_skew,
             flash_provider,
             flash_support,
+            simulate,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
         } => run_pairs_command(&RunPairsArgs {
@@ -819,6 +827,7 @@ fn main() {
             max_skew,
             flash_provider: &flash_provider,
             flash_support: flash_support.as_deref(),
+            simulate,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
         }),
@@ -2000,6 +2009,9 @@ struct RunPairsArgs<'a> {
     /// Maximum `|log2 skew|` a quote may carry and still be gated; quotes
     /// above it are screened out as uncaptureable.
     max_skew: f64,
+    /// Simulation gate (task 2.3): screen every gate-passing candidate
+    /// fail-closed until the route simulator is available.
+    simulate: bool,
     /// Flash-loan cost mode for gating (`none`, a provider name, or `auto`).
     flash_provider: &'a str,
     /// Support CSV backing `flash_provider = auto`.
@@ -2177,6 +2189,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut applied = 0u64;
     let mut evals = 0usize;
     let mut interesting = 0usize;
+    let mut sim_screened_total = 0usize;
     let mut not_evaluated = 0usize;
     let mut stale_screened = 0usize;
     let mut triangle_evals = 0usize;
@@ -2323,7 +2336,21 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             gas_price_age_valid: gas_age_valid,
             gas_price_wei,
         });
-        let outcome = evaluator.run_once();
+        let mut outcome = evaluator.run_once();
+        // Audit task 2.3: nothing gates without a passing route simulation.
+        // The route simulator is currently unavailable for the fork's V4 leg
+        // (non-standard swap ABI, 2026-08-27 finding), so with `--simulate`
+        // every gate-passing candidate is screened fail-closed and counted.
+        let sim_screened = if args.simulate {
+            dirty::apply_simulation_gate(&mut outcome)
+        } else {
+            0
+        };
+        if sim_screened > 0 {
+            eprintln!(
+                "run-pairs: sim-screened {sim_screened} gate-passing candidate(s) (fail-closed)"
+            );
+        }
         if !outcome.stale_screened.is_empty() || !outcome.triangle_stale_screened.is_empty() {
             eprintln!(
                 "run-pairs: screened {} pair(s), {} triangle(s) on broken sweep coverage or leg age",
@@ -2380,6 +2407,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         }
         evals += outcome.evaluated.len();
         interesting += outcome.interesting.len();
+        sim_screened_total += sim_screened;
         not_evaluated += outcome.not_evaluated.len();
         stale_screened += outcome.stale_screened.len() + outcome.triangle_stale_screened.len();
         triangle_evals += outcome.triangle_evaluated.len();
@@ -2493,11 +2521,12 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         }
         last_window = to_eff;
         println!(
-            "run-pairs: poll tip={latest} swept_to={to_eff} priced a={} b={} evals={} gated={} triangles={}/{} stale_screened={} dirty={}",
+            "run-pairs: poll tip={latest} swept_to={to_eff} priced a={} b={} evals={} gated={} sim_screened={} triangles={}/{} stale_screened={} dirty={}",
             priced_a.len(),
             priced_b.len(),
             outcome.evaluated.len(),
             outcome.interesting.len(),
+            sim_screened,
             outcome.triangle_interesting.len(),
             outcome.triangle_evaluated.len(),
             outcome.stale_screened.len() + outcome.triangle_stale_screened.len(),
@@ -2508,11 +2537,12 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
 
     let dirty_now = evaluator.queue_len();
     println!(
-        "run-pairs: done at block {} applied={} evals={} gated={} triangles={}/{} stale_screened={} near_miss={} provisional={} not_evaluated={} dirty={} elapsed_s={}",
+        "run-pairs: done at block {} applied={} evals={} gated={} sim_screened={} triangles={}/{} stale_screened={} near_miss={} provisional={} not_evaluated={} dirty={} elapsed_s={}",
         last_window,
         applied,
         evals,
         interesting,
+        sim_screened_total,
         triangle_interesting,
         triangle_evals,
         stale_screened,

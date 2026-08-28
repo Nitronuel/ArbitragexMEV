@@ -838,11 +838,113 @@ impl PairDirtyEvaluator {
     }
 }
 
+/// Audit task 2.3: a candidate may gate only after a passing route
+/// simulation. The route simulator is currently unavailable for the RHC
+/// fork's V4 leg (non-standard swap ABI — 2026-08-27 finding), so with the
+/// simulation gate enabled every gate-passing candidate — pair and triangle
+/// — is screened fail-closed, its USD figures zeroed, and the screening
+/// counted. The zeroing matches the unpriced-anchor screen: no consumer may
+/// read a valued number out of a screened row. When the route simulator
+/// lands, this becomes a real per-candidate verdict (Passed gates,
+/// Reverted screens, Error screens separately).
+///
+/// Returns the number of candidates screened.
+pub fn apply_simulation_gate(outcome: &mut PairRunOutcome) -> usize {
+    const DETAIL: &str = "simulation required before gating; route simulator unavailable (V4 leg ABI blocker, 2026-08-27)";
+    let mut screened = 0;
+    for (_, classification) in &mut outcome.pair_results {
+        if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+            classification.reason = ClassificationReason::NotEvaluated {
+                detail: DETAIL.to_owned(),
+            };
+            classification.gross_profit_usd = U256::ZERO;
+            classification.flash_cost_usd = U256::ZERO;
+            classification.gas_cost_usd = U256::ZERO;
+            classification.estimated_net_profit_usd = U256::ZERO;
+            classification.threshold_usd = U256::ZERO;
+            classification.shortfall_usd = U256::ZERO;
+            screened += 1;
+        }
+    }
+    for (_, classification) in &mut outcome.triangle_results {
+        if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+            classification.reason = ClassificationReason::NotEvaluated {
+                detail: DETAIL.to_owned(),
+            };
+            classification.gross_profit_usd = U256::ZERO;
+            classification.flash_cost_usd = U256::ZERO;
+            classification.gas_cost_usd = U256::ZERO;
+            classification.estimated_net_profit_usd = U256::ZERO;
+            classification.threshold_usd = U256::ZERO;
+            classification.shortfall_usd = U256::ZERO;
+            screened += 1;
+        }
+    }
+    outcome.interesting.clear();
+    outcome.triangle_interesting.clear();
+    screened
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::{Address, U256};
     use shadow::{ClassificationReason, FIXED_POINT_SCALE};
+
+    /// Task 2.3: with the simulation gate on, a gate-passing candidate is
+    /// screened fail-closed — reason downgraded, USD zeroed, counted — and
+    /// below-gate rows pass through untouched.
+    #[test]
+    fn simulation_gate_screens_gate_passers_fail_closed() {
+        fn gate_passer() -> shadow::Classification {
+            shadow::Classification {
+                gross_profit: U256::from(5u128 * FIXED_POINT_SCALE),
+                gross_profit_usd: U256::from(5u128 * FIXED_POINT_SCALE),
+                flash_cost_usd: U256::ZERO,
+                gas_cost_usd: U256::from(1_000),
+                estimated_net_profit_usd: U256::from(4u128 * FIXED_POINT_SCALE),
+                threshold_usd: U256::from(1_000),
+                shortfall_usd: U256::ZERO,
+                reason: ClassificationReason::AboveThreshold,
+            }
+        }
+        let mut below = gate_passer();
+        below.reason = ClassificationReason::BelowThreshold;
+        let mut outcome = PairRunOutcome::default();
+        let stub_quote = || crate::gaps::PairQuote {
+            token_lo: Address::ZERO,
+            token_hi: Address::ZERO,
+            input: U256::ZERO,
+            output: U256::ZERO,
+            profit: U256::ZERO,
+            toll: 0.0,
+            log2_skew: 0.0,
+            optimal_unclamped: U256::ZERO,
+            input_capacity: U256::ZERO,
+        };
+        outcome.pair_results = vec![(stub_quote(), gate_passer()), (stub_quote(), below)];
+        outcome.interesting = vec![([0u8; 20], [0u8; 20])];
+        outcome.triangle_results = vec![(stub_quote(), gate_passer())];
+        outcome.triangle_interesting = vec![7];
+
+        let screened = apply_simulation_gate(&mut outcome);
+
+        assert_eq!(screened, 2, "one pair + one triangle gate-passer");
+        assert!(outcome.interesting.is_empty() && outcome.triangle_interesting.is_empty());
+        for (quote, classification) in &outcome.pair_results {
+            let _ = quote;
+            match &classification.reason {
+                ClassificationReason::NotEvaluated { detail } => {
+                    assert!(detail.contains("simulation required"));
+                    assert_eq!(classification.estimated_net_profit_usd, U256::ZERO);
+                    assert_eq!(classification.gross_profit_usd, U256::ZERO);
+                    assert_eq!(classification.threshold_usd, U256::ZERO);
+                }
+                ClassificationReason::BelowThreshold => {}
+                other => panic!("unexpected surviving classification: {other:?}"),
+            }
+        }
+    }
 
     const WEI: u128 = FIXED_POINT_SCALE;
 
