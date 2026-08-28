@@ -26,6 +26,7 @@
 
 mod db;
 mod engine;
+mod executor;
 mod fork;
 mod tokens;
 
@@ -37,5 +38,6 @@ pub use engine::{
     FLASH_FEE_SCALE, LENDER_ADDRESS, LegResult, Outcome, RoundTripSim, SimError, Step,
     round_trip_steps,
 };
+pub use executor::{encode_v3_callback, executor_address, v3_callback_runtime};
 pub use fork::{ForkDb, ForkTx, fork_transact};
 pub use tokens::{TokenKind, TokenSpec, token_bytecode};

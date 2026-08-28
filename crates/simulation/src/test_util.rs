@@ -79,6 +79,27 @@ pub fn transfer_from(
     }
 }
 
+/// Runs one committed `transfer(to, amount)` against the assembled token —
+/// the caller (`CACHE_CALLER`) debits itself. `Err(reason)` when the transfer
+/// reverts or halts.
+pub fn transfer(
+    cache: &mut Cache,
+    token: Address,
+    to: Address,
+    amount: U256,
+) -> Result<(), String> {
+    let data = crate::engine::encode_transfer(to, amount);
+    let db = std::mem::take(&mut cache.db);
+    let (outcome, db) = crate::engine::run_tx(db, CACHE_CALLER, token, data);
+    cache.db = db;
+    let result = outcome?;
+    if result.is_success() {
+        Ok(())
+    } else {
+        Err(format!("{result:?}"))
+    }
+}
+
 /// Queries `balanceOf(who)` of `token` through the assembled `balanceOf` path
 /// (side-effect-free: runs on a throwaway clone).
 #[must_use]

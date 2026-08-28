@@ -7,10 +7,16 @@
 //! - [`TokenKind::FeeOnTransfer`]: `amount` is pulled from `from` but only
 //!   `amount * (1 - fee)` reaches `to` (the fee is burned) — the net-output
 //!   basis of the quote is wrong and revm sees the shortfall.
-//! - [`TokenKind::RevertOnTransfer`]: `transferFrom` always `REVERT`s.
+//! - [`TokenKind::RevertOnTransfer`]: transfers always `REVERT`.
 //! - [`TokenKind::Drain`]: `to` is credited `amount` then immediately
 //!   skimmed `drain_amount` (credited to a fixed siphon address) — the
 //!   executor's net check catches the silent outflow.
+//!
+//! Both `transferFrom(from, to, amount)` and `transfer(to, amount)` (the
+//! caller debits itself) exercise the same behavior halves — the V3
+//! settlement callback pays pools via plain `transfer`, so the honeypot
+//! screens must see fee-on-transfer, revert, and drain semantics on that
+//! path too.
 //!
 //! ## Storage layout
 //!
@@ -73,6 +79,7 @@ pub const fn siphon_address() -> alloy_primitives::Address {
 }
 
 const SEL_BALANCE_OF: u32 = 0x70a0_8231;
+const SEL_TRANSFER: u32 = 0xa905_9cbb;
 const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
 
 /// Returns the assembled fixture bytecode for [`TokenSpec`].
@@ -176,19 +183,48 @@ fn emit_revert(a: &mut Asm) {
     a.op(0xfd);
 }
 
-/// `transferFrom` debit half: require `balance_from >= amount`, then
+/// Calldata offsets for the two transfer shapes.
+///
+/// - `transferFrom(from, to, amount)`: from@0x04, to@0x24, amount@0x44.
+/// - `transfer(to, amount)`: to@0x04, amount@0x24 (from = CALLER).
+struct Offsets {
+    to: u8,
+    amount: u8,
+}
+
+const TRANSFER_FROM_OFFSETS: Offsets = Offsets {
+    to: 0x24,
+    amount: 0x44,
+};
+
+const TRANSFER_OFFSETS: Offsets = Offsets {
+    to: 0x04,
+    amount: 0x24,
+};
+
+/// Debit half: require `balance_from >= amount`, then
 /// `balance_from -= amount`.
-fn emit_discharge(a: &mut Asm) {
+///
+/// `transferFrom` reads `from` from calldata; `transfer` debits `CALLER`.
+fn emit_discharge(a: &mut Asm, from_caller: bool, offsets: &Offsets) {
     // stack: [selector]
-    a.push1(0x04);
-    a.op(0x35); // CALLDATALOAD -> [selector, from]
+    if from_caller {
+        a.op(0x33); // CALLER -> [selector, from]
+    } else {
+        a.push1(0x04);
+        a.op(0x35); // CALLDATALOAD -> [selector, from]
+    }
     a.op(0x54); // SLOAD -> [selector, balance_from]
-    a.push1(0x44);
+    a.push1(offsets.amount);
     a.op(0x35); // CALLDATALOAD -> [selector, balance_from, amount]
     a.dup(1); // [selector, balance_from, amount, amount]
-    a.push1(0x04);
-    a.op(0x35); // [selector, balance_from, amount, amount, from]
-    a.op(0x54); // [selector, balance_from, amount, amount, balance_from]
+    if from_caller {
+        a.op(0x33); // [selector, balance_from, amount, from]
+    } else {
+        a.push1(0x04);
+        a.op(0x35); // [selector, balance_from, amount, from]
+    }
+    a.op(0x54); // [selector, balance_from, amount, balance_from]
     a.op(0x10); // LT: balance_from < amount -> [selector, balance_from, amount, insufficient]
     a.op(0x15); // ISZERO -> [selector, balance_from, amount, sufficient]
     let j_sufficient = a.jumpi_placeholder(); // pops dest+flag -> [selector, balance_from, amount]
@@ -198,26 +234,30 @@ fn emit_discharge(a: &mut Asm) {
     // stack: [selector, balance_from, amount] — want balance_from - amount
     a.swap(1); // [selector, amount, balance_from]
     a.op(0x03); // SUB -> [selector, new_balance_from]
-    a.push1(0x04);
-    a.op(0x35); // [selector, new_balance_from, from]
+    if from_caller {
+        a.op(0x33); // [selector, new_balance_from, from]
+    } else {
+        a.push1(0x04);
+        a.op(0x35); // [selector, new_balance_from, from]
+    }
     a.op(0x55); // SSTORE(from, new_balance_from) -> [selector]
 }
 
-/// `transferFrom` credit half: `balance_to += credit` where `credit` is
-/// `amount` for a plain transfer or `amount * (10000 - fee_bps) / 10000` for
-/// the fee variant (fee burned).
-fn emit_credit(a: &mut Asm, fee_bps: u32) {
+/// Credit half: `balance_to += credit` where `credit` is `amount` for a plain
+/// transfer or `amount * (10000 - fee_bps) / 10000` for the fee variant (fee
+/// burned).
+fn emit_credit(a: &mut Asm, fee_bps: u32, offsets: &Offsets) {
     assert!(fee_bps <= 10_000, "fee_bps out of range");
     // stack: [selector]
-    a.push1(0x24);
+    a.push1(offsets.to);
     a.op(0x35); // CALLDATALOAD -> [selector, to]
     a.op(0x54); // SLOAD -> [selector, balance_to]
     let numerator = u16::try_from(10_000 - fee_bps).expect("numerator fits u16");
     if numerator == 10_000 {
-        a.push1(0x44);
+        a.push1(offsets.amount);
         a.op(0x35); // CALLDATALOAD -> [selector, balance_to, amount]
     } else {
-        a.push1(0x44);
+        a.push1(offsets.amount);
         a.op(0x35); // CALLDATALOAD -> [selector, balance_to, amount]
         a.push2(numerator); // [selector, balance_to, amount, numerator]
         a.op(0x02); // MUL -> [selector, balance_to, amount * numerator]
@@ -226,24 +266,23 @@ fn emit_credit(a: &mut Asm, fee_bps: u32) {
         a.op(0x04); // DIV -> [selector, balance_to, credit]
     }
     a.op(0x01); // ADD -> [selector, new_balance_to]
-    a.push1(0x24);
+    a.push1(offsets.to);
     a.op(0x35); // [selector, new_balance_to, to]
     a.op(0x55); // SSTORE(to, new_balance_to) -> [selector]
 }
 
 /// Skims `drain_amount` from `to` and credits it to the siphon address.
-/// `to` = calldataload(36); siphon slot = the siphon address word.
-fn emit_drain(a: &mut Asm, drain_amount: u64) {
+fn emit_drain(a: &mut Asm, drain_amount: u64, offsets: &Offsets) {
     let drain = drain_amount.to_be_bytes();
     let siphon = siphon_address();
     // stack: [selector]
-    a.push1(0x24);
+    a.push1(offsets.to);
     a.op(0x35); // [selector, to]
     a.op(0x54); // [selector, balance_to]
     a.push(&drain); // [selector, balance_to, drain]
     a.swap(1); // [selector, drain, balance_to]
     a.op(0x03); // SUB -> [selector, new_balance_to]
-    a.push1(0x24);
+    a.push1(offsets.to);
     a.op(0x35); // [selector, new_balance_to, to]
     a.op(0x55); // SSTORE(to, new_balance_to) -> [selector]
     // siphon += drain_amount
@@ -268,6 +307,10 @@ fn assemble(spec: TokenSpec) -> Vec<u8> {
     a.push4(SEL_BALANCE_OF);
     a.op(0x14); // EQ -> [selector, is_balance]
     let j_balance = a.jumpi_placeholder(); // pops dest, is_balance -> [selector]
+    a.dup(1); // [selector, selector]
+    a.push4(SEL_TRANSFER);
+    a.op(0x14); // EQ -> [selector, is_plain_transfer]
+    let j_plain = a.jumpi_placeholder();
     a.dup(1); // [selector, selector]
     a.push4(SEL_TRANSFER_FROM);
     a.op(0x14); // EQ -> [selector, is_transfer]
@@ -294,19 +337,39 @@ fn assemble(spec: TokenSpec) -> Vec<u8> {
         emit_revert(&mut a);
         return a.into_vec();
     }
-    emit_discharge(&mut a);
-    emit_credit(&mut a, spec.fee_bps);
+    emit_discharge(&mut a, false, &TRANSFER_FROM_OFFSETS);
+    emit_credit(&mut a, spec.fee_bps, &TRANSFER_FROM_OFFSETS);
     if matches!(spec.kind, TokenKind::Drain) {
-        emit_drain(&mut a, spec.drain_amount);
+        emit_drain(&mut a, spec.drain_amount, &TRANSFER_FROM_OFFSETS);
     }
 
-    // return true
+    // return true (shared with the plain-transfer branch, which jumps here)
     a.push1(0x01);
     a.push1(0x00);
     a.op(0x52); // MSTORE(offset=0, value=1) -> [selector]
     a.push1(0x20);
     a.push1(0x00);
     a.op(0xf3); // RETURN(offset=0, len=32)
+
+    // --- transfer(to, amount): from = CALLER ---
+    let site_plain = a.jumpdest();
+    a.bind(&j_plain, site_plain);
+    if matches!(spec.kind, TokenKind::RevertOnTransfer) {
+        emit_revert(&mut a);
+        return a.into_vec();
+    }
+    emit_discharge(&mut a, true, &TRANSFER_OFFSETS);
+    emit_credit(&mut a, spec.fee_bps, &TRANSFER_OFFSETS);
+    if matches!(spec.kind, TokenKind::Drain) {
+        emit_drain(&mut a, spec.drain_amount, &TRANSFER_OFFSETS);
+    }
+    // return true — duplicated epilogue (5 bytes) keeps both branches linear
+    a.push1(0x01);
+    a.push1(0x00);
+    a.op(0x52);
+    a.push1(0x20);
+    a.push1(0x00);
+    a.op(0xf3);
 
     a.into_vec()
 }
@@ -317,7 +380,7 @@ mod tests {
     use crate::db::balance_slot;
     use crate::test_util::{
         CACHE_CALLER, Cache, balance_of, cache, deploy_token, fixture_addr as addr, seed_balance,
-        transfer_from,
+        transfer, transfer_from,
     };
     use alloy_primitives::{Address, U256};
 
@@ -427,5 +490,94 @@ mod tests {
         assert_eq!(balance_of(cache, token, FROM), U256::from(1000));
         let direct = crate::db::read_slot(&cache.db, token, balance_slot(FROM));
         assert_eq!(direct, Some(U256::from(1000)));
+    }
+
+    // --- transfer(to, amount): caller debits itself ---
+
+    #[test]
+    fn plain_transfer_moves_full_amount_from_caller() {
+        let cache = &mut cache();
+        let token = addr(1);
+        seed(cache, token);
+
+        let result = transfer(cache, token, TO, U256::from(100));
+        assert!(result.is_ok());
+        assert_eq!(balance_of(cache, token, FROM), U256::from(900));
+        assert_eq!(balance_of(cache, token, TO), U256::from(600));
+    }
+
+    #[test]
+    fn plain_transfer_reverts_on_insufficient_balance() {
+        let cache = &mut cache();
+        let token = addr(1);
+        seed(cache, token);
+
+        let result = transfer(cache, token, TO, U256::from(2000));
+        assert!(result.is_err());
+        assert_eq!(balance_of(cache, token, FROM), U256::from(1000));
+        assert_eq!(balance_of(cache, token, TO), U256::from(500));
+    }
+
+    #[test]
+    fn plain_transfer_fee_on_transfer_credits_reduced_amount() {
+        let cache = &mut cache();
+        let token = addr(1);
+        seed(cache, token);
+        deploy_token(
+            cache,
+            token,
+            TokenSpec {
+                kind: TokenKind::FeeOnTransfer,
+                fee_bps: 1000, // 10%
+                ..Default::default()
+            },
+        );
+
+        let result = transfer(cache, token, TO, U256::from(100));
+        assert!(result.is_ok());
+        assert_eq!(balance_of(cache, token, FROM), U256::from(900));
+        assert_eq!(balance_of(cache, token, TO), U256::from(590));
+    }
+
+    #[test]
+    fn plain_transfer_drain_token_siphons_from_recipient() {
+        let cache = &mut cache();
+        let token = addr(1);
+        seed(cache, token);
+        deploy_token(
+            cache,
+            token,
+            TokenSpec {
+                kind: TokenKind::Drain,
+                drain_amount: 25,
+                ..Default::default()
+            },
+        );
+
+        let result = transfer(cache, token, TO, U256::from(100));
+        assert!(result.is_ok());
+        assert_eq!(balance_of(cache, token, FROM), U256::from(900));
+        assert_eq!(balance_of(cache, token, TO), U256::from(575));
+        assert_eq!(balance_of(cache, token, siphon_address()), U256::from(25));
+    }
+
+    #[test]
+    fn plain_transfer_revert_token_never_moves() {
+        let cache = &mut cache();
+        let token = addr(1);
+        seed(cache, token);
+        deploy_token(
+            cache,
+            token,
+            TokenSpec {
+                kind: TokenKind::RevertOnTransfer,
+                ..Default::default()
+            },
+        );
+
+        let result = transfer(cache, token, TO, U256::from(100));
+        assert!(result.is_err());
+        assert_eq!(balance_of(cache, token, FROM), U256::from(1000));
+        assert_eq!(balance_of(cache, token, TO), U256::from(500));
     }
 }

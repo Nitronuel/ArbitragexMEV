@@ -15,4 +15,4 @@ serde_json.workspace = true
 
 [dependencies.revm]
 version = "42"
-features = ["serde"]
+features = ["serde", "optional_eip3607"]

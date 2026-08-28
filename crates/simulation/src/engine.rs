@@ -177,6 +177,16 @@ pub(crate) fn encode_transfer_from(from: Address, to: Address, amount: U256) -> 
     Bytes::from(calldata)
 }
 
+/// The revm `transfer(to, amount)` calldata — the caller debits itself.
+#[cfg(test)]
+pub(crate) fn encode_transfer(to: Address, amount: U256) -> Bytes {
+    let mut calldata = Vec::with_capacity(68);
+    calldata.extend_from_slice(&0xa905_9cbb_u32.to_be_bytes());
+    calldata.extend_from_slice(&to.into_word().0);
+    calldata.extend_from_slice(&amount.to_be_bytes::<32>());
+    Bytes::from(calldata)
+}
+
 /// Runs one committed revm transaction; returns the committed database with
 /// the execution outcome.
 pub fn run_tx<D>(
