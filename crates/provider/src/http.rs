@@ -192,6 +192,22 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
         quantity(&response.result)
     }
 
+    /// Fetches a raw transaction by hash; `None` when unknown to the node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transport, budget, or malformed-response failures.
+    pub fn transaction_by_hash(&self, hash: &str) -> Result<Option<Value>, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_getTransactionByHash".to_owned(),
+            params: json!([hash]),
+        })?;
+        Ok(match response.result {
+            Value::Null => None,
+            v => Some(v),
+        })
+    }
+
     /// Reads contract bytecode at a block.
     ///
     /// # Errors

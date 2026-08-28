@@ -1463,8 +1463,9 @@ mod gate_probes {
 
 #[cfg(test)]
 mod router_swap_test {
+    use super::*;
     use crate::fork::ForkDb;
-    use alloy_primitives::{Address, Bytes, U256, keccak256};
+    use alloy_primitives::{Address, Bytes, TxKind, U256, keccak256};
     use revm::bytecode::Bytecode;
     use revm::context::TxEnv;
     use revm::database::CacheDB;
@@ -1480,6 +1481,7 @@ mod router_swap_test {
 
     #[test]
     #[ignore = "live: router swap replay, run with --ignored"]
+    #[allow(clippy::too_many_lines)]
     fn router_swap_replay() {
         use provider::{ChainReader, LiveHttp, ProviderBudget, RetryPolicy, ThreadSleeper};
         let rpc = std::env::var("ROBINHOOD_HTTP_RPC_URL")
@@ -1496,79 +1498,103 @@ mod router_swap_test {
             4663,
         );
         reader.validate_chain_id().unwrap();
-        // Block of the real router swap tx we decoded
-        let block = 47_918_280_u64;
+        // Find the newest NATIVE-input router swap in the recent horizon
+        // (the gateway serves state only ~1-2 min back, so the replay must
+        // target a tx from the last minute or two). Funding is a native
+        // balance insert — no token storage, no allowance.
+        let pm = crate::executor::pool_manager_address();
+        let swap_topic: alloy_primitives::B256 =
+            "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
+                .parse()
+                .unwrap();
         let router: Address = "0x65050a9b7e5075a2ba5ced7b1b64ee66262c40dc"
             .parse()
             .unwrap();
-        let weth: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
-            .parse()
-            .unwrap();
         let exec = Address::with_last_byte(0xEE);
-        // Find WETH balances slot via the V3 pool that holds WETH
-        let pool_v3: Address = "0x52e65b17fb6e5ba00ed806f37afcd2daa50271ca"
-            .parse()
-            .unwrap();
-        let bal_of = |token: Address, who: Address| -> U256 {
-            let mut cd = Vec::with_capacity(36);
-            cd.extend_from_slice(&0x70a0_8231_u32.to_be_bytes());
-            cd.extend_from_slice(&who.into_word().0);
-            let out = match reader.call(token, &Bytes::from(cd), block) {
-                Ok(o) => o,
-                Err(e) if e.to_string().contains("not found") => {
-                    eprintln!("SKIP: history pruned at block {block}: {e}");
-                    return U256::ZERO;
+        let head = reader.current_block().expect("head");
+        let mut found: Option<(String, u64, U256)> = None;
+        for back in [8u64, 40, 120, 400] {
+            let from = head.saturating_sub(back);
+            let logs = reader
+                .get_logs(&provider::LogFilter {
+                    from_block: from,
+                    to_block: head,
+                    addresses: vec![pm],
+                    topic0: swap_topic,
+                    topic0_alternates: Vec::new(),
+                })
+                .unwrap_or_default();
+            for l in logs.iter().rev() {
+                let Some(txh) = l["transactionHash"].as_str() else {
+                    continue;
+                };
+                let Ok(Some(t)) = reader.transaction_by_hash(txh) else {
+                    continue;
+                };
+                let to_ok = t["to"]
+                    .as_str()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(&format!("{router:?}")));
+                if !to_ok
+                    || !t["input"]
+                        .as_str()
+                        .is_some_and(|v| v.starts_with("0x4d819a2a"))
+                {
+                    continue;
                 }
-                Err(e) => panic!("balanceOf failed: {e}"),
-            };
-            U256::from_be_slice(&out)
-        };
-        let pool_bal = bal_of(weth, pool_v3);
-        println!("pool V3 WETH balance {pool_bal}");
-        let mut slot_found = None;
-        for s in 0..30u64 {
-            let k = mapping_slot(pool_v3.into_array(), U256::from(s));
-            match reader.storage_at(weth, k, block) {
-                Ok(v) if v == pool_bal && !v.is_zero() => {
-                    slot_found = Some(U256::from(s));
-                    println!("WETH slot {s}");
-                    break;
+                let value = U256::from_str_radix(
+                    t["value"]
+                        .as_str()
+                        .unwrap_or("0x0")
+                        .trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap_or_default();
+                if value.is_zero() {
+                    continue; // native-input only: trivial funding
                 }
-                Err(e) if e.to_string().contains("not found") => {
-                    eprintln!("SKIP: history pruned at block {block}: {e}");
-                    return;
-                }
-                _ => {}
+                let blk = u64::from_str_radix(
+                    t["blockNumber"]
+                        .as_str()
+                        .unwrap_or("0x0")
+                        .trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap_or_default();
+                found = Some((txh.to_owned(), blk, value));
+                break;
+            }
+            if found.is_some() {
+                break;
             }
         }
-        let Some(slot) = slot_found else {
-            eprintln!("SKIP: WETH slot not found");
+        let Some((tx_hash, block, tx_value)) = found else {
+            eprintln!("SKIP: no native router swap in the recent horizon");
             return;
         };
-        // Need real tx calldata - fetch it
-        let tx_hash = "0x8bf3f2f25c05e6f8d5fc2ae865aac50a2859060612fa9221f523a94dbe9f799b";
-        // For now, just call the router with the exact calldata from the real tx
-        // We fetch via RPC
-        let c = std::process::Command::new("curl").args(["-s","--max-time","15","-X","POST","-H","Content-Type: application/json","--data", &format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionByHash\",\"params\":[\"{tx_hash}\"]}}"), "https://rpc.mainnet.chain.robinhood.com"]).output().unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&c.stdout).unwrap();
-        let input = v["result"]["input"].as_str().unwrap().to_string();
-        println!("calldata len {}", input.len());
-        // fund exec with 1 ETH worth of WETH
-        let amount = U256::from(250_000_000_000_000_000u64);
+        println!("replaying {tx_hash} at block {block} value {tx_value}");
+        // Replay the router's exact calldata from the real tx.
+        let raw = reader
+            .transaction_by_hash(&tx_hash)
+            .expect("tx fetch")
+            .expect("tx exists");
+        let input = Bytes::from(
+            alloy_primitives::hex::decode(raw["input"].as_str().unwrap().trim_start_matches("0x"))
+                .unwrap(),
+        );
+        // Fund the caller's NATIVE balance directly — no token storage.
         let mut db = CacheDB::new(crate::fork::ForkDb::new(reader, block));
         db.insert_account_info(
             exec,
-            revm::state::AccountInfo::from_bytecode(Bytecode::new_legacy(Bytes::new())),
+            revm::state::AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000_u128), // 1 ETH
+                ..revm::state::AccountInfo::default()
+            },
         );
-        // seed exec WETH
-        let exec_key = mapping_slot(exec.into_array(), slot);
-        db.insert_account_storage(weth, exec_key, amount).unwrap();
         let tx = TxEnv::builder()
             .caller(exec)
             .kind(alloy_primitives::TxKind::Call(router))
-            .data(Bytes::from(
-                alloy_primitives::hex::decode(input.trim_start_matches("0x")).unwrap(),
-            ))
+            .value(tx_value)
+            .data(input)
             .gas_limit(5_000_000)
             .build()
             .unwrap();
@@ -1583,6 +1609,730 @@ mod router_swap_test {
         .build_mainnet();
         let res = evm.transact_commit(tx).unwrap();
         println!("router swap result: {res:?}");
-        assert!(res.is_success());
+        assert!(res.is_success(), "router swap replay failed: {res:?}");
+    }
+
+    // --- live fork replay (operator-run; ignored by default) ---
+
+    /// `swap(address recipient, bool zeroForOne, int256 amountSpecified,
+    /// uint160 sqrtPriceLimitX96, bytes data)`.
+    const SEL_V3_SWAP: u32 = 0x128a_cb08;
+
+    /// `Transfer(address,address,uint256)` topic0.
+    const TRANSFER_TOPIC: alloy_primitives::B256 = alloy_primitives::B256::new([
+        0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d,
+        0xaa, 0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23,
+        0xb3, 0xef,
+    ]);
+
+    /// `MIN_SQRT_RATIO + 1` — the tightest legal limit for zeroFor-one swaps.
+    const MIN_SQRT_RATIO_PLUS_1: u64 = 4_295_128_741;
+
+    /// A live V3 pool from the activity manifest (USDG/a30F, 0.3% fee).
+    const LIVE_V3_POOL: &str = "0x02175608F1b5E6b5ed221cCFdC7Be197D111D915";
+    const LIVE_TOKEN0: &str = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"; // USDG
+    const LIVE_TOKEN1: &str = "0xa30FA36Db767ad9eD3f7a60fC79526fB4d56D344";
+
+    /// Replays a real RHC V3 pool `swap()` through the settlement stub on a
+    /// block-pinned fork and cross-checks the executor's received output
+    /// against the in-range constant-product-equivalent formula.
+    ///
+    /// Funding is a seeded token0 balance (flash simulation is a later
+    /// phase); the stub pays the pool's positive delta exactly as in
+    /// production. Read-only against the chain; nothing is broadcast.
+    #[test]
+    #[ignore = "live: needs the RHC gateway; run with --ignored"]
+    #[allow(clippy::too_many_lines)]
+    fn fork_v3_leg_replay_matches_local_quote() {
+        use provider::{ChainReader, LiveHttp, ProviderBudget, RetryPolicy, ThreadSleeper};
+        use revm::database::CacheDB;
+        use revm::handler::{ExecuteCommitEvm, MainBuilder};
+        use std::time::Duration;
+
+        let rpc = std::env::var("ROBINHOOD_HTTP_RPC_URL")
+            .unwrap_or_else(|_| "https://rpc.mainnet.chain.robinhood.com".to_owned());
+        let reader = ChainReader::new(
+            LiveHttp::new(rpc.parse().expect("valid rpc url")),
+            ThreadSleeper,
+            ProviderBudget::new(40_000, 1 << 24),
+            RetryPolicy {
+                max_retries: 3,
+                initial_delay: Duration::from_millis(250),
+                max_delay: Duration::from_secs(2),
+            },
+            4663,
+        );
+        reader.validate_chain_id().expect("chain id");
+        let head = reader.current_block().expect("head");
+        let block = head - 2;
+
+        let pool: Address = LIVE_V3_POOL.parse().unwrap();
+        let token0: Address = LIVE_TOKEN0.parse().unwrap();
+        let token1: Address = LIVE_TOKEN1.parse().unwrap();
+
+        // Pool state at the pinned block: slot0 = sqrtPriceX96 | tick<<160,
+        // slot 1 = in-range liquidity.
+        let slot0 = reader.storage_at(pool, U256::ZERO, block).expect("slot0");
+        let mask = (U256::from(1) << U256::from(160)) - U256::from(1);
+        let sqrt_p = slot0 & mask;
+        let liquidity = reader.storage_at(pool, U256::from(1), block).expect("L");
+        assert!(!sqrt_p.is_zero() && !liquidity.is_zero(), "pool is idle");
+        let sqrt_p_f = f64_of_sqrt(sqrt_p);
+        let l_f = u256_to_f64(liquidity);
+
+        // Discover the real token's `balances` mapping slot from the pool's
+        // own known balance: find N such that storage[keccak(pool ++ N)]
+        // equals balanceOf(pool). Fixture-layout seeding is invisible to a
+        // real ERC-20, so the executor must be funded at the derived slot.
+        let balance_of = |token: Address, who: Address| -> U256 {
+            let mut cd = Vec::with_capacity(36);
+            cd.extend_from_slice(&0x70a0_8231_u32.to_be_bytes()); // balanceOf
+            cd.extend_from_slice(&who.into_word().0);
+            let out = reader
+                .call(token, &Bytes::from(cd), block)
+                .expect("balanceOf");
+            U256::from_be_slice(&out)
+        };
+        let pool_token0 = balance_of(token0, pool);
+        assert!(!pool_token0.is_zero(), "pool holds no token0");
+        let token1_balance = balance_of(token1, pool);
+        assert!(!token1_balance.is_zero(), "pool holds no token1");
+        let exec = executor_address();
+        let exec_token0 = balance_of(token0, exec);
+        assert!(exec_token0.is_zero(), "executor unexpectedly funded");
+        let balances_slot_of = |token: Address, pool_balance: U256| -> U256 {
+            (0u64..=10)
+                .find(|n| {
+                    let key = mapping_slot(pool.into_array(), U256::from(*n));
+                    reader
+                        .storage_at(token, key, block)
+                        .is_ok_and(|v| v == pool_balance)
+                })
+                .map_or(U256::MAX, U256::from)
+        };
+        let balances_slot = balances_slot_of(token0, pool_token0);
+        assert_ne!(balances_slot, U256::MAX, "token0 balances slot not found");
+        // token1's storage layout may not be discoverable; the received
+        // amount is read from its Transfer log instead.
+        // Size the input from the pool's REAL token1 balance: the tick's
+        // virtual liquidity can be unbacked (the honeypot signature), so a
+        // purely in-range sizing would demand an output the pool cannot
+        // pay. Target 0.1% of the real balance, i.e. move the price by
+        // f = target/(L*sqrtP), and fall back to the 0.01% in-range sizing
+        // when the balance backs more than that.
+        assert!(!token1_balance.is_zero(), "pool holds no token1");
+        let l_sqrt = l_f * sqrt_p_f;
+        let target_out_f = u256_to_f64(token1_balance) / 1000.0;
+        let f = (target_out_f / l_sqrt).min(5.0e-5);
+        let input_f = l_f * f / sqrt_p_f;
+        // Diagnostic input sizing; f64 rounding cannot move the price out of
+        // the in-range band this targets.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let input = U256::from(input_f.max(1_000.0) as u128);
+
+        // In-range expected output with the 0.3% fee taken from the input,
+        // first order in the (dust-sized) price move: dy = aIn * P.
+        let fee_den = 1_000_000.0;
+        let fee_num = 3000.0;
+        let a_in = input_f * (fee_den - fee_num) / fee_den;
+        let expected_out_f = a_in * sqrt_p_f * sqrt_p_f;
+
+        // Fork overlay: the stub at the executor address, funded with the
+        // input token at the real mapping slot.
+        let mut db = CacheDB::new(crate::fork::ForkDb::new(reader, block));
+        db.insert_account_info(
+            exec,
+            revm::state::AccountInfo::from_bytecode(Bytecode::new_legacy(v3_callback_runtime())),
+        );
+        let exec_key = mapping_slot(exec.into_array(), balances_slot) + exec_token0;
+        db.insert_account_storage(token0, exec_key, input).unwrap();
+
+        // swap(recipient=exec, zeroForOne, amountSpecified=input,
+        //      sqrtLimit=MIN+1, data=token0)
+        let mut cd = Vec::with_capacity(4 + 32 * 7);
+        cd.extend_from_slice(&SEL_V3_SWAP.to_be_bytes());
+        cd.extend_from_slice(&exec.into_word().0);
+        cd.extend_from_slice(&U256::from(1).to_be_bytes::<32>()); // true
+        cd.extend_from_slice(&input.to_be_bytes::<32>());
+        cd.extend_from_slice(&U256::from(MIN_SQRT_RATIO_PLUS_1).to_be_bytes::<32>());
+        cd.extend_from_slice(&U256::from(0xA0).to_be_bytes::<32>()); // data offset
+        cd.extend_from_slice(&U256::from(32).to_be_bytes::<32>()); // data len
+        let mut word = [0u8; 32];
+        word[12..].copy_from_slice(&token0.into_array());
+        cd.extend_from_slice(&word);
+
+        let tx = TxEnv::builder()
+            .caller(exec)
+            .kind(TxKind::Call(pool))
+            .data(Bytes::from(cd))
+            .gas_limit(5_000_000)
+            .build()
+            .unwrap();
+        let mut evm = <crate::engine::SimContext<
+            CacheDB<crate::fork::ForkDb<provider::LiveHttp, provider::ThreadSleeper>>,
+        >>::new(db, SpecId::PRAGUE)
+        .modify_cfg_chained(|cfg| {
+            cfg.disable_nonce_check = true;
+            cfg.disable_eip3607 = true; // the caller is a contract by design
+        })
+        .build_mainnet();
+        let result = evm.transact_commit(tx).expect("evm runs");
+        assert!(result.is_success(), "forked swap reverted: {result:?}");
+        let db = evm.ctx.journaled_state.database;
+
+        let slot_of =
+            |db: &CacheDB<crate::fork::ForkDb<provider::LiveHttp, provider::ThreadSleeper>>,
+             token: Address,
+             slot: U256|
+             -> U256 {
+                db.cache
+                    .accounts
+                    .get(&token)
+                    .and_then(|account| account.storage.get(&slot))
+                    .copied()
+                    .unwrap_or_default()
+            };
+        let paid_in = slot_of(&db, token0, mapping_slot(exec.into_array(), balances_slot));
+        // received: the token1 Transfer(pool -> exec) log's data word.
+        let exec_word = exec.into_word();
+        let received = result
+            .logs()
+            .iter()
+            .filter(|log| {
+                log.address == token1
+                    && log.topics().len() == 3
+                    && log.topics()[0] == TRANSFER_TOPIC
+                    && log.topics()[2] == exec_word
+            })
+            .map(|log| U256::from_be_slice(&log.data.data))
+            .fold(U256::ZERO, |a, v| a.checked_add(v).unwrap_or(U256::MAX));
+        assert_eq!(paid_in, U256::ZERO, "input fully spent via the callback");
+        let received_f = u256_to_f64(received);
+        let rel = (received_f - expected_out_f).abs() / expected_out_f;
+        eprintln!(
+            "fork replay: block={block} input={input} received={received} expected~{expected_out_f:.0} rel_err={rel:.4}"
+        );
+        assert!(
+            received > U256::ZERO,
+            "executor must receive the output token"
+        );
+        assert!(
+            rel < 0.05,
+            "received {received_f:.0} vs in-range expectation {expected_out_f:.0} (rel {rel:.4})"
+        );
+    }
+
+    #[test]
+    #[ignore = "live: needs the RHC gateway; run with --ignored"]
+    fn fork_stub_callback_with_real_token() {
+        use provider::{ChainReader, LiveHttp, ProviderBudget, RetryPolicy, ThreadSleeper};
+        use revm::database::CacheDB;
+        use revm::handler::{ExecuteCommitEvm, MainBuilder};
+        use std::time::Duration;
+
+        let rpc = std::env::var("ROBINHOOD_HTTP_RPC_URL")
+            .unwrap_or_else(|_| "https://rpc.mainnet.chain.robinhood.com".to_owned());
+        let reader = ChainReader::new(
+            LiveHttp::new(rpc.parse().expect("valid rpc url")),
+            ThreadSleeper,
+            ProviderBudget::new(40_000, 1 << 24),
+            RetryPolicy {
+                max_retries: 3,
+                initial_delay: Duration::from_millis(250),
+                max_delay: Duration::from_secs(2),
+            },
+            4663,
+        );
+        let head = reader.current_block().expect("head");
+        let block = head - 2;
+        let token0: Address = LIVE_TOKEN0.parse().unwrap();
+        let pool: Address = LIVE_V3_POOL.parse().unwrap();
+        let exec = executor_address();
+
+        let balance_of = |who: Address| -> U256 {
+            let mut cd = Vec::with_capacity(36);
+            cd.extend_from_slice(&0x70a0_8231_u32.to_be_bytes());
+            cd.extend_from_slice(&who.into_word().0);
+            let out = reader
+                .call(token0, &Bytes::from(cd), block)
+                .expect("balanceOf");
+            U256::from_be_slice(&out)
+        };
+        let pool_token0 = balance_of(pool);
+        let balances_slot: U256 = (0u64..=10)
+            .find(|n| {
+                let key = mapping_slot(pool.into_array(), U256::from(*n));
+                reader
+                    .storage_at(token0, key, block)
+                    .is_ok_and(|v| v == pool_token0)
+            })
+            .map(U256::from)
+            .expect("slot");
+        let amount = U256::from(1_000u64); // 0.001 USDG
+        let mut db = CacheDB::new(crate::fork::ForkDb::new(reader, block));
+        db.insert_account_info(
+            exec,
+            revm::state::AccountInfo::from_bytecode(Bytecode::new_legacy(v3_callback_runtime())),
+        );
+        let key = mapping_slot(exec.into_array(), balances_slot);
+        db.insert_account_storage(token0, key, amount).unwrap();
+
+        // Top-level call: EOA pays the pool directly through the stub.
+        let tx = TxEnv::builder()
+            .caller(Address::with_last_byte(0xE1))
+            .kind(TxKind::Call(exec))
+            .data(Bytes::from(encode_v3_callback(token0, amount)))
+            .gas_limit(1_000_000)
+            .build()
+            .unwrap();
+        let mut evm = <crate::engine::SimContext<
+            CacheDB<crate::fork::ForkDb<provider::LiveHttp, provider::ThreadSleeper>>,
+        >>::new(db, SpecId::PRAGUE)
+        .modify_cfg_chained(|cfg| {
+            cfg.disable_nonce_check = true;
+            cfg.disable_eip3607 = true;
+        })
+        .build_mainnet();
+        let result = evm.transact_commit(tx).expect("evm runs");
+        eprintln!("DEBUG direct-callback result: {result:?}");
+        let db = evm.ctx.journaled_state.database;
+        let paid = db
+            .cache
+            .accounts
+            .get(&token0)
+            .and_then(|a| {
+                a.storage
+                    .get(&mapping_slot(pool.into_array(), balances_slot))
+            })
+            .copied()
+            .unwrap_or_default();
+        assert!(result.is_success(), "stub callback on fork reverted");
+        assert_eq!(paid, amount, "pool must be paid on the fork");
+    }
+
+    /// Bisection: does `unlock` + a no-op `unlockCallback` succeed at all?
+    #[test]
+    #[ignore = "live: needs the RHC gateway; run with --ignored"]
+    fn fork_v4_unlock_noop() {
+        use provider::{ChainReader, LiveHttp, ProviderBudget, RetryPolicy, ThreadSleeper};
+        use revm::database::CacheDB;
+        use revm::handler::{ExecuteCommitEvm, MainBuilder};
+        use revm::primitives::hardfork::SpecId;
+        use std::time::Duration;
+
+        let rpc = std::env::var("ROBINHOOD_HTTP_RPC_URL")
+            .unwrap_or_else(|_| "https://rpc.mainnet.chain.robinhood.com".to_owned());
+        let reader = ChainReader::new(
+            LiveHttp::new(rpc.parse().expect("valid rpc url")),
+            ThreadSleeper,
+            ProviderBudget::new(20_000_000, 1 << 24),
+            RetryPolicy {
+                max_retries: 6,
+                initial_delay: Duration::from_secs(2),
+                max_delay: Duration::from_secs(30),
+            },
+            4663,
+        );
+        let head = reader.current_block().expect("head");
+        let block = head - 2;
+        let pm = pool_manager_address();
+        let exec = executor_address();
+
+        // A no-op callback: return abi-encoded empty bytes.
+        // MSTORE(0x200,0x40); MSTORE(0x220,0); RETURN(0x200,0x40)
+        let mut a: Vec<u8> = Vec::new();
+        let word = |out: &mut Vec<u8>, hi: u8, lo: u16| {
+            out.push(hi);
+            out.extend_from_slice(&lo.to_be_bytes());
+        };
+        word(&mut a, 0x61, 0x40);
+        word(&mut a, 0x61, 0x200);
+        a.push(0x52);
+        a.push(0x60);
+        a.push(0x00);
+        word(&mut a, 0x61, 0x220);
+        a.push(0x52);
+        word(&mut a, 0x61, 0x40);
+        word(&mut a, 0x61, 0x200);
+        a.push(0xf3);
+
+        let mut db = CacheDB::new(crate::fork::ForkDb::new(reader, block));
+        db.insert_account_info(
+            exec,
+            revm::state::AccountInfo::from_bytecode(Bytecode::new_legacy(Bytes::from(a))),
+        );
+        // unlock(bytes) with any data — the no-op callback settles nothing.
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&0x48c8_9491_u32.to_be_bytes());
+        cd.extend_from_slice(&alloy_primitives::U256::from(0x20).to_be_bytes::<32>());
+        cd.extend_from_slice(&alloy_primitives::U256::from(0).to_be_bytes::<32>());
+        let tx = TxEnv::builder()
+            .caller(exec)
+            .kind(TxKind::Call(pm))
+            .data(Bytes::from(cd))
+            .gas_limit(1_000_000)
+            .build()
+            .unwrap();
+        let mut evm = <crate::engine::SimContext<
+            CacheDB<crate::fork::ForkDb<provider::LiveHttp, provider::ThreadSleeper>>,
+        >>::new(db, SpecId::PRAGUE)
+        .modify_cfg_chained(|cfg| {
+            cfg.disable_nonce_check = true;
+            cfg.disable_eip3607 = true;
+        })
+        .build_mainnet();
+        let result = evm.transact_commit(tx).expect("evm runs");
+        eprintln!("DEBUG v4 noop unlock: {result:?}");
+        assert!(result.is_success(), "noop unlock failed: {result:?}");
+    }
+
+    /// Replays a real RHC V4 pool swap through the unlock/settlement stub on
+    /// a block-pinned fork. The `PoolManager` executes its real `unlock`;
+    /// the stub performs the re-entrant `swap`, pays the input via
+    /// `transfer`+`settle`, and pulls the output via `take` with the
+    /// swap's own return delta. Read-only; nothing is broadcast.
+    #[test]
+    #[ignore = "live: needs the RHC gateway; run with --ignored"]
+    #[allow(clippy::too_many_lines)]
+    fn fork_v4_leg_replay_matches_local_quote() {
+        use provider::{ChainReader, LiveHttp, ProviderBudget, RetryPolicy, ThreadSleeper};
+        use revm::database::CacheDB;
+        use revm::handler::{ExecuteCommitEvm, MainBuilder};
+        use revm::primitives::hardfork::SpecId;
+        use std::time::Duration;
+
+        use crate::fork::{ForkTx, fork_transact};
+
+        let rpc = std::env::var("ROBINHOOD_HTTP_RPC_URL")
+            .unwrap_or_else(|_| "https://rpc.mainnet.chain.robinhood.com".to_owned());
+        let reader = ChainReader::new(
+            LiveHttp::new(rpc.parse().expect("valid rpc url")),
+            ThreadSleeper,
+            // Diagnostic test on the unmetered public gateway: a generous
+            // budget because candidate probing reads several pools.
+            ProviderBudget::new(20_000_000, 1 << 24),
+            RetryPolicy {
+                max_retries: 6,
+                initial_delay: Duration::from_secs(2),
+                max_delay: Duration::from_secs(30),
+            },
+            4663,
+        );
+        reader.validate_chain_id().expect("chain id");
+        let head = reader.current_block().expect("head");
+        let block = head - 2;
+        let pm = pool_manager_address();
+
+        // Manifest V4 candidates with key immutables resolved from each
+        // pool's Initialize event (raw eth_getLogs 2026-08-27; the manifest
+        // fee_numerator is an OBSERVED fee and differs from the key fee on
+        // several pools). The event's hooks word is a non-key artifact; the
+        // key derives canonically with hooks = address(0) for every pool
+        // probed. Native-currency pools are skipped (payment path differs).
+        // Active pools (recent Swap events) resolve to dynamic-fee keys
+        // (sentinel 0x800000): the fee charged comes from the hook at swap
+        // time, so the output check below uses a sanity band, and the stub
+        // pulls the pool's own return delta via take().
+        let candidates: [(alloy_primitives::B256, Address, Address, u32, i32, Address); 3] = [
+            (
+                "0xab044f2db051cd39aecb7ed0d2f9facd5731ff9387f9648e72e9e5803257be79"
+                    .parse()
+                    .unwrap(),
+                "0x1c338e6b0e02a8212544f962d3cc619b53fbbd6d"
+                    .parse()
+                    .unwrap(),
+                "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec"
+                    .parse()
+                    .unwrap(),
+                0,
+                200,
+                "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044"
+                    .parse()
+                    .unwrap(),
+            ),
+            (
+                "0x23bcbfacd38446f8beaeb3af134e7028a2c385149b2fae415fe83775bb9a404b"
+                    .parse()
+                    .unwrap(),
+                "0xafe41f4356c24f716111de1fbbc84e061d291e18"
+                    .parse()
+                    .unwrap(),
+                "0xB90A19ff0Af67F7779aFF50a882A9CFF42446400"
+                    .parse()
+                    .unwrap(),
+                8_388_608,
+                8,
+                "0x4e3468951d49f2eea976ed0d6e75ffcb44a9a544"
+                    .parse()
+                    .unwrap(),
+            ),
+            (
+                "0x001cf1577c95c4dc5d85a3e57157781247d4aca8964dab1bc2a3cfebe400aa52"
+                    .parse()
+                    .unwrap(),
+                "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+                    .parse()
+                    .unwrap(),
+                "0x8e62F281f282686fCa6dCB39288069a93fC23F1c"
+                    .parse()
+                    .unwrap(),
+                15_600,
+                312,
+                Address::ZERO,
+            ),
+        ];
+
+        // Canonical poolId derivation — must reproduce the Initialize
+        // topic1 for every candidate (verified live 2026-08-27).
+        let derive_id = |c0: Address,
+                         c1: Address,
+                         fee: u32,
+                         ts: i32,
+                         hooks: Address|
+         -> alloy_primitives::B256 {
+            let mut buf = Vec::with_capacity(160);
+            buf.extend_from_slice(c0.into_word().as_slice());
+            buf.extend_from_slice(c1.into_word().as_slice());
+            buf.extend_from_slice(&U256::from(fee).to_be_bytes::<32>());
+            buf.extend_from_slice(&U256::from(ts.cast_unsigned()).to_be_bytes::<32>());
+            buf.extend_from_slice(hooks.into_word().as_slice());
+            alloy_primitives::keccak256(buf)
+        };
+
+        let mut pool_id = alloy_primitives::B256::ZERO;
+        let mut currency0 = Address::ZERO;
+        let mut currency1 = Address::ZERO;
+        let mut fee: u32 = 0;
+        let mut tick_spacing: i32 = 0;
+        let mut hooks = Address::ZERO;
+        let mut sqrt_p = U256::ZERO;
+        let mut liquidity = U256::ZERO;
+        let mut last_swap_fee: Option<u32> = None;
+        for (id, c0, c1, f, ts, hk) in candidates {
+            assert_eq!(
+                derive_id(c0, c1, f, ts, hk).as_slice(),
+                id.as_slice(),
+                "key derivation must reproduce the Initialize poolId"
+            );
+            let state_slot = |slot: u64| -> U256 {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(id.as_slice());
+                buf[32..].copy_from_slice(&U256::from(slot).to_be_bytes::<32>());
+                U256::from_be_bytes(alloy_primitives::keccak256(buf).0)
+            };
+            // In-range liquidity: the fork's State layout hides it from
+            // plain storage probes, so take it from the pool's most recent
+            // Swap event (word 4 = liquidity, canonical V4 Swap data).
+            let swap_topic: alloy_primitives::B256 =
+                "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
+                    .parse()
+                    .unwrap();
+            let swaps = reader
+                .get_logs(&provider::LogFilter {
+                    from_block: block.saturating_sub(2_000),
+                    to_block: block,
+                    addresses: vec![pm],
+                    topic0: swap_topic,
+                    topic0_alternates: Vec::new(),
+                })
+                .unwrap_or_default();
+            let id_hex = id.to_string().to_ascii_lowercase();
+            let swap_log = swaps.iter().find(|log| {
+                log["topics"].as_array().is_some_and(|t| {
+                    t.len() >= 2
+                        && t[1]
+                            .as_str()
+                            .is_some_and(|v| v.to_ascii_lowercase() == id_hex)
+                })
+            });
+            let Some(swap_log) = swap_log else {
+                eprintln!("DEBUG v4 cand fee={f} ts={ts}: no recent swap");
+                continue;
+            };
+            let Some(sd) = swap_log["data"]
+                .as_str()
+                .and_then(|d| alloy_primitives::hex::decode(d.trim_start_matches("0x")).ok())
+            else {
+                continue;
+            };
+            if sd.len() < 192 {
+                continue;
+            }
+            // Canonical V4 Swap data: [amount0, amount1, sqrtP, liquidity,
+            // tick, fee]. Word 3 = liquidity; word 5 = the fee the hook
+            // charged (the dynamic-fee observation task 3.1 needs).
+            let liq = U256::from_be_slice(&sd[96..128])
+                & ((U256::from(1) << U256::from(128)) - U256::from(1));
+            last_swap_fee = Some(u32::try_from(U256::from_be_slice(&sd[160..192])).unwrap_or(fee));
+            let slot0 = reader
+                .storage_at(pm, state_slot(6), block)
+                .unwrap_or_default()
+                & ((U256::from(1) << U256::from(160)) - U256::from(1));
+            eprintln!("DEBUG v4 cand fee={f} ts={ts} swap_liq={liq}");
+            if !slot0.is_zero() && !liq.is_zero() {
+                pool_id = id;
+                currency0 = c0;
+                currency1 = c1;
+                fee = f;
+                tick_spacing = ts;
+                hooks = hk;
+                sqrt_p = slot0;
+                liquidity = liq;
+                break;
+            }
+            eprintln!("DEBUG v4 cand fee={f} ts={ts} slot0={slot0} liq={liq}");
+            if !slot0.is_zero() && !liq.is_zero() {
+                pool_id = id;
+                currency0 = c0;
+                currency1 = c1;
+                fee = f;
+                tick_spacing = ts;
+                hooks = hk;
+                sqrt_p = slot0;
+                liquidity = liq;
+                break;
+            }
+        }
+        assert!(
+            !pool_id.is_zero() && !liquidity.is_zero(),
+            "no candidate pool is live (key resolved + in-range liquidity)"
+        );
+        let sqrt_p_f = f64_of_sqrt(sqrt_p);
+        let l_f = u256_to_f64(liquidity);
+        eprintln!(
+            "DEBUG v4 pool fee={fee} tickSpacing={tick_spacing} hooks={hooks} sqrtP={sqrt_p} L={liquidity}"
+        );
+
+        let balance_of = |token: Address, who: Address| -> U256 {
+            let mut cd = Vec::with_capacity(36);
+            cd.extend_from_slice(&0x70a0_8231_u32.to_be_bytes()); // balanceOf
+            cd.extend_from_slice(&who.into_word().0);
+            let out = reader
+                .call(token, &Bytes::from(cd), block)
+                .expect("balanceOf");
+            U256::from_be_slice(&out)
+        };
+        // The PoolManager holds every V4 reserve; size the input from its
+        // REAL currency1 balance (unbacked virtual liquidity would revert).
+        let pm_out_balance = balance_of(currency1, pm);
+        assert!(!pm_out_balance.is_zero(), "PM holds no currency1");
+        let exec = executor_address();
+        let pm_in_balance = balance_of(currency0, pm);
+        assert!(!pm_in_balance.is_zero(), "PM holds no currency0");
+        let exec_in = balance_of(currency0, exec);
+        assert!(exec_in.is_zero(), "executor unexpectedly funded");
+
+        // Input: target 0.1% of the PM's real currency1 balance.
+        let l_sqrt = l_f * sqrt_p_f;
+        let target_out_f = u256_to_f64(pm_out_balance) / 1000.0;
+        let f = (target_out_f / l_sqrt).min(5.0e-5);
+        let input_f = l_f * f / sqrt_p_f;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let input = U256::from(input_f.max(1_000.0) as u128);
+        // First-order expected output: dy = aIn * P with the fee on input.
+        // The key fee may be the dynamic sentinel; the OBSERVED fee from the
+        // pool's last swap is the best estimate of what the hook will charge.
+        let observed_fee = last_swap_fee.unwrap_or(fee);
+        eprintln!("DEBUG v4 observed fee={observed_fee} (key fee {fee})");
+        let expected_out_f =
+            input_f * (1_000_000.0 - f64::from(observed_fee)) / 1_000_000.0 * sqrt_p_f * sqrt_p_f;
+
+        // Fund the executor by replaying a real ERC-20 transfer FROM the
+        // PoolManager (which holds currency0 reserves) — no storage-layout
+        // probing needed. Simulation only: nothing is broadcast. The
+        // settlement stub is then deployed into the post-funding overlay.
+        let ForkTx {
+            db,
+            result: fund_result,
+        } = fork_transact(
+            reader,
+            block,
+            pm,
+            currency0,
+            crate::engine::encode_transfer(exec, input),
+        )
+        .expect("fork db");
+        assert!(
+            fund_result
+                .as_ref()
+                .is_ok_and(revm::context_interface::result::ExecutionResult::is_success),
+            "executor funding transfer reverted: {fund_result:?}"
+        );
+        let mut db = db;
+        db.insert_account_info(
+            exec,
+            revm::state::AccountInfo::from_bytecode(Bytecode::new_legacy(
+                v4_unlock_callback_runtime(),
+            )),
+        );
+
+        let intent = V4SwapIntent {
+            currency0,
+            currency1,
+            fee,
+            tick_spacing,
+            hooks,
+            zero_for_one: true,
+            amount_specified: input,
+            sqrt_price_limit: min_sqrt_ratio_plus_1(),
+            currency_in: currency0,
+            currency_out: currency1,
+        };
+        let tx = TxEnv::builder()
+            .caller(exec)
+            .kind(TxKind::Call(pm))
+            .data(Bytes::from(encode_v4_unlock(&intent)))
+            .gas_limit(5_000_000)
+            .build()
+            .unwrap();
+        let mut evm = <crate::engine::SimContext<
+            CacheDB<crate::fork::ForkDb<provider::LiveHttp, provider::ThreadSleeper>>,
+        >>::new(db, SpecId::PRAGUE)
+        .modify_cfg_chained(|cfg| {
+            cfg.disable_nonce_check = true;
+            cfg.disable_eip3607 = true;
+        })
+        .build_mainnet();
+        let result = evm.transact_commit(tx).expect("evm runs");
+        assert!(result.is_success(), "forked v4 swap reverted: {result:?}");
+
+        // Received: the currency1 Transfer(PM -> exec) log's data word.
+        let exec_word = exec.into_word();
+        let received = result
+            .logs()
+            .iter()
+            .filter(|log| {
+                log.address == currency1
+                    && log.topics().len() == 3
+                    && log.topics()[0] == TRANSFER_TOPIC
+                    && log.topics()[2] == exec_word
+            })
+            .map(|log| U256::from_be_slice(&log.data.data))
+            .fold(U256::ZERO, |a, v| a.checked_add(v).unwrap_or(U256::MAX));
+        let received_f = u256_to_f64(received);
+        // Dynamic fee: the hook sets the fee at swap time, so the received
+        // amount must fall in [50%, 100%] of the zero-fee first-order
+        // expectation; the implied fee is reported as a diagnostic.
+        let implied_fee_pct = (1.0 - received_f / expected_out_f) * 100.0;
+        eprintln!(
+            "v4 fork replay: block={block} input={input} received={received} expected~{expected_out_f:.0} implied_fee={implied_fee_pct:.3}%"
+        );
+        assert!(received > U256::ZERO, "executor must receive currency1");
+        assert!(
+            received_f <= expected_out_f * 1.001 && received_f >= expected_out_f * 0.5,
+            "received {received_f:.0} outside the dynamic-fee band [50%,100%] of {expected_out_f:.0}"
+        );
+    }
+    fn f64_of_sqrt(sqrt: U256) -> f64 {
+        u256_to_f64(sqrt) / 2f64.powi(96)
+    }
+
+    /// Lossy f64 conversion for diagnostic math only (never the gate).
+    #[allow(clippy::cast_precision_loss)]
+    fn u256_to_f64(value: U256) -> f64 {
+        let bits = value.to_be_bytes::<32>();
+        let high = u128::from_be_bytes(bits[..16].try_into().unwrap());
+        let low = u128::from_be_bytes(bits[16..].try_into().unwrap());
+        high as f64 * 2f64.powi(128) + low as f64
     }
 }
