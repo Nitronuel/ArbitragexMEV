@@ -1386,3 +1386,77 @@ mod tests {
         high as f64 * 2f64.powi(128) + low as f64
     }
 }
+
+#[cfg(test)]
+mod gate_probes {
+    use alloy_primitives::keccak256;
+    #[test]
+    #[ignore = "diagnostic"]
+    fn probe_swap_signature_wide() {
+        let key = "(address,address,uint24,int24,address)";
+        let fields = [
+            "bool", "int256", "int128", "uint160", "uint128", "uint24", "address", "bytes",
+            "bytes32", "uint256",
+        ];
+        // Selectors forwarded inside a real router swap tx (decoded
+        // 2026-08-28): the router passes the PM address + inner payloads.
+        let targets = [
+            "b56079fd", "6a90e8e3", "a50271ca",
+            // earlier dispatcher unknowns, kept for coverage
+            "5750565b", "708daca9", "c7d39266", "efd1fc6a", "96168273", "18c639ce", "d76453e0",
+            "988d2681", "4549b62c", "18c6db6d",
+        ];
+        let want: Vec<[u8; 4]> = targets
+            .iter()
+            .map(|t| {
+                let mut b = [0u8; 4];
+                for i in 0..4 {
+                    b[i] = u8::from_str_radix(&t[2 * i..2 * i + 2], 16).unwrap();
+                }
+                b
+            })
+            .collect();
+        for a in fields {
+            for b in fields {
+                for c in fields {
+                    for d in fields {
+                        for tail in ["", ",bytes", ",bytes,bytes"] {
+                            for pr in [
+                                format!("({a},{b},{c},{d})"),
+                                format!("({a},{b},{c},{d},bytes)"),
+                                format!("({a},{b},{c},{d},bytes,bytes)"),
+                                format!("({a},{b},{c},{d},bytes32)"),
+                            ] {
+                                let sig = format!("swap({key},{pr}{tail})");
+                                let h = keccak256(sig.as_bytes());
+                                if want.iter().any(|w| *w == h[..4]) {
+                                    println!(
+                                        "SWAPSIG 0x{} {sig}",
+                                        alloy_primitives::hex::encode(&h[..4])
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("wide brute done");
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn probe_gpo_selectors() {
+        for sig in [
+            "baseFee()",
+            "scalar()",
+            "overhead()",
+            "l1BaseFee()",
+            "gasPrice()",
+            "l1Fee(uint256)",
+        ] {
+            let h = keccak256(sig.as_bytes());
+            println!("GPO {sig} = 0x{}", alloy_primitives::hex::encode(&h[..4]));
+        }
+    }
+}
