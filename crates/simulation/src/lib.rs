@@ -38,6 +38,10 @@ pub use engine::{
     FLASH_FEE_SCALE, LENDER_ADDRESS, LegResult, Outcome, RoundTripSim, SimError, Step,
     round_trip_steps,
 };
-pub use executor::{encode_v3_callback, executor_address, v3_callback_runtime};
+pub use executor::{
+    V4SwapIntent, encode_v3_callback, encode_v4_unlock, encode_v4_unlock_callback,
+    executor_address, max_sqrt_ratio_minus_1, min_sqrt_ratio_plus_1, pool_manager_address,
+    v3_callback_runtime, v4_unlock_callback_runtime,
+};
 pub use fork::{ForkDb, ForkTx, fork_transact};
 pub use tokens::{TokenKind, TokenSpec, token_bytecode};

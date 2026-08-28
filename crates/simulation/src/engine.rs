@@ -206,7 +206,13 @@ where
         .build()
         .expect("static transaction fields");
     let mut evm = <SimContext<D>>::new(db, SpecId::PRAGUE)
-        .modify_cfg_chained(|cfg| cfg.disable_nonce_check = true)
+        .modify_cfg_chained(|cfg| {
+            cfg.disable_nonce_check = true;
+            // Simulation actors may carry code (e.g. a caller replaying a
+            // transfer from a contract it controls); tx validation is not
+            // the simulator's job.
+            cfg.disable_eip3607 = true;
+        })
         .build_mainnet();
     let outcome = evm.transact_commit(tx);
     (
