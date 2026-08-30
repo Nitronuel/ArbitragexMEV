@@ -349,7 +349,7 @@ mod tests {
         let token1 = Address::from_slice(&TOKEN1).to_checksum(None);
         format!(
             "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,source\n\
-             4663,{pool},{factory},{token0},{token1},997,1000,fixture\n"
+              4663,{pool},{factory},{token0},{token1},997,1000,fixture\n"
         )
     }
 

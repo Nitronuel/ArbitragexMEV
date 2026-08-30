@@ -24,10 +24,14 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::all, clippy::pedantic)]
 
+#[cfg(test)]
+mod capture_test;
 mod db;
 mod engine;
 mod executor;
 mod fork;
+#[allow(dead_code, clippy::too_many_arguments, clippy::doc_markdown)]
+mod payload_builder;
 mod tokens;
 
 #[cfg(test)]
