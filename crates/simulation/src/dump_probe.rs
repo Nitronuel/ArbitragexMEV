@@ -10,6 +10,9 @@
     clippy::match_same_arms
 )]
 
+use revm::context_interface::journaled_state::JournalTr as _;
+use revm::context_interface::local::LocalContextTr as _;
+
 #[test]
 #[ignore = "live: needs the RHC gateway; run with --ignored"]
 fn dump_router_calldata() {
@@ -397,4 +400,209 @@ fn executor_v2_replay() {
             }
         }
     }
+}
+
+/// Records every CALL made during the router swap to expose the PoolManager's
+/// real function ABI (the fork's dispatch is via-IR — no PUSH4 immediates).
+#[derive(Default)]
+pub struct CallTreeInspector {
+    pub calls: Vec<(usize, String, String, u128)>,
+    pub pm_inputs: Vec<(String, String)>,
+}
+
+impl<CTX, INTR> revm::inspector::Inspector<CTX, INTR> for CallTreeInspector
+where
+    CTX: revm::context_interface::ContextTr,
+    INTR: revm::interpreter::InterpreterTypes,
+{
+    fn call(
+        &mut self,
+        context: &mut CTX,
+        inputs: &mut revm::interpreter::CallInputs,
+    ) -> Option<revm::interpreter::CallOutcome> {
+        let depth = context.journal().depth();
+        let target = inputs.target_address;
+        let value = inputs.value.clone().get().to::<u128>();
+        let input: Vec<u8> = match &inputs.input {
+            revm::interpreter::CallInput::Bytes(bytes) => bytes.to_vec(),
+            revm::interpreter::CallInput::SharedBuffer(range) => context
+                .local()
+                .shared_memory_buffer_slice(range.clone())
+                .map(|b| b.to_vec())
+                .unwrap_or_default(),
+        };
+        let selector = if input.len() >= 4 {
+            alloy_primitives::hex::encode(&input[..4])
+        } else {
+            format!("len{}", input.len())
+        };
+        self.calls
+            .push((depth, format!("{target:#?}"), selector.clone(), value));
+        let pm_target = alloy_primitives::Address::new([
+            0x83, 0x66, 0xa3, 0x9c, 0xc6, 0x70, 0xb4, 0x00, 0x1a, 0x11, 0x21, 0xb8, 0xf6, 0xa4,
+            0x43, 0xa6, 0x43, 0xe4, 0x09, 0x51,
+        ]);
+        if target == pm_target {
+            self.pm_inputs.push((
+                selector.clone(),
+                alloy_primitives::hex::encode(&input[4..input.len().min(4 + 320)]),
+            ));
+        }
+        None
+    }
+}
+
+/// Simulate the 1-leg router swap through ExecutorV2 and dump the sub-call
+/// tree: this IS the live PM ABI (unlock/take/settle/swap selectors).
+#[test]
+#[ignore = "live: needs the RHC gateway; run with --ignored"]
+fn router_subcall_tree() {
+    use crate::payload_builder::{RouteElement, V4_DYNAMIC_FEE_SENTINEL, encode_swap_calldata};
+    use provider::{ChainReader, LiveHttp, ProviderBudget, RetryPolicy, ThreadSleeper};
+    use revm::context::TxEnv;
+    use revm::database::CacheDB;
+    use revm::handler::MainBuilder;
+    use revm::inspector::InspectEvm;
+    use revm::primitives::hardfork::SpecId;
+
+    let rpc = std::env::var("ROBINHOOD_HTTP_RPC_URL")
+        .unwrap_or_else(|_| "https://rpc.mainnet.chain.robinhood.com".to_owned());
+    let reader = ChainReader::new(
+        LiveHttp::new(rpc.parse().unwrap()),
+        provider::ThreadSleeper,
+        ProviderBudget::new(400_000, 1 << 24),
+        RetryPolicy {
+            max_retries: 6,
+            initial_delay: std::time::Duration::from_secs(2),
+            max_delay: std::time::Duration::from_secs(30),
+        },
+        4663,
+    );
+    reader.validate_chain_id().unwrap();
+
+    let executor: alloy_primitives::Address = "0x5d1Aa3f67AC0Ee82FB46497deE85105C070AE93B"
+        .parse()
+        .unwrap();
+    let owner: alloy_primitives::Address = "0x3219E15A8d1e82368340dfB6697fE6a6B41d686D"
+        .parse()
+        .unwrap();
+    let token: alloy_primitives::Address = "0xccf14ec1f58b04baa52ce0c562899c26db7d1e18"
+        .parse()
+        .unwrap();
+    let hook: alloy_primitives::Address = "0x4e3468951d49f2eea976ed0d6e75ffcb44a9a544"
+        .parse()
+        .unwrap();
+    let router: alloy_primitives::Address = "0x65050A9b7E5075A2bA5cED7b1b64EE66262c40Dc"
+        .parse()
+        .unwrap();
+    let pm: alloy_primitives::Address = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+        .parse()
+        .unwrap();
+
+    let elements = [RouteElement::v4(
+        alloy_primitives::Address::ZERO,
+        token,
+        V4_DYNAMIC_FEE_SENTINEL,
+        8,
+        hook,
+    )];
+    let amount = alloy_primitives::U256::from(20_000_000_000_000_000_u64);
+    let router_data = encode_swap_calldata(
+        &elements,
+        amount,
+        alloy_primitives::U256::ZERO,
+        alloy_primitives::U256::from(1_900_000_000_u64),
+    )
+    .unwrap();
+
+    let mut data = Vec::new();
+    data.extend_from_slice(
+        &alloy_primitives::keccak256("execute(address,uint256,bytes,uint256)")[0..4],
+    );
+    data.extend_from_slice(&[0u8; 32]);
+    data.extend_from_slice(&amount.to_be_bytes::<32>());
+    data.extend_from_slice(&alloy_primitives::U256::from(0x80u32).to_be_bytes::<32>());
+    data.extend_from_slice(&alloy_primitives::U256::ZERO.to_be_bytes::<32>());
+    data.extend_from_slice(&alloy_primitives::U256::from(router_data.len()).to_be_bytes::<32>());
+    data.extend_from_slice(&router_data);
+
+    let head = reader.current_block().expect("head");
+    let mut db = CacheDB::new(crate::fork::ForkDb::new(reader, head));
+    db.insert_account_info(
+        owner,
+        revm::state::AccountInfo {
+            balance: alloy_primitives::U256::from(1_000_000_000_000_000_000_u128),
+            ..revm::state::AccountInfo::default()
+        },
+    );
+    let tx = TxEnv::builder()
+        .caller(owner)
+        .kind(alloy_primitives::TxKind::Call(executor))
+        .value(amount)
+        .data(alloy_primitives::Bytes::from(data))
+        .gas_limit(3_000_000)
+        .build()
+        .unwrap();
+    let inspector = CallTreeInspector::default();
+    let mut evm = <crate::engine::SimContext<
+        CacheDB<crate::fork::ForkDb<provider::LiveHttp, provider::ThreadSleeper>>,
+    >>::new(db, SpecId::PRAGUE)
+    .modify_cfg_chained(|cfg| {
+        cfg.disable_nonce_check = true;
+        cfg.disable_eip3607 = true;
+    })
+    .build_mainnet_with_inspector(inspector);
+    let res = evm.inspect_one_tx(tx).unwrap();
+    println!(
+        "result: {}",
+        if res.is_success() {
+            "SUCCESS"
+        } else {
+            "REVERT"
+        }
+    );
+    println!("sub-call tree (depth, target, selector, value):");
+    for (depth, target, sel, value) in &evm.inspector.calls {
+        let label = if *target == format!("{pm:#?}") {
+            "PM"
+        } else if *target == format!("{router:#?}") {
+            "ROUTER"
+        } else if *target == format!("{hook:#?}") {
+            "HOOK"
+        } else {
+            ""
+        };
+        println!("  d{depth} {label:6} {target} sel=0x{sel} value={value}");
+    }
+}
+
+/// Print fresh router calldata for the 1-leg native route (for fork tests).
+#[test]
+#[ignore = "live: prints fresh calldata; run with --ignored"]
+fn print_fresh_router_calldata() {
+    use crate::payload_builder::{RouteElement, V4_DYNAMIC_FEE_SENTINEL, encode_swap_calldata};
+    let elements = [RouteElement::v4(
+        alloy_primitives::Address::ZERO,
+        "0xccf14ec1f58b04baa52ce0c562899c26db7d1e18"
+            .parse()
+            .unwrap(),
+        V4_DYNAMIC_FEE_SENTINEL,
+        8,
+        "0x4e3468951d49f2eea976ed0d6e75ffcb44a9a544"
+            .parse()
+            .unwrap(),
+    )];
+    let deadline: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600;
+    let cd = encode_swap_calldata(
+        &elements,
+        alloy_primitives::U256::from(20_000_000_000_000_000_u64),
+        alloy_primitives::U256::ZERO,
+        alloy_primitives::U256::from(deadline),
+    )
+    .unwrap();
+    println!("FRESH_CALLDATA={}", alloy_primitives::hex::encode(&cd));
 }
