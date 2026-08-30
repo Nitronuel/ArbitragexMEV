@@ -29,7 +29,8 @@ fi
 NATIVE_USD="${1:-2488}"
 
 OWNER="0x3219E15A8d1e82368340dfB6697fE6a6B41d686D"
-EXECUTOR="0x5d1Aa3f67AC0Ee82FB46497deE85105C070AE93B"
+EXECUTOR="0xE1dB326DC4B0853914EA455E7ED49d970d59180d"
+TRADE_ATTEMPTS="${TRADE_ATTEMPTS:-2}"
 RPC="https://rpc.mainnet.chain.robinhood.com"
 CSV="logs/live/trades.csv"
 RUNPAIRS_LOG="logs/live/run-pairs.log"
@@ -70,6 +71,7 @@ trade_loop() {
   while true; do
     ./target/debug/shadow-bot trade \
       --executor "$EXECUTOR" --csv "$CSV" --overrides "$OVERRIDES" \
+      --flash --max-attempts "$TRADE_ATTEMPTS" \
       $BROADCAST_FLAG >> "$TRADE_LOG" 2>&1
     echo "$(date -u +%FT%TZ) trade exited; restarting in 5s" >> "$TRADE_LOG"
     sleep 5

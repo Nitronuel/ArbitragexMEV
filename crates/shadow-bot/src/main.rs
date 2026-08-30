@@ -112,6 +112,9 @@ enum Command {
         /// V4 overrides file (`pool_id,tick_spacing,hooks` per line).
         #[arg(long)]
         overrides: Option<PathBuf>,
+        /// Use PM flash (borrow input via ExecutorV3) instead of funded-caller.
+        #[arg(long, default_value_t = false)]
+        flash: bool,
         /// Token price table (`token,usd_per_token`, 1e18-scaled USD).
         #[arg(long, default_value = "data/prices-seed.csv")]
         prices: PathBuf,
@@ -647,6 +650,7 @@ fn main() {
             executor,
             csv,
             overrides,
+            flash,
             prices,
             win_rate_pct,
             native_usd,
@@ -664,6 +668,7 @@ fn main() {
                 &executor,
                 &csv,
                 overrides.as_deref(),
+                flash,
                 &prices,
                 win_rate_pct,
                 native_usd,

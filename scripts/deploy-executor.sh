@@ -43,11 +43,22 @@ CONTRACT="${1:-ExecutorV2}"
 CONSTRUCTOR_ARGS="${2:-}"
 
 echo "broadcasting forge create ($CONTRACT)..."
+
+# Optional gas-price pin (legacy type-0 tx): GAS_PRICE_GWEI=0.18 scripts/deploy-executor.sh X
+# Use when forge's 1559 estimate exceeds the wallet balance (RHC base fee spike).
+GAS_FLAGS=()
+if [[ -n "${GAS_PRICE_GWEI:-}" ]]; then
+  GAS_PRICE_WEI="$(python3 -c "print(int(float('$GAS_PRICE_GWEI') * 1_000_000_000))")"
+  echo "pinning gas price: $GAS_PRICE_GWEI gwei ($GAS_PRICE_WEI wei, legacy)"
+  GAS_FLAGS=(--gas-price "$GAS_PRICE_WEI")
+fi
+
 if [[ -n "$CONSTRUCTOR_ARGS" ]]; then
   forge create \
     --rpc-url "$RPC_URL" \
     --private-key "$ARBITRAGE_WALLET_PRIVATE_KEY" \
     --broadcast \
+    "${GAS_FLAGS[@]}" \
     --json \
     "contracts/$CONTRACT.sol:$CONTRACT" \
     --constructor-args $CONSTRUCTOR_ARGS
@@ -56,6 +67,7 @@ else
     --rpc-url "$RPC_URL" \
     --private-key "$ARBITRAGE_WALLET_PRIVATE_KEY" \
     --broadcast \
+    "${GAS_FLAGS[@]}" \
     --json \
     "contracts/$CONTRACT.sol:$CONTRACT"
 fi

@@ -17,7 +17,7 @@ use alloy_primitives::{Address, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::sol;
+use alloy_sol_types::{SolCall, SolValue, sol};
 
 use simulation::{RouteElement, encode_swap_calldata};
 
@@ -26,6 +26,27 @@ sol! {
     interface IExecutorV2 {
         #[allow(dead_code)]
         function execute(address token, uint256 amount, bytes routerData, uint256 minProfit) external payable;
+    }
+    #[sol(all_derives)]
+    interface IExecutorV3 {
+        function executeFlash(address token, uint256 amount, bytes legsData, uint256 minProfit) external payable;
+    }
+    struct FlashPoolKey {
+        address currency0;
+        address currency1;
+        uint24 fee;
+        int24 tickSpacing;
+        address hooks;
+    }
+    struct FlashSwapParams {
+        bool zeroForOne;
+        int256 amountSpecified;
+        uint160 sqrtPriceLimitX96;
+    }
+    struct FlashLegSol {
+        FlashPoolKey key;
+        FlashSwapParams params;
+        bytes hookData;
     }
 }
 
@@ -314,6 +335,77 @@ impl Submitter {
         })
     }
 
+    /// Estimate `ExecutorV3.executeFlash`.
+    pub async fn estimate_flash(
+        &self,
+        token: Address,
+        amount: U256,
+        legs_data: &[u8],
+        min_profit: U256,
+    ) -> Result<u64, String> {
+        let call = IExecutorV3::executeFlashCall {
+            token,
+            amount,
+            legsData: Bytes::from(legs_data.to_vec()),
+            minProfit: min_profit,
+        };
+        let tx = TransactionRequest::default()
+            .from(self.wallet)
+            .to(self.executor)
+            .input(alloy_rpc_types_eth::TransactionInput::new(Bytes::from(
+                call.abi_encode(),
+            )));
+        self.provider
+            .estimate_gas(tx)
+            .await
+            .map_err(|e| format!("flash execute would revert (estimate): {e}"))
+    }
+
+    /// Broadcast `ExecutorV3.executeFlash`.
+    pub async fn broadcast_flash(
+        &self,
+        token: Address,
+        amount: U256,
+        legs_data: &[u8],
+        min_profit: U256,
+        gas_estimate: u64,
+    ) -> Result<BroadcastResult, String> {
+        let call = IExecutorV3::executeFlashCall {
+            token,
+            amount,
+            legsData: Bytes::from(legs_data.to_vec()),
+            minProfit: min_profit,
+        };
+        let tx = TransactionRequest::default()
+            .from(self.wallet)
+            .to(self.executor)
+            .input(alloy_rpc_types_eth::TransactionInput::new(Bytes::from(
+                call.abi_encode(),
+            )))
+            .gas_limit(gas_estimate + gas_estimate / 4);
+        let wallet = EthereumWallet::new(self.signer.clone());
+        let provider = ProviderBuilder::new().wallet(wallet).connect_http(
+            self.rpc_url
+                .parse()
+                .map_err(|e| format!("bad rpc url: {e}"))?,
+        );
+        let pending = provider
+            .send_transaction(tx)
+            .await
+            .map_err(|e| format!("broadcast failed: {e}"))?;
+        let tx_hash = *pending.tx_hash();
+        let receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| format!("receipt wait failed: {e}"))?;
+        Ok(BroadcastResult {
+            tx_hash,
+            status: u64::from(receipt.status()),
+            gas_used: receipt.gas_used,
+            effective_gas_price_gwei: receipt.effective_gas_price as f64 / 1e9,
+        })
+    }
+
     /// Full fail-closed pipeline: preflight → encode → estimate.
     ///
     /// # Errors
@@ -394,6 +486,48 @@ pub fn route_elements(req: &RouteRequest) -> Vec<RouteElement> {
         .collect()
 }
 
+/// Build `FlashLeg[]` abi-encoded bytes for `ExecutorV3.executeFlash` from a
+/// `GatedRow`. Only V4 legs are supported in flash mode (V3 needs a separate callback).
+///
+/// # Errors
+/// Fails if any leg is not V4 or lacks tick/hooks overrides.
+pub fn build_flash_legs_data(
+    row: &trade::GatedRow,
+    overrides: &std::collections::HashMap<String, (i32, Address)>,
+) -> Result<Vec<u8>, String> {
+    use alloy_sol_types::SolValue;
+    let mut legs: Vec<FlashLegSol> = Vec::with_capacity(row.legs.len());
+    for leg in &row.legs {
+        let (profile, _pool, pool_id, tin, tout, fee_raw) = trade::parse_leg(leg)?;
+        if profile != "v4" {
+            return Err(format!("flash mode requires V4 legs; got {profile} pool {leg}"));
+        }
+        let key = alloy_primitives::hex::encode(pool_id);
+        let Some((tick, hooks)) = overrides.get(&key) else {
+            return Err(format!("V4 pool {key} missing tick/hooks override"));
+        };
+        // V4 PoolKey currencies are sorted
+        let (c0, c1) = if tin < tout { (tin, tout) } else { (tout, tin) };
+        let zero_for_one = tin == c0;
+        legs.push(FlashLegSol {
+            key: FlashPoolKey {
+                currency0: c0,
+                currency1: c1,
+                fee: alloy_primitives::Uint::<24, 1>::from(fee_raw),
+                tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
+                hooks: *hooks,
+            },
+            params: FlashSwapParams {
+                zeroForOne: zero_for_one,
+                amountSpecified: alloy_primitives::I256::ZERO, // set in contract to curAmount
+                sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
+            },
+            hookData: alloy_primitives::Bytes::new(),
+        });
+    }
+    Ok(legs.abi_encode())
+}
+
 /// CLI glue for `submit-exec`.
 pub mod command {
     use super::{RouteRequest, Submitter};
@@ -467,6 +601,7 @@ pub mod command {
         executor: &str,
         csv: &Path,
         overrides: Option<&Path>,
+        flash: bool,
         prices: &Path,
         win_rate_pct: u64,
         native_usd: u64,
@@ -500,7 +635,7 @@ pub mod command {
             .len();
         tailer.skip_to(len);
         eprintln!(
-            "trade: wallet {:#?} executor {executor:#?} broadcast={broadcast} overrides={} tailing {}",
+            "trade: wallet {:#?} executor {executor:#?} flash={flash} broadcast={broadcast} overrides={} tailing {}",
             submitter.wallet,
             overrides.len(),
             csv.display()
@@ -548,6 +683,7 @@ pub mod command {
                     profit_safety_pct,
                     deadline_secs,
                     broadcast,
+                    flash,
                 )
                 .await
                 {
@@ -822,7 +958,63 @@ pub mod trade {
         profit_safety_pct: u64,
         deadline_secs: u64,
         broadcast: bool,
+        flash: bool,
     ) -> Result<TradeOutcome, String> {
+        if flash {
+            let token = row.token_lo;
+            let legs_data = crate::submit::build_flash_legs_data(row, overrides)?;
+            let mut min_profit =
+                row.profit.saturating_mul(U256::from(profit_safety_pct)) / U256::from(100_u64);
+            // Preflight: chain, code, gas price
+            submitter.check_chain().await?;
+            let code_len = submitter.check_executor_code().await?;
+            eprintln!("preflight (flash): chain ok, executor code {code_len} bytes");
+            let gas_price_wei = submitter.check_gas_price(gas_cap_gwei).await?;
+            eprintln!(
+                "preflight (flash): gas price {:.4} gwei under cap",
+                gas_price_wei as f64 / 1e9
+            );
+            // Estimate with quoted minProfit to learn gas, then enforce floor
+            let mut est = submitter
+                .estimate_flash(token, row.input, &legs_data, min_profit)
+                .await?;
+            eprintln!("preflight (flash): estimate {est} gas");
+            // Gas floor
+            let token_usd = prices.get(&token).copied();
+            if let Some(usd) = token_usd.filter(|u| !u.is_zero()) {
+                let native_usd_wei =
+                    U256::from(native_usd) * U256::from(1_000_000_000_000_000_000_u64);
+                let gas_cost_usd_wei = U256::from(est) * U256::from(gas_price_wei) * native_usd_wei
+                    / U256::from(1_000_000_000_000_000_000_u64);
+                let floor = gas_cost_usd_wei * U256::from(100_u64)
+                    / U256::from(win_rate_pct.max(1))
+                    * U256::from(1_000_000_000_000_000_000_u64)
+                    / usd;
+                if floor > min_profit {
+                    eprintln!("trade (flash): gas floor binds {min_profit} -> {floor}");
+                    min_profit = floor;
+                    est = submitter
+                        .estimate_flash(token, row.input, &legs_data, min_profit)
+                        .await?;
+                    eprintln!("preflight (flash): re-estimate {est} gas with floor");
+                }
+            }
+            let need = U256::from(est.saturating_mul(2)) * U256::from(gas_price_wei);
+            submitter.check_wallet_gas(need).await?;
+            if !broadcast {
+                return Ok(TradeOutcome {
+                    dry_run: true,
+                    detail: format!("gates passed (flash), estimate {est} gas (dry run)"),
+                });
+            }
+            let result = submitter
+                .broadcast_flash(token, row.input, &legs_data, min_profit, est)
+                .await?;
+            return Ok(TradeOutcome {
+                dry_run: false,
+                detail: format!("TX {} status {} gas {}", result.tx_hash, result.status, result.gas_used),
+            });
+        }
         let elements = build_elements(submitter.provider_ref(), row, overrides).await?;
         let token = row.token_lo;
         let min_out = {
