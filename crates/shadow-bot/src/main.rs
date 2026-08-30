@@ -112,6 +112,15 @@ enum Command {
         /// V4 overrides file (`pool_id,tick_spacing,hooks` per line).
         #[arg(long)]
         overrides: Option<PathBuf>,
+        /// Token price table (`token,usd_per_token`, 1e18-scaled USD).
+        #[arg(long, default_value = "data/prices-seed.csv")]
+        prices: PathBuf,
+        /// Expected win rate in percent — divides the gas cost for the floor.
+        #[arg(long, default_value_t = 10)]
+        win_rate_pct: u64,
+        /// Native token USD price (gas-cost conversion).
+        #[arg(long, default_value_t = 2488)]
+        native_usd: u64,
         /// Gas-price cap in gwei (budget guard).
         #[arg(long, default_value_t = 0.5)]
         gas_cap_gwei: f64,
@@ -638,6 +647,9 @@ fn main() {
             executor,
             csv,
             overrides,
+            prices,
+            win_rate_pct,
+            native_usd,
             gas_cap_gwei,
             slippage_bps,
             profit_safety_pct,
@@ -652,6 +664,9 @@ fn main() {
                 &executor,
                 &csv,
                 overrides.as_deref(),
+                &prices,
+                win_rate_pct,
+                native_usd,
                 gas_cap_gwei,
                 slippage_bps,
                 profit_safety_pct,

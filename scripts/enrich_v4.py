@@ -2,8 +2,23 @@
 """Discover tickSpacing/hooks for specific V4 poolIds from RHC Initialize events.
 
 The enumeration CSV omits tickSpacing/hooks (audit B58); the `trade` command
-refuses V4 legs without them. This tool sweeps the PoolManager's Initialize
-logs in windows via curl (the gateway rate-limits; urllib gets 403-blocked),
+refuses V4 legs without them.
+
+**Fast path (2026-08-30):** `poolId` is an indexed topic, so ONE filtered
+getLogs over the whole chain finds everything — no window sweep needed:
+
+    curl -s -X POST https://rpc.mainnet.chain.robinhood.com \
+      -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,
+      "method":"eth_getLogs","params":[{"fromBlock":"0x0","toBlock":"0x2faf080",
+      "address":"0x8366a39CC670B4001A1121B8F6A443A643e40951",
+      "topics":[["0xdd466e67…8d6438"], ["0x<poolId1>","0x<poolId2>",…]]}]}'
+
+with <=100 poolIds per query (the gateway silently returns 0 for larger
+OR-lists) and no null-topic positional filters (they return 0 rows). The
+window-sweep mode below still works but is only needed when the OR-filter
+is unavailable.
+
+This tool sweeps the PoolManager's Initialize logs in windows via curl (the gateway rate-limits; urllib gets 403-blocked),
 writing an overrides CSV: pool_id,tick_spacing,hooks
 
 Usage:
@@ -95,7 +110,7 @@ def main() -> int:
                     tick = int(data[64:128], 16)
                     if tick >= 1 << 255:
                         tick -= 1 << 256
-                    hooks = "0x" + data[128:192][-40:].lstrip("0")
+                    hooks = "0x" + data[128:192][-40:].rjust(40, "0")
                     out.write(f"{pid},{tick},{hooks}\n")
                     pending.discard(pid)
                     n += 1

@@ -323,7 +323,7 @@ impl Submitter {
         req: &RouteRequest,
         gas_cap_gwei: f64,
         min_gas_headroom_wei: U256,
-    ) -> Result<(Vec<u8>, u64), String> {
+    ) -> Result<(Vec<u8>, u64, u128), String> {
         self.check_chain().await?;
         let code_len = self.check_executor_code().await?;
         eprintln!("preflight: chain ok, executor code {code_len} bytes");
@@ -348,7 +348,7 @@ impl Submitter {
         let need = U256::from(est.saturating_mul(2)) * U256::from(gp);
         self.check_wallet_gas(min_gas_headroom_wei.max(need))
             .await?;
-        Ok((router_data, est))
+        Ok((router_data, est, gp))
     }
 }
 
@@ -432,7 +432,7 @@ pub mod command {
             "submit-exec: wallet {:#?} executor {executor:#?} broadcast={broadcast}",
             submitter.wallet
         );
-        let (router_data, est) = submitter
+        let (router_data, est, _gp) = submitter
             .prepare(&req, gas_cap_gwei, alloy_primitives::U256::ZERO)
             .await?;
         eprintln!(
@@ -467,6 +467,9 @@ pub mod command {
         executor: &str,
         csv: &Path,
         overrides: Option<&Path>,
+        prices: &Path,
+        win_rate_pct: u64,
+        native_usd: u64,
         gas_cap_gwei: f64,
         slippage_bps: u64,
         profit_safety_pct: u64,
@@ -481,6 +484,11 @@ pub mod command {
             .parse()
             .map_err(|e| format!("bad executor address: {e}"))?;
         let submitter = super::Submitter::new(rpc, &key, executor)?;
+        let prices = crate::gaps::load_prices(prices)?;
+        eprintln!(
+            "trade: loaded {} token prices for the gas floor",
+            prices.len()
+        );
         let overrides = match overrides {
             Some(path) => super::trade::load_overrides(path)?,
             None => std::collections::HashMap::new(),
@@ -532,6 +540,9 @@ pub mod command {
                     &submitter,
                     &row,
                     &overrides,
+                    &prices,
+                    win_rate_pct,
+                    native_usd,
                     gas_cap_gwei,
                     slippage_bps,
                     profit_safety_pct,
@@ -735,7 +746,12 @@ pub mod trade {
                 continue;
             }
             let tick: i32 = cols[1].parse().map_err(|e| format!("bad tick: {e}"))?;
-            let hooks: Address = cols[2].parse().map_err(|e| format!("bad hooks: {e}"))?;
+            // Hooks may be stored unpadded ("0x" for zero) — left-pad to 40 hex.
+            let raw = cols[2].trim_start_matches("0x").trim_start_matches("0X");
+            let padded = format!("{raw:0>40}");
+            let hooks: Address = padded
+                .parse()
+                .map_err(|e| format!("bad hooks {}: {e}", cols[2]))?;
             map.insert(cols[0].to_lowercase(), (tick, hooks));
         }
         Ok(map)
@@ -787,13 +803,20 @@ pub mod trade {
 
     /// Attempt one gated row: build route → preflight → (optionally) broadcast.
     ///
+    /// The on-chain `minProfit` is `max(quoted profit × safety, gas floor)`:
+    /// the gas floor expresses `gas_cost / win_rate` in input-token terms so a
+    /// tiny-quoted episode can never pass at a net loss (SECURITY.md gate).
+    ///
     /// # Errors
     /// Any gate failure aborts before signing (fail-closed).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn attempt(
         submitter: &Submitter,
         row: &GatedRow,
         overrides: &Overrides,
+        prices: &std::collections::HashMap<Address, U256>,
+        win_rate_pct: u64,
+        native_usd: u64,
         gas_cap_gwei: f64,
         slippage_bps: u64,
         profit_safety_pct: u64,
@@ -838,7 +861,57 @@ pub mod trade {
                 })
                 .collect(),
         };
-        let (router_data, est) = submitter.prepare(&req, gas_cap_gwei, U256::ZERO).await?;
+        let (router_data, est, gas_price_wei) =
+            submitter.prepare(&req, gas_cap_gwei, U256::ZERO).await?;
+
+        // Gas floor in input-token wei: gas_cost_usd / win_rate converted via
+        // the token's 1e18-scaled USD price. No price → refuse (fail-closed).
+        let token_usd = prices.get(&token).copied();
+        let quoted_min = min_profit;
+        let floor_min = match token_usd {
+            Some(usd) if !usd.is_zero() => {
+                let native_usd_wei =
+                    U256::from(native_usd) * U256::from(1_000_000_000_000_000_000_u64);
+                let gas_cost_usd_wei = U256::from(est) * U256::from(gas_price_wei) * native_usd_wei
+                    / U256::from(1_000_000_000_000_000_000_u64);
+                gas_cost_usd_wei * U256::from(100_u64) / U256::from(win_rate_pct.max(1))
+                    * U256::from(1_000_000_000_000_000_000_u64)
+                    / usd
+            }
+            _ => {
+                return Err(format!(
+                    "refusing: input token {token:#?} has no USD price — cannot size the gas floor"
+                ));
+            }
+        };
+        let min_profit = quoted_min.max(floor_min);
+        if min_profit != quoted_min {
+            eprintln!(
+                "trade: gas floor binds — minProfit raised {quoted_min} -> {min_profit} (gas {est} @ {gas_price_wei} wei, win {win_rate_pct}%)"
+            );
+            // Re-encode with the floor as the on-chain minProfit; gas usage is
+            // unchanged (the floor only tightens the final balance check), so
+            // the estimate is reused.
+            let req = RouteRequest {
+                min_profit_wei: min_profit,
+                ..req
+            };
+            let (router_data, est, _) = submitter.prepare(&req, gas_cap_gwei, U256::ZERO).await?;
+            if !broadcast {
+                return Ok(TradeOutcome {
+                    dry_run: true,
+                    detail: format!("gates passed with gas floor {min_profit} wei (dry run)"),
+                });
+            }
+            let result = submitter.broadcast_execute(&req, &router_data, est).await?;
+            return Ok(TradeOutcome {
+                dry_run: false,
+                detail: format!(
+                    "TX {} status {} gas {}",
+                    result.tx_hash, result.status, result.gas_used
+                ),
+            });
+        }
         if !broadcast {
             return Ok(TradeOutcome {
                 dry_run: true,
