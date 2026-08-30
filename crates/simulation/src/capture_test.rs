@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::payload_builder::encode_route_element;
+use crate::payload_builder::{RouteElement, V4_DYNAMIC_FEE_SENTINEL};
 use alloy_primitives::Address;
 
 /// Minimal capture rate test: reads captured opportunities from `logs/captures/`,
@@ -43,22 +43,17 @@ fn capture_rate_table_demo() {
 
         let log_line = capture["log_line"].as_str().unwrap_or("");
 
-        // Build a route element using the payload builder
-        // Each field is encoded as a 32-byte ABI word
-        let elem = encode_route_element(
-            1,                        // venue_type: V4 dynamic-fee pool
-            token_lo,                 // currency0
-            token_hi,                 // currency1
-            token_lo,                 // pool (using token_lo as pool placeholder)
-            100,                      // fee = 0.1%
-            312,                      // tickSpacing
-            Address::from([0u8; 20]), // hooks
-            Address::from([0u8; 20]), // pool_manager
-            [0u8; 32],                // pool_key
+        // Build a route element using the payload builder (live-tx layout)
+        let elem = RouteElement::v4(
+            token_lo,                // currency0
+            token_hi,                // currency1
+            V4_DYNAMIC_FEE_SENTINEL, // dynamic-fee sentinel
+            8,                       // tickSpacing (observed live value)
+            Address::ZERO,           // hooks
         );
-
-        // Verify route element size
-        assert_eq!(elem.len(), 320, "route element must be 320 bytes");
+        // RouteElement is the typed input; encoding is round-trip verified
+        // against live txs in payload_builder::tests.
+        let _ = &elem;
 
         // Closed-form classification:
         // An opportunity is "ok" if the price ratio indicates viable arbitrage.

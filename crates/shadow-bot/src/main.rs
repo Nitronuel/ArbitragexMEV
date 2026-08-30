@@ -28,6 +28,7 @@ use storage::Storage;
 mod dirty;
 mod enumerate;
 mod gaps;
+mod submit;
 mod ws_probe;
 
 const QUEUE_CAPACITY: usize = 100_000;
@@ -78,6 +79,61 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Preflights and (with --broadcast) submits one executor route.
+    SubmitExec {
+        /// RPC endpoint (defaults to the RHC gateway).
+        #[arg(long, default_value = "https://rpc.mainnet.chain.robinhood.com")]
+        rpc: String,
+        /// Deployed `ExecutorV2` address.
+        #[arg(long)]
+        executor: String,
+        /// Route JSON file (`token`, `amount_in`, `min_out`, `min_profit_wei`, `deadline`, `elements`).
+        #[arg(long)]
+        route: PathBuf,
+        /// Gas-price cap in gwei (budget guard).
+        #[arg(long, default_value_t = 0.5)]
+        gas_cap_gwei: f64,
+        /// Broadcast when every gate passes; without it, preflight+estimate only.
+        #[arg(long, default_value_t = false)]
+        broadcast: bool,
+    },
+    /// Tails a run-pairs GATED CSV and executes gate-passing rows
+    /// (dry-run unless --broadcast).
+    Trade {
+        /// RPC endpoint (defaults to the RHC gateway).
+        #[arg(long, default_value = "https://rpc.mainnet.chain.robinhood.com")]
+        rpc: String,
+        /// Deployed `ExecutorV2` address.
+        #[arg(long)]
+        executor: String,
+        /// run-pairs CSV to tail (`--csv` output of a concurrent `run-pairs`).
+        #[arg(long)]
+        csv: PathBuf,
+        /// V4 overrides file (`pool_id,tick_spacing,hooks` per line).
+        #[arg(long)]
+        overrides: Option<PathBuf>,
+        /// Gas-price cap in gwei (budget guard).
+        #[arg(long, default_value_t = 0.5)]
+        gas_cap_gwei: f64,
+        /// Router-level slippage bound in bps (of the quoted output).
+        #[arg(long, default_value_t = 100)]
+        slippage_bps: u64,
+        /// On-chain minProfit as this percentage of the quoted profit.
+        #[arg(long, default_value_t = 70)]
+        profit_safety_pct: u64,
+        /// Route deadline in seconds from submission.
+        #[arg(long, default_value_t = 60)]
+        deadline_secs: u64,
+        /// Poll interval for new CSV rows (ms).
+        #[arg(long, default_value_t = 500)]
+        poll_ms: u64,
+        /// Stop after this many broadcast attempts (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
+        max_attempts: u64,
+        /// Broadcast when every gate passes; without it, dry-run only.
+        #[arg(long, default_value_t = false)]
+        broadcast: bool,
+    },
     /// Validates the TOML configuration and RPC environment redaction.
     ValidateConfig {
         #[arg(long)]
@@ -561,6 +617,50 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let outcome = match cli.command {
+        Command::SubmitExec {
+            rpc,
+            executor,
+            route,
+            gas_cap_gwei,
+            broadcast,
+        } => {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(submit::command::submit_exec_command(
+                &rpc,
+                &executor,
+                &route,
+                gas_cap_gwei,
+                broadcast,
+            ))
+        }
+        Command::Trade {
+            rpc,
+            executor,
+            csv,
+            overrides,
+            gas_cap_gwei,
+            slippage_bps,
+            profit_safety_pct,
+            deadline_secs,
+            poll_ms,
+            max_attempts,
+            broadcast,
+        } => {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(submit::command::trade_command(
+                &rpc,
+                &executor,
+                &csv,
+                overrides.as_deref(),
+                gas_cap_gwei,
+                slippage_bps,
+                profit_safety_pct,
+                deadline_secs,
+                poll_ms,
+                max_attempts,
+                broadcast,
+            ))
+        }
         Command::ValidateConfig { config } => validate_config(&config),
         Command::VerifyCatalog { manifest, config } => verify_catalog_command(manifest, config),
         Command::SmokeTest {
@@ -2072,7 +2172,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         if !existed {
             writeln!(
                 out,
-                "kind,token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,shortfall_usd,threshold_usd,floor_ratio,optimal_unclamped,input_capacity,reason_code,reason_detail,anchor_priced"
+                "kind,token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,shortfall_usd,threshold_usd,floor_ratio,optimal_unclamped,input_capacity,reason_code,reason_detail,anchor_priced,legs"
             )
             .map_err(|e| e.to_string())?;
             out.flush().map_err(|e| e.to_string())?;
@@ -2446,7 +2546,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     let hi = quote.token_hi;
                     writeln!(
                         out,
-                        "pair,{lo},{hi},{latest},{input},{output},{profit},{log2_skew:.6},{gross},{net},{shortfall},{threshold},{floor:.4},{unclamped},{capacity},{reason_code},{reason_detail},{priced}",
+                        "pair,{lo},{hi},{latest},{input},{output},{profit},{log2_skew:.6},{gross},{net},{shortfall},{threshold},{floor:.4},{unclamped},{capacity},{reason_code},{reason_detail},{priced},{legs}",
                         lo = lo,
                         hi = hi,
                         latest = latest,
@@ -2469,6 +2569,12 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                         reason_code = code_and_detail(&classification.reason).0,
                         reason_detail = code_and_detail(&classification.reason).1,
                         priced = evaluator.token_is_priced(lo),
+                        legs = quote
+                            .legs
+                            .iter()
+                            .map(crate::gaps::LegRoute::encode_csv)
+                            .collect::<Vec<_>>()
+                            .join("|"),
                     )?;
                 }
                 for (tri, (quote, classification)) in outcome
@@ -2481,7 +2587,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     let hi = alloy_primitives::Address::from_slice(&t.1);
                     writeln!(
                         out,
-                        "triangle,{lo},{hi},{latest},{input},{output},{profit},{log2_skew:.6},{gross},{net},{shortfall},{threshold},{floor:.4},{unclamped},{capacity},{reason_code},{reason_detail},{priced}",
+                        "triangle,{lo},{hi},{latest},{input},{output},{profit},{log2_skew:.6},{gross},{net},{shortfall},{threshold},{floor:.4},{unclamped},{capacity},{reason_code},{reason_detail},{priced},{legs}",
                         lo = lo,
                         hi = hi,
                         latest = latest,
@@ -2502,6 +2608,12 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                         reason_code = code_and_detail(&classification.reason).0,
                         reason_detail = code_and_detail(&classification.reason).1,
                         priced = evaluator.token_is_priced(lo),
+                        legs = quote
+                            .legs
+                            .iter()
+                            .map(crate::gaps::LegRoute::encode_csv)
+                            .collect::<Vec<_>>()
+                            .join("|"),
                     )?;
                 }
                 Ok(())

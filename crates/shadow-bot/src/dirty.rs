@@ -792,7 +792,8 @@ impl PairDirtyEvaluator {
             Some(anchor),
         )
         .ok()??;
-        Some((quote, self.classify_anchor(anchor, &quote)))
+        let classification = self.classify_anchor(anchor, &quote);
+        Some((quote, classification))
     }
 
     /// Picks the cycle anchor for one pair by executability (audit S3a /
@@ -834,7 +835,8 @@ impl PairDirtyEvaluator {
         let quote =
             crate::gaps::quote_triangle(t0, t1, t2, &self.by_pair, &self.prices_a, &self.prices_b)
                 .ok()??;
-        Some((quote, self.classify_anchor(t0, &quote)))
+        let classification = self.classify_anchor(t0, &quote);
+        Some((quote, classification))
     }
 }
 
@@ -921,6 +923,7 @@ mod tests {
             log2_skew: 0.0,
             optimal_unclamped: U256::ZERO,
             input_capacity: U256::ZERO,
+            legs: Vec::new(),
         };
         outcome.pair_results = vec![(stub_quote(), gate_passer()), (stub_quote(), below)];
         outcome.interesting = vec![([0u8; 20], [0u8; 20])];
@@ -1577,6 +1580,7 @@ mod tests {
             log2_skew: f64::NAN,
             optimal_unclamped: U256::from(WEI),
             input_capacity: U256::from(WEI),
+            legs: Vec::new(),
         };
         let classification = evaluator.classify_anchor(token_a(), &fake);
         assert!(

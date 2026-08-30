@@ -27,10 +27,12 @@
 #[cfg(test)]
 mod capture_test;
 mod db;
+#[cfg(test)]
+mod dump_probe;
 mod engine;
 mod executor;
 mod fork;
-#[allow(dead_code, clippy::too_many_arguments, clippy::doc_markdown)]
+#[allow(clippy::too_many_arguments, clippy::doc_markdown)]
 mod payload_builder;
 mod tokens;
 
@@ -48,4 +50,8 @@ pub use executor::{
     v3_callback_runtime, v4_unlock_callback_runtime,
 };
 pub use fork::{ForkDb, ForkTx, fork_transact};
+pub use payload_builder::{
+    RHC_POOL_MANAGER, RouteElement, V4_DYNAMIC_FEE_SENTINEL, VENUE_V3, VENUE_V4,
+    encode_swap_calldata,
+};
 pub use tokens::{TokenKind, TokenSpec, token_bytecode};

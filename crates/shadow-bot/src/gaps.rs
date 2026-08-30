@@ -1419,9 +1419,44 @@ pub fn gap_rankings(
     ranks
 }
 
+/// One executable leg of a quoted pair: the exact pool the quote used, its
+/// swap direction, and the venue routing fields the payload builder needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegRoute {
+    /// Venue profile: `*v3` or `*v4`.
+    pub profile: [u8; 2],
+    /// V3 pool contract address, or the V4 `PoolManager` singleton.
+    pub pool: Address,
+    /// V4 `PoolId` (zero for V3 legs).
+    pub pool_id: [u8; 32],
+    /// Token sold into this leg.
+    pub token_in: Address,
+    /// Token received from this leg.
+    pub token_out: Address,
+    /// Raw fee field as carried by the catalog row.
+    pub fee_raw: u32,
+}
+
+impl LegRoute {
+    /// `<profile>:<pool>:<pool_id_hex>:<token_in>:<token_out>:<fee>` — the
+    /// CSV-serializable form consumed by the `trade` command.
+    #[must_use]
+    pub fn encode_csv(&self) -> String {
+        let profile = std::str::from_utf8(&self.profile).unwrap_or("??");
+        format!(
+            "{profile}:{:#x}:{}:{:#x}:{:#x}:{}",
+            self.pool,
+            alloy_primitives::hex::encode(self.pool_id),
+            self.token_in,
+            self.token_out,
+            self.fee_raw
+        )
+    }
+}
+
 /// A single pair-level closed-form optimal quote over one cross-venue cycle:
 /// buy on the cheaper venue, sell on the dearer, sized so profit is maximal.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PairQuote {
     pub token_lo: Address,
     pub token_hi: Address,
@@ -1442,6 +1477,9 @@ pub struct PairQuote {
     /// cell — the bound inside which the constant-product model stays
     /// credible. `input <= optimal_unclamped`, equal when unclamped.
     pub input_capacity: U256,
+    /// The chosen legs in execution order (hop 0, hop 1, ...) — exactly what
+    /// the `trade` command encodes into router calldata.
+    pub legs: Vec<LegRoute>,
 }
 
 /// Reduces a concentrated pool's sampled state to the virtual constant-product
@@ -1845,9 +1883,13 @@ pub fn quote_pair_anchored(
             build_pair_cycle(anchor, other, first, first_price, second, second_price)
         };
 
+    let mut first_leg = leg_a;
+    let mut second_leg = leg_b;
     let mut best: Option<BestPick> = make_cycle(leg_a, leg_price_a, leg_b, leg_price_b)
         .map_err(|e| format!("optimal input failed: {e}"))?;
     if best.is_none() {
+        first_leg = leg_b;
+        second_leg = leg_a;
         best = make_cycle(leg_b, leg_price_b, leg_a, leg_price_a)
             .ok()
             .flatten();
@@ -1855,6 +1897,18 @@ pub fn quote_pair_anchored(
     let Some((unclamped_quote, cycle, states, leg_caps)) = best else {
         return Ok(None);
     };
+    let leg_route = |entry: PoolEntry, token_in: Address, token_out: Address| LegRoute {
+        profile: entry.profile,
+        pool: entry.venue,
+        pool_id: entry.id,
+        token_in,
+        token_out,
+        fee_raw: entry.fee,
+    };
+    let legs = vec![
+        leg_route(first_leg, anchor, other),
+        leg_route(second_leg, other, anchor),
+    ];
     // Clamp the trade to what every leg can absorb within one liquidity
     // cell; beyond it the constant-product model is fiction (audit S1).
     let (input, output, profit) =
@@ -1872,6 +1926,7 @@ pub fn quote_pair_anchored(
         log2_skew: skew,
         optimal_unclamped: unclamped_quote.input,
         input_capacity: input.min(unclamped_quote.input),
+        legs,
     }))
 }
 
@@ -2068,6 +2123,7 @@ fn triangle_log2_skew(
     (cycle_product.log2() - 288.0).abs()
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn quote_triangle(
     p0: Address,
     p1: Address,
@@ -2160,6 +2216,14 @@ pub fn quote_triangle(
     let keep_product = keep(&leg01)? * keep(&leg12)? * keep(&leg20)?;
     let toll = 1.0 - keep_product;
     let log2_skew = triangle_log2_skew(&leg01, &leg12, &leg20, p0, p1, p2);
+    let tri_leg = |leg: &CycleLeg, tin: Address, tout: Address| LegRoute {
+        profile: leg.entry.profile,
+        pool: leg.entry.venue,
+        pool_id: leg.entry.id,
+        token_in: tin,
+        token_out: tout,
+        fee_raw: leg.entry.fee,
+    };
     Ok(Some(PairQuote {
         token_lo: p0,
         token_hi: p2,
@@ -2170,6 +2234,11 @@ pub fn quote_triangle(
         log2_skew,
         optimal_unclamped: unclamped.input,
         input_capacity: input.min(unclamped.input),
+        legs: vec![
+            tri_leg(&leg01, p0, p1),
+            tri_leg(&leg12, p1, p2),
+            tri_leg(&leg20, p2, p0),
+        ],
     }))
 }
 

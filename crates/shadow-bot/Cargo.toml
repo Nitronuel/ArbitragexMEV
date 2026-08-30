@@ -6,16 +6,25 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+alloy-consensus.workspace = true
+alloy-network.workspace = true
 alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-signer-local.workspace = true
+alloy-sol-types.workspace = true
 catalog = { path = "../catalog" }
 clap.workspace = true
 csv.workspace = true
 domain = { path = "../domain" }
 provider = { path = "../provider" }
 ruint.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 shadow = { path = "../shadow" }
 signal-hook.workspace = true
+tokio.workspace = true
+simulation = { path = "../simulation" }
 storage = { path = "../storage" }
 v2-math = { path = "../v2-math" }
 
