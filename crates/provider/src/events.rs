@@ -34,6 +34,16 @@ pub fn v4_swap_topic() -> B256 {
     keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)")
 }
 
+#[must_use]
+pub fn up_pool_created_topic() -> B256 {
+    keccak256("PoolCreated(address,address,uint24,int24,address)")
+}
+
+#[must_use]
+pub fn up_swap_topic() -> B256 {
+    keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
+}
+
 /// The two RHC V3 liquidity-change topics (audit task 1.3).
 ///
 /// RHC's V3 fork emits **non-canonical** liquidity events: neither hash

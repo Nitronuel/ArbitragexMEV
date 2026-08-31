@@ -29,6 +29,7 @@ impl Default for CrawlPace {
 pub enum VenueKind {
     V3,
     V4,
+    Up,
 }
 
 /// A factory (for `VenueKind::V3`, the factory contract; for
@@ -58,6 +59,12 @@ pub enum EnumeratedPool {
         tick_spacing: i32,
         hooks: Address,
     },
+    Up {
+        token0: Address,
+        token1: Address,
+        fee: u32,
+        pool: Address,
+    },
 }
 
 impl Venue {
@@ -79,6 +86,15 @@ impl Venue {
         }
     }
 
+    #[must_use]
+    pub fn up_pools(factory: Address) -> Self {
+        Self {
+            address: factory,
+            topic: v3_pool_created_topic(),
+            kind: VenueKind::Up,
+        }
+    }
+
     /// Decodes one raw `eth_getLogs` result into a pool-creation event, or
     /// `None` when the log does not carry this venue's signature topic0.
     #[must_use]
@@ -89,6 +105,12 @@ impl Venue {
         }
         match self.kind {
             VenueKind::V3 => decode_v3_pool_created(&envelope).map(|pool| EnumeratedPool::V3 {
+                token0: pool.token0,
+                token1: pool.token1,
+                fee: pool.fee,
+                pool: pool.pool,
+            }),
+            VenueKind::Up => decode_v3_pool_created(&envelope).map(|pool| EnumeratedPool::Up {
                 token0: pool.token0,
                 token1: pool.token1,
                 fee: pool.fee,
@@ -111,6 +133,7 @@ impl Venue {
     pub fn pool_key(pool: &EnumeratedPool) -> B256 {
         match pool {
             EnumeratedPool::V3 { pool, .. } => pool.into_word(),
+            EnumeratedPool::Up { pool, .. } => pool.into_word(),
             EnumeratedPool::V4 { id, .. } => *id,
         }
     }
@@ -120,7 +143,7 @@ impl EnumeratedPool {
     #[cfg(test)]
     fn fee(&self) -> u32 {
         match self {
-            EnumeratedPool::V3 { fee, .. } | EnumeratedPool::V4 { fee, .. } => *fee,
+            EnumeratedPool::V3 { fee, .. } | EnumeratedPool::Up { fee, .. } | EnumeratedPool::V4 { fee, .. } => *fee,
         }
     }
 }

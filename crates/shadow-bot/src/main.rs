@@ -1009,7 +1009,8 @@ fn enumerate_pools_command(
     let venue = match venue_name {
         "v3" => Venue::v3_pools(factory),
         "v4" => Venue::v4_pools(factory),
-        other => return Err(format!("unsupported venue {other:?}; use v3 or v4")),
+        "up" => Venue::up_pools(factory),
+        other => return Err(format!("unsupported venue {other:?}; use v3, v4 or up")),
     };
     let http = std::env::var("ROBINHOOD_HTTP_RPC_URL")
         .map_err(|_| "missing ROBINHOOD_HTTP_RPC_URL".to_owned())?;
@@ -1058,6 +1059,12 @@ fn enumerate_pools_command(
                 fee,
                 pool: address,
             } => format!("4663,{address},{factory},{token0},{token1},{fee},1000000,v3,,\n"),
+            enumerate::EnumeratedPool::Up {
+                token0,
+                token1,
+                fee,
+                pool: address,
+            } => format!("4663,{address},{factory},{token0},{token1},{fee},1000000,up,,\n"),
             enumerate::EnumeratedPool::V4 {
                 id,
                 currency0,
@@ -1259,8 +1266,8 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
         profile_b.as_bytes().try_into().unwrap(),
     );
     for (label, profile) in [(profile_a, &profile_bytes_a), (profile_b, &profile_bytes_b)] {
-        if profile != b"v3" && profile != b"v4" {
-            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        if profile != b"v3" && profile != b"v4" && profile != b"up" {
+            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
         }
     }
     let http_url: RedactedUrl = rpc
@@ -1398,8 +1405,8 @@ fn rank_activity_command(args: &RankActivityArgs<'_>) -> Result<(), String> {
         (args.profile_a, &profile_bytes_a),
         (args.profile_b, &profile_bytes_b),
     ] {
-        if profile != b"v3" && profile != b"v4" {
-            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        if profile != b"v3" && profile != b"v4" && profile != b"up" {
+            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
         }
     }
     if args.from > args.to {
@@ -1731,8 +1738,8 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
         .try_into()
         .map_err(|_| format!("profile_b must be exactly 2 bytes, got {profile_b}"))?;
     for (label, profile) in [(profile_a, &profile_bytes_a), (profile_b, &profile_bytes_b)] {
-        if profile != b"v3" && profile != b"v4" {
-            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        if profile != b"v3" && profile != b"v4" && profile != b"up" {
+            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
         }
     }
 
@@ -1907,8 +1914,8 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
         (args.profile_a, &profile_bytes_a),
         (args.profile_b, &profile_bytes_b),
     ] {
-        if profile != b"v3" && profile != b"v4" {
-            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        if profile != b"v3" && profile != b"v4" && profile != b"up" {
+            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
         }
     }
 
@@ -2208,8 +2215,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         .try_into()
         .map_err(|_| format!("profile_b must be exactly 2 bytes, got {profile_b}"))?;
     for (label, profile) in [(profile_a, &profile_bytes_a), (profile_b, &profile_bytes_b)] {
-        if profile != b"v3" && profile != b"v4" {
-            return Err(format!("unsupported venue {label:?}: expected v3 or v4"));
+        if profile != b"v3" && profile != b"v4" && profile != b"up" {
+            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
         }
     }
 

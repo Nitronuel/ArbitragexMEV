@@ -128,6 +128,7 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
             None | Some("v2" | "constant_product" | "ConstantProduct") => Profile::ConstantProduct,
             Some("v3" | "concentrated" | "Concentrated") => Profile::Concentrated,
             Some("v4" | "volatile_managed" | "VolatileManaged") => Profile::VolatileManaged,
+            Some("up" | "Up" | "UP") => Profile::Concentrated,
             Some(other) => {
                 return Err(ManifestError::UnsupportedProfile {
                     row: row_number,
