@@ -30,6 +30,7 @@ sol! {
     #[sol(all_derives)]
     interface IExecutorV3 {
         function executeFlash(address token, uint256 amount, bytes legsData, uint256 minProfit) external payable;
+        function executeHybrid(address token, uint256 amount, bytes legsData, uint256 minProfit) external payable;
     }
     struct FlashPoolKey {
         address currency0;
@@ -44,6 +45,13 @@ sol! {
         uint160 sqrtPriceLimitX96;
     }
     struct FlashLegSol {
+        FlashPoolKey key;
+        FlashSwapParams params;
+        bytes hookData;
+    }
+    struct HybridLegSol {
+        uint8 venue;
+        address v3Pool;
         FlashPoolKey key;
         FlashSwapParams params;
         bytes hookData;
@@ -406,6 +414,77 @@ impl Submitter {
         })
     }
 
+    /// Estimate `ExecutorV3.executeHybrid`.
+    pub async fn estimate_hybrid(
+        &self,
+        token: Address,
+        amount: U256,
+        legs_data: &[u8],
+        min_profit: U256,
+    ) -> Result<u64, String> {
+        let call = IExecutorV3::executeHybridCall {
+            token,
+            amount,
+            legsData: Bytes::from(legs_data.to_vec()),
+            minProfit: min_profit,
+        };
+        let tx = TransactionRequest::default()
+            .from(self.wallet)
+            .to(self.executor)
+            .input(alloy_rpc_types_eth::TransactionInput::new(Bytes::from(
+                call.abi_encode(),
+            )));
+        self.provider
+            .estimate_gas(tx)
+            .await
+            .map_err(|e| format!("hybrid execute would revert (estimate): {e}"))
+    }
+
+    /// Broadcast `ExecutorV3.executeHybrid`.
+    pub async fn broadcast_hybrid(
+        &self,
+        token: Address,
+        amount: U256,
+        legs_data: &[u8],
+        min_profit: U256,
+        gas_estimate: u64,
+    ) -> Result<BroadcastResult, String> {
+        let call = IExecutorV3::executeHybridCall {
+            token,
+            amount,
+            legsData: Bytes::from(legs_data.to_vec()),
+            minProfit: min_profit,
+        };
+        let tx = TransactionRequest::default()
+            .from(self.wallet)
+            .to(self.executor)
+            .input(alloy_rpc_types_eth::TransactionInput::new(Bytes::from(
+                call.abi_encode(),
+            )))
+            .gas_limit(gas_estimate + gas_estimate / 4);
+        let wallet = EthereumWallet::new(self.signer.clone());
+        let provider = ProviderBuilder::new().wallet(wallet).connect_http(
+            self.rpc_url
+                .parse()
+                .map_err(|e| format!("bad rpc url: {e}"))?,
+        );
+        let pending = provider
+            .send_transaction(tx)
+            .await
+            .map_err(|e| format!("broadcast failed: {e}"))?;
+        let tx_hash = *pending.tx_hash();
+        let receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| format!("receipt wait failed: {e}"))?;
+        Ok(BroadcastResult {
+            tx_hash,
+            status: u64::from(receipt.status()),
+            gas_used: receipt.gas_used,
+            effective_gas_price_gwei: receipt.effective_gas_price as f64 / 1e9,
+        })
+    }
+
     /// Full fail-closed pipeline: preflight → encode → estimate.
     ///
     /// # Errors
@@ -524,6 +603,67 @@ pub fn build_flash_legs_data(
             },
             hookData: alloy_primitives::Bytes::new(),
         });
+    }
+    Ok(legs.abi_encode())
+}
+
+/// Build `HybridLeg[]` for `ExecutorV3.executeHybrid` — supports V3+V4 mixes.
+/// V3 legs use the pool address and sorted currencies; V4 legs use overrides.
+pub fn build_hybrid_legs_data(
+    row: &trade::GatedRow,
+    overrides: &std::collections::HashMap<String, (i32, Address)>,
+) -> Result<Vec<u8>, String> {
+    use alloy_sol_types::SolValue;
+    let mut legs: Vec<HybridLegSol> = Vec::with_capacity(row.legs.len());
+    for leg in &row.legs {
+        let (profile, pool, pool_id, tin, tout, fee_raw) = trade::parse_leg(leg)?;
+        let (c0, c1) = if tin < tout { (tin, tout) } else { (tout, tin) };
+        let zero_for_one = tin == c0;
+        match profile.as_str() {
+            "v3" => {
+                legs.push(HybridLegSol {
+                    venue: 0,
+                    v3Pool: pool,
+                    key: FlashPoolKey {
+                        currency0: c0,
+                        currency1: c1,
+                        fee: alloy_primitives::Uint::<24, 1>::from(fee_raw),
+                        tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(0).unwrap(),
+                        hooks: Address::ZERO,
+                    },
+                    params: FlashSwapParams {
+                        zeroForOne: zero_for_one,
+                        amountSpecified: alloy_primitives::I256::ZERO,
+                        sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
+                    },
+                    hookData: alloy_primitives::Bytes::new(),
+                });
+            }
+            "v4" => {
+                let key = alloy_primitives::hex::encode(pool_id);
+                let Some((tick, hooks)) = overrides.get(&key) else {
+                    return Err(format!("V4 pool {key} missing tick/hooks override"));
+                };
+                legs.push(HybridLegSol {
+                    venue: 1,
+                    v3Pool: Address::ZERO,
+                    key: FlashPoolKey {
+                        currency0: c0,
+                        currency1: c1,
+                        fee: alloy_primitives::Uint::<24, 1>::from(fee_raw),
+                        tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
+                        hooks: *hooks,
+                    },
+                    params: FlashSwapParams {
+                        zeroForOne: zero_for_one,
+                        amountSpecified: alloy_primitives::I256::ZERO,
+                        sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
+                    },
+                    hookData: alloy_primitives::Bytes::new(),
+                });
+            }
+            other => return Err(format!("unknown venue profile {other:?}")),
+        }
     }
     Ok(legs.abi_encode())
 }
@@ -962,7 +1102,12 @@ pub mod trade {
     ) -> Result<TradeOutcome, String> {
         if flash {
             let token = row.token_lo;
-            let legs_data = crate::submit::build_flash_legs_data(row, overrides)?;
+            let is_hybrid = row.legs.iter().any(|l| l.starts_with("v3:"));
+            let legs_data = if is_hybrid {
+                crate::submit::build_hybrid_legs_data(row, overrides)?
+            } else {
+                crate::submit::build_flash_legs_data(row, overrides)?
+            };
             let mut min_profit =
                 row.profit.saturating_mul(U256::from(profit_safety_pct)) / U256::from(100_u64);
             // Preflight: chain, code, gas price
@@ -975,9 +1120,15 @@ pub mod trade {
                 gas_price_wei as f64 / 1e9
             );
             // Estimate with quoted minProfit to learn gas, then enforce floor
-            let mut est = submitter
-                .estimate_flash(token, row.input, &legs_data, min_profit)
-                .await?;
+            let mut est = if is_hybrid {
+                submitter
+                    .estimate_hybrid(token, row.input, &legs_data, min_profit)
+                    .await?
+            } else {
+                submitter
+                    .estimate_flash(token, row.input, &legs_data, min_profit)
+                    .await?
+            };
             eprintln!("preflight (flash): estimate {est} gas");
             // Gas floor
             let token_usd = prices.get(&token).copied();
@@ -993,9 +1144,15 @@ pub mod trade {
                 if floor > min_profit {
                     eprintln!("trade (flash): gas floor binds {min_profit} -> {floor}");
                     min_profit = floor;
-                    est = submitter
-                        .estimate_flash(token, row.input, &legs_data, min_profit)
-                        .await?;
+                    est = if is_hybrid {
+                        submitter
+                            .estimate_hybrid(token, row.input, &legs_data, min_profit)
+                            .await?
+                    } else {
+                        submitter
+                            .estimate_flash(token, row.input, &legs_data, min_profit)
+                            .await?
+                    };
                     eprintln!("preflight (flash): re-estimate {est} gas with floor");
                 }
             }
@@ -1007,9 +1164,15 @@ pub mod trade {
                     detail: format!("gates passed (flash), estimate {est} gas (dry run)"),
                 });
             }
-            let result = submitter
-                .broadcast_flash(token, row.input, &legs_data, min_profit, est)
-                .await?;
+            let result = if is_hybrid {
+                submitter
+                    .broadcast_hybrid(token, row.input, &legs_data, min_profit, est)
+                    .await?
+            } else {
+                submitter
+                    .broadcast_flash(token, row.input, &legs_data, min_profit, est)
+                    .await?
+            };
             return Ok(TradeOutcome {
                 dry_run: false,
                 detail: format!("TX {} status {} gas {}", result.tx_hash, result.status, result.gas_used),
