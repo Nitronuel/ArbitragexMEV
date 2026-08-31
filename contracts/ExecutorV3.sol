@@ -13,6 +13,7 @@ pragma solidity ^0.8.26;
 contract ExecutorV3 {
     address public immutable owner;
     address public constant PM = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
+    address public constant ROUTER = 0x65050A9b7E5075A2bA5cED7b1b64EE66262c40Dc;
 
     // V4 sqrt price limits
     uint160 constant MIN_SQRT_PRICE = 4295128739 + 1;
@@ -25,6 +26,7 @@ contract ExecutorV3 {
     error RouteTooShort();
     error ProfitTooLow();
     error NoProfit();
+    error ArbitraryTargetBlocked();
 
     struct PoolKey {
         address currency0;
@@ -90,47 +92,29 @@ contract ExecutorV3 {
             abi.decode(data, (address, uint256, bytes, uint256, address, bool));
         uint256 startGas = gasleft();
 
+        // Reset transient callback state
+        s_curAmount = 0;
+        delete s_v3Pools;
         uint256 curAmount = amount;
         bool hasV3 = false;
         if (isHybrid) {
-            HybridLeg[] memory hlegs = abi.decode(legsData, (HybridLeg[]));
-            for (uint256 i = 0; i < hlegs.length; i++) if (hlegs[i].venue == 0) { hasV3 = true; break; }
-            if (hasV3) {
-                // Hybrid needs physical funds for V3 callback payments.
-                IPM(PM).take(token, address(this), amount);
+            // Hybrid via router: legsData is 0x4d819a2a router calldata. Use PM flash to fund it.
+            hasV3 = true;
+            if (legsData.length < 4 || bytes4(legsData) != bytes4(0x4d819a2a)) revert ArbitraryTargetBlocked();
+            IPM(PM).take(token, address(this), amount);
+            if (token == address(0)) {
+                (bool ok,) = ROUTER.call{value: amount}(legsData);
+                require(ok, "router failed");
+                curAmount = address(this).balance;
+            } else {
+                // Approve exact amount, no persistent approval
+                IERC20(token).approve(ROUTER, amount);
+                (bool ok,) = ROUTER.call(legsData);
+                require(ok, "router failed");
+                IERC20(token).approve(ROUTER, 0);
+                curAmount = IERC20(token).balanceOf(address(this));
             }
-            for (uint256 i = 0; i < hlegs.length; i++) {
-                hlegs[i].params.amountSpecified = int256(curAmount);
-                if (hlegs[i].params.sqrtPriceLimitX96 == 0) {
-                    hlegs[i].params.sqrtPriceLimitX96 =
-                        hlegs[i].params.zeroForOne ? MIN_SQRT_PRICE : MAX_SQRT_PRICE;
-                }
-                if (hlegs[i].venue == 0) {
-                    // V3 leg: pool.swap(recipient, zeroForOne, amountSpecified, sqrtPriceLimit, data)
-                    // data = abi.encode(curAmount) for callback verification; zeroForOne derived from key.
-                    uint160 limit = hlegs[i].params.sqrtPriceLimitX96;
-                    int256 amt = hlegs[i].params.amountSpecified;
-                    bool zfo = hlegs[i].params.zeroForOne;
-                    // V3 exact-in: swap with positive amountSpecified? Use negative for exact-in per V3 spec? AmountSpecified positive = exact-in of token0/1.
-                    // Our curAmount is the input amount in the leg's input token.
-                    IUniswapV3Pool(hlegs[i].v3Pool).swap(
-                        address(this), zfo, amt, limit, abi.encode(hlegs[i].key.currency0, hlegs[i].key.currency1, hlegs[i].key.fee)
-                    );
-                    // curAmount is updated in callback via s_curAmount
-                    curAmount = s_curAmount;
-                    if (curAmount == 0) revert NoProfit();
-                } else {
-                    BalanceDelta memory delta = IPM(PM).swap(hlegs[i].key, hlegs[i].params, hlegs[i].hookData);
-                    int256 d0 = delta.amount0;
-                    int256 d1 = delta.amount1;
-                    if (hlegs[i].params.zeroForOne) {
-                        curAmount = d1 > 0 ? uint256(d1) : 0;
-                    } else {
-                        curAmount = d0 > 0 ? uint256(d0) : 0;
-                    }
-                    if (curAmount == 0) revert NoProfit();
-                }
-            }
+            if (curAmount == 0) revert NoProfit();
         } else {
             // Legacy V4-only path: no upfront take
             FlashLeg[] memory legs = abi.decode(legsData, (FlashLeg[]));
@@ -194,6 +178,7 @@ contract ExecutorV3 {
 
     // Transient storage for V3 callback -> unlockCallback communication (single tx, safe)
     uint256 private s_curAmount;
+    address[] private s_v3Pools;
 
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
         // V3 pool calls back to pay. amount0Delta >0 means pool owes token0 to us? No, per V3, positive delta means pool is owed that amount.
@@ -237,4 +222,4 @@ interface IUniswapV3Pool {
     function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data) external returns (int256 amount0, int256 amount1);
 }
 struct BalanceDelta { int256 amount0; int256 amount1; }
-interface IERC20 { function transfer(address, uint256) external returns (bool); function balanceOf(address) external view returns (uint256); }
+interface IERC20 { function transfer(address, uint256) external returns (bool); function balanceOf(address) external view returns (uint256); function approve(address, uint256) external returns (bool); }
