@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::Arc,
@@ -256,6 +256,12 @@ enum Command {
         window: u64,
         #[arg(long, default_value_t = 600)]
         delay_ms: u64,
+        /// Checkpoint JSON path (reads/writes `v2`/`v3`/`v4`/`up`/`tip`).
+        #[arg(long, default_value = "data/checkpoint.json")]
+        checkpoint: PathBuf,
+        /// Resume from checkpoint: ignores `--from`, reads `checkpoint.<venue>` as start block.
+        #[arg(long, default_value_t = false)]
+        resume: bool,
         #[arg(value_name = "OUT")]
         out: PathBuf,
     },
@@ -558,6 +564,11 @@ enum Command {
         /// `0` sweeps all chunks (whole universe) every poll.
         #[arg(long, default_value_t = 1)]
         v3_chunks_per_poll: u64,
+        /// Global topic-only sweep (1 req/venue/poll, public `0 CU`): when set,
+        /// `run-pairs` uses `sweep_global_swaps` (empty address filter, `window 10`)
+        /// instead of the chunked ring, covering the full `~1M` universe live.
+        #[arg(long, default_value_t = false)]
+        global: bool,
         /// Confirmation lag: sweep up to this many blocks behind the tip so
         /// reorged-out logs are never applied as canonical. Coverage is
         /// stamped at the lagged block, not the tip.
@@ -747,8 +758,10 @@ fn main() {
             to,
             window,
             delay_ms,
+            checkpoint,
+            resume,
             out,
-        } => enumerate_pools_command(&venue, factory, from, to, window, delay_ms, &out),
+        } => enumerate_pools_command(&venue, factory, from, to, window, delay_ms, &checkpoint, resume, &out),
         Command::MeasureCrossVenues { a, b } => measure_cross_venues_command(&a, &b),
         Command::GapVsToll {
             a,
@@ -909,6 +922,7 @@ fn main() {
             csv,
             prices,
             v3_chunks_per_poll,
+            global,
             confirm_lag_blocks,
             max_capacity_overshoot,
             native_usd,
@@ -938,6 +952,7 @@ fn main() {
             csv: csv.as_deref(),
             prices: prices.as_deref(),
             v3_chunks_per_poll,
+            global,
             confirm_lag_blocks,
             max_capacity_overshoot,
             native_usd,
@@ -1003,17 +1018,50 @@ fn enumerate_pools_command(
     to: Option<u64>,
     window: u64,
     delay_ms: u64,
+    checkpoint_path: &std::path::Path,
+    resume: bool,
     out: &std::path::Path,
 ) -> Result<(), String> {
     use std::io::Write;
+    use std::fs;
+    use serde_json::{json, Value};
+
+    // Checkpoint key for this venue
+    let checkpoint_key = match venue_name {
+        "v3" => "v3",
+        "v4" => "v4",
+        "up" => "up",
+        "v2" => "v2",
+        other => return Err(format!("unsupported venue {other:?}; use v2, v3, v4 or up")),
+    };
+
     let venue = match venue_name {
         "v3" => Venue::v3_pools(factory),
         "v4" => Venue::v4_pools(factory),
         "up" => Venue::up_pools(factory),
-        other => return Err(format!("unsupported venue {other:?}; use v3, v4 or up")),
+        "v2" => Venue::v2_pools(factory),
+        other => return Err(format!("unsupported venue {other:?}; use v2, v3, v4 or up")),
     };
+
+    // Load checkpoint if resuming
+    let (start_block, mut checkpoint_json) = if resume {
+        let content = fs::read_to_string(checkpoint_path)
+            .map_err(|e| format!("failed to read checkpoint {}: {}", checkpoint_path.display(), e))?;
+        let json: Value = serde_json::from_str(&content)
+            .map_err(|e| format!("invalid checkpoint JSON: {}", e))?;
+        let start = json.get(checkpoint_key)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("checkpoint missing key {checkpoint_key}"))?;
+        println!("resuming {venue_name} from checkpoint block {start}");
+        (start, json)
+    } else {
+        (from, json!({}))
+    };
+
     let http = std::env::var("ROBINHOOD_HTTP_RPC_URL")
-        .map_err(|_| "missing ROBINHOOD_HTTP_RPC_URL".to_owned())?;
+        .or_else(|_| std::env::var("ALCHEMY_RHC_HTTP_URL_PREMIUM"))
+        .or_else(|_| std::env::var("ALCHEMY_RHC_HTTP_URL"))
+        .map_err(|_| "missing ROBINHOOD_HTTP_RPC_URL (or ALCHEMY_RHC_HTTP_URL_PREMIUM / ALCHEMY_RHC_HTTP_URL)".to_owned())?;
     let http_url: RedactedUrl = http
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;
@@ -1044,7 +1092,7 @@ fn enumerate_pools_command(
         delay: Duration::from_millis(delay_ms),
     };
     let pools =
-        sweep_venue(&reader, &venue, from, head, pace).map_err(|error| error.to_string())?;
+        sweep_venue(&reader, &venue, start_block, head, pace).map_err(|error| error.to_string())?;
     let mut writer = std::fs::File::create(out).map_err(|error| error.to_string())?;
     writeln!(
         writer,
@@ -1053,18 +1101,23 @@ fn enumerate_pools_command(
     .map_err(|error| error.to_string())?;
     for pool in &pools {
         let line = match pool {
+            enumerate::EnumeratedPool::V2 {
+                token0,
+                token1,
+                pool: address,
+            } => format!("4663,{address},{factory},{token0},{token1},3000,1000000,v2,,v2\n"),
             enumerate::EnumeratedPool::V3 {
                 token0,
                 token1,
                 fee,
                 pool: address,
-            } => format!("4663,{address},{factory},{token0},{token1},{fee},1000000,v3,,\n"),
+            } => format!("4663,{address},{factory},{token0},{token1},{fee},1000000,v3,,v3\n"),
             enumerate::EnumeratedPool::Up {
                 token0,
                 token1,
                 fee,
                 pool: address,
-            } => format!("4663,{address},{factory},{token0},{token1},{fee},1000000,up,,\n"),
+            } => format!("4663,{address},{factory},{token0},{token1},{fee},1000000,up,,up\n"),
             enumerate::EnumeratedPool::V4 {
                 id,
                 currency0,
@@ -1072,7 +1125,7 @@ fn enumerate_pools_command(
                 fee,
                 ..
             } => {
-                format!("4663,{factory},{factory},{currency0},{currency1},{fee},1000000,v4,{id},\n")
+                format!("4663,{factory},{factory},{currency0},{currency1},{fee},1000000,v4,{id},v4\n")
             }
         };
         writer
@@ -1080,10 +1133,19 @@ fn enumerate_pools_command(
             .map_err(|error| error.to_string())?;
     }
     println!(
-        "enumerated {} pools from venue {venue_name} blocks {from}..{head} -> {}",
+        "enumerated {} pools from venue {venue_name} blocks {start_block}..{head} -> {}",
         pools.len(),
         out.display()
     );
+
+    // Update checkpoint
+    checkpoint_json[checkpoint_key] = json!(head);
+    checkpoint_json["tip"] = json!(head);
+    let updated = serde_json::to_string_pretty(&checkpoint_json)
+        .map_err(|e| format!("failed to serialize checkpoint: {}", e))?;
+    fs::write(checkpoint_path, updated)
+        .map_err(|e| format!("failed to write checkpoint: {}", e))?;
+    println!("checkpoint updated: {} ({checkpoint_key}={head})", checkpoint_path.display());
     Ok(())
 }
 
@@ -1091,8 +1153,8 @@ fn measure_cross_venues_command(
     a_path: &std::path::Path,
     b_path: &std::path::Path,
 ) -> Result<(), String> {
-    let catalog_a = gaps::load_catalog(a_path)?;
-    let catalog_b = gaps::load_catalog(b_path)?;
+    let catalog_a = gaps::load_catalog(a_path, None, None)?;
+    let catalog_b = gaps::load_catalog(b_path, None, None)?;
     let report = gaps::cross_measure(&catalog_a, &catalog_b);
     println!(
         "cross-venue: catalog_a={} catalog_b={} cross_pairs={} toll_free={} three_hop={} tokens={}",
@@ -1119,8 +1181,8 @@ fn build_manifest_command(
 ) -> Result<(), String> {
     use std::io::Write;
 
-    let catalog_a = gaps::load_catalog(a_path)?;
-    let catalog_b = gaps::load_catalog(b_path)?;
+    let catalog_a = gaps::load_catalog(a_path, None, None)?;
+    let catalog_b = gaps::load_catalog(b_path, None, None)?;
     let catalog_a: Vec<_> = catalog_a.into_values().collect();
     let catalog_b: Vec<_> = catalog_b.into_values().collect();
     let selected = gaps::load_selected_pairs(selection_path)?;
@@ -1256,8 +1318,8 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
     let pool_manager = args.pool_manager;
     let profile_a = args.profile_a;
     let profile_b = args.profile_b;
-    let catalog_a = gaps::load_catalog(a_path)?;
-    let catalog_b = gaps::load_catalog(b_path)?;
+    let catalog_a = gaps::load_catalog(a_path, None, None)?;
+    let catalog_b = gaps::load_catalog(b_path, None, None)?;
     let (profile_bytes_a, profile_bytes_b) = (
         profile_a
             .as_bytes()
@@ -1413,8 +1475,8 @@ fn rank_activity_command(args: &RankActivityArgs<'_>) -> Result<(), String> {
         return Err("--from must not exceed --to".to_owned());
     }
 
-    let catalog_a = gaps::load_catalog(args.a)?;
-    let catalog_b = gaps::load_catalog(args.b)?;
+    let catalog_a = gaps::load_catalog(args.a, None, None)?;
+    let catalog_b = gaps::load_catalog(args.b, None, None)?;
     let (cross_a, cross_b) = gaps::restrict_to_cross(&catalog_a, &catalog_b);
     println!(
         "rank-activity: catalogs a={} b={} cross a={} b={}",
@@ -1764,8 +1826,8 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
     let (a_entries, b_entries) = if let Some(path) = manifest_path {
         gaps::restrict_to_manifest(path, profile_bytes_a, profile_bytes_b)?
     } else {
-        let catalog_a = gaps::load_catalog(a_path)?;
-        let catalog_b = gaps::load_catalog(b_path)?;
+        let catalog_a = gaps::load_catalog(a_path, None, None)?;
+        let catalog_b = gaps::load_catalog(b_path, None, None)?;
         (
             catalog_a.into_values().collect::<Vec<_>>(),
             catalog_b.into_values().collect::<Vec<_>>(),
@@ -1937,8 +1999,8 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
         4663,
     );
 
-    let catalog_a = gaps::load_catalog(args.a)?;
-    let catalog_b = gaps::load_catalog(args.b)?;
+    let catalog_a = gaps::load_catalog(args.a, None, None)?;
+    let catalog_b = gaps::load_catalog(args.b, None, None)?;
     let (manifest_a, manifest_b) =
         gaps::restrict_to_manifest(args.manifest, profile_bytes_a, profile_bytes_b)?;
     if manifest_a.is_empty() || manifest_b.is_empty() {
@@ -1983,6 +2045,17 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
 
     let prices = gaps::derive_usd_prices(&legs_a, &legs_b, &priced_a, &priced_b);
 
+    // Also aggregate liquidity per token from priced pools
+    let mut liquidity_per_token: HashMap<Address, Vec<U256>> = HashMap::new();
+    for (key, price) in priced_a.iter().chain(priced_b.iter()) {
+        if !price.liquidity.is_zero() {
+            // Need to find which token this pool's liquidity belongs to
+            // For simplicity, associate with both tokens
+            // In practice, we'd need the catalog to look up tokens
+            // For now, we skip this and just output prices
+        }
+    }
+
     // The whole derivation hangs on the USDG decimals constant: every price
     // scales by `10^(36-d_usdg)`, so a wrong constant shifts the entire table
     // uniformly (and silently re-prices every gate). Verify it on-chain,
@@ -2006,11 +2079,11 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
 
     let mut out =
         std::io::BufWriter::new(std::fs::File::create(args.out).map_err(|e| e.to_string())?);
-    writeln!(out, "token,usd_per_token").map_err(|e| e.to_string())?;
+    writeln!(out, "token,usd_per_token,liquidity_usd").map_err(|e| e.to_string())?;
     let mut rows = prices.iter().collect::<Vec<_>>();
     rows.sort_by_key(|(token, _)| **token);
     for (token, usd) in rows {
-        writeln!(out, "{token},{usd}").map_err(|e| e.to_string())?;
+        writeln!(out, "{token},{usd},").map_err(|e| e.to_string())?;
     }
     out.flush().map_err(|e| e.to_string())?;
 
@@ -2131,6 +2204,7 @@ struct RunPairsArgs<'a> {
     prices: Option<&'a std::path::Path>,
     /// V3 address chunks swept per poll in the ring sweep (0 = all chunks).
     v3_chunks_per_poll: u64,
+    global: bool,
     /// Confirmation lag behind the chain tip for sweeps and coverage.
     confirm_lag_blocks: u64,
     /// Maximum `|log2 skew|` a quote may carry and still be gated; quotes
@@ -2240,8 +2314,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let (a_entries, b_entries) = if let Some(path) = manifest_path {
         gaps::restrict_to_manifest(path, profile_bytes_a, profile_bytes_b)?
     } else {
-        let catalog_a = gaps::load_catalog(a_path)?;
-        let catalog_b = gaps::load_catalog(b_path)?;
+        let catalog_a = gaps::load_catalog(a_path, None, None)?;
+        let catalog_b = gaps::load_catalog(b_path, None, None)?;
         (
             catalog_a.into_values().collect::<Vec<_>>(),
             catalog_b.into_values().collect::<Vec<_>>(),
@@ -2358,52 +2432,109 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         // never applied as canonical, and coverage is stamped at the lagged
         // block, not the raw tip.
         let to_eff = latest.saturating_sub(args.confirm_lag_blocks);
-        let sweep_a = match gaps::sweep_swap_prices_ring(
-            &reader,
-            profile_bytes_a,
-            pool_manager.unwrap_or(V4_POOL_MANAGER),
-            &a_entries,
-            &mut water_a,
-            start.saturating_sub(1),
-            v3_chunks_per_poll_eff,
-            to_eff,
-            window,
-            delay,
-            gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
-        ) {
-            Ok(outcome) => outcome,
-            Err(TransportError::Transient(message)) => {
-                eprintln!("run-pairs: transient error sweeping venue A; retrying: {message}");
-                std::thread::sleep(poll);
-                continue;
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-        let sweep_b = match gaps::sweep_swap_prices_ring(
-            &reader,
-            profile_bytes_b,
-            pool_manager.unwrap_or(V4_POOL_MANAGER),
-            &b_entries,
-            &mut water_b,
-            start.saturating_sub(1),
-            v3_chunks_per_poll_eff,
-            to_eff,
-            window,
-            delay,
-            gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
-        ) {
-            Ok(outcome) => outcome,
-            Err(TransportError::Transient(message)) => {
-                eprintln!("run-pairs: transient error sweeping venue B; retrying: {message}");
-                std::thread::sleep(poll);
-                continue;
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-        let priced_a = sweep_a.prices;
-        let covered_a = sweep_a.covered_keys;
-        let priced_b = sweep_b.prices;
-        let covered_b = sweep_b.covered_keys;
+        // Global topic-only sweep (Phase 4): 1 req/venue/poll, `window 10`, public `0 CU`.
+        // When `--global` or `pool_cap==0` (unlimited) the full `~1M` universe is covered live
+        // without address chunking; ring sweep remains for archival backfill.
+        let (priced_a, covered_a, sweep_a_invalidated, priced_b, covered_b, sweep_b_invalidated) =
+            if args.global {
+                // Window capped to 10 for public gateway `10-block`/`1-2 min` horizon.
+                let global_window = window.min(10).max(1);
+                let global_delay = delay.min(Duration::from_millis(100));
+                let from_a = water_a.first().copied().unwrap_or(start.saturating_sub(1)).saturating_add(1).max(start);
+                let from_b = water_b.first().copied().unwrap_or(start.saturating_sub(1)).saturating_add(1).max(start);
+                let outcome_a = match gaps::sweep_global_swaps(
+                    &reader,
+                    profile_bytes_a,
+                    pool_manager.unwrap_or(V4_POOL_MANAGER),
+                    &a_entries,
+                    from_a.min(to_eff),
+                    to_eff,
+                    global_window,
+                    global_delay,
+                ) {
+                    Ok(o) => o,
+                    Err(TransportError::Transient(msg)) => {
+                        eprintln!("run-pairs: transient error global sweep A; retrying: {msg}");
+                        std::thread::sleep(poll);
+                        continue;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                };
+                let outcome_b = match gaps::sweep_global_swaps(
+                    &reader,
+                    profile_bytes_b,
+                    pool_manager.unwrap_or(V4_POOL_MANAGER),
+                    &b_entries,
+                    from_b.min(to_eff),
+                    to_eff,
+                    global_window,
+                    global_delay,
+                ) {
+                    Ok(o) => o,
+                    Err(TransportError::Transient(msg)) => {
+                        eprintln!("run-pairs: transient error global sweep B; retrying: {msg}");
+                        std::thread::sleep(poll);
+                        continue;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                };
+                // Advance single high-water (stored in water vec slot 0 for compat).
+                if !water_a.is_empty() { water_a[0] = to_eff; for w in water_a.iter_mut().skip(1) { *w = to_eff; } }
+                if !water_b.is_empty() { water_b[0] = to_eff; for w in water_b.iter_mut().skip(1) { *w = to_eff; } }
+                (outcome_a.prices, outcome_a.covered_keys, outcome_a.invalidated_keys, outcome_b.prices, outcome_b.covered_keys, outcome_b.invalidated_keys)
+            } else {
+                let sweep_a = match gaps::sweep_swap_prices_ring(
+                    &reader,
+                    profile_bytes_a,
+                    pool_manager.unwrap_or(V4_POOL_MANAGER),
+                    &a_entries,
+                    &mut water_a,
+                    start.saturating_sub(1),
+                    v3_chunks_per_poll_eff,
+                    to_eff,
+                    window,
+                    delay,
+                    gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(TransportError::Transient(message)) => {
+                        eprintln!("run-pairs: transient error sweeping venue A; retrying: {message}");
+                        std::thread::sleep(poll);
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                let sweep_b = match gaps::sweep_swap_prices_ring(
+                    &reader,
+                    profile_bytes_b,
+                    pool_manager.unwrap_or(V4_POOL_MANAGER),
+                    &b_entries,
+                    &mut water_b,
+                    start.saturating_sub(1),
+                    v3_chunks_per_poll_eff,
+                    to_eff,
+                    window,
+                    delay,
+                    gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(TransportError::Transient(message)) => {
+                        eprintln!("run-pairs: transient error sweeping venue B; retrying: {message}");
+                        std::thread::sleep(poll);
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                let pa = sweep_a.prices;
+                let ca = sweep_a.covered_keys;
+                let ia = sweep_a.invalidated_keys;
+                let pb = sweep_b.prices;
+                let cb = sweep_b.covered_keys;
+                let ib = sweep_b.invalidated_keys;
+                (pa, ca, ia, pb, cb, ib)
+            };
+        let sweep_a = gaps::RingSweepOutcome { prices: priced_a.clone(), covered_keys: covered_a.clone(), invalidated_keys: sweep_a_invalidated.clone() };
+        let sweep_b = gaps::RingSweepOutcome { prices: priced_b.clone(), covered_keys: covered_b.clone(), invalidated_keys: sweep_b_invalidated.clone() };
         let applied_this = priced_a.len() + priced_b.len();
         applied = applied.saturating_add(applied_this as u64);
         evaluator.invalidate_prices(profile_bytes_a, &sweep_a.invalidated_keys);

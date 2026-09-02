@@ -67,7 +67,7 @@ pub enum CatalogError {
     WrongChain(u64),
     #[error("pinned block {0} is unavailable")]
     PinnedBlockUnavailable(u64),
-    #[error("catalog exceeds the 2,000-pool cap")]
+    #[error("catalog exceeds the pool cap (unlimited when 0)")]
     PoolCapExceeded,
 }
 
@@ -81,13 +81,15 @@ pub enum CatalogError {
 ///
 /// Returns a fatal error when the RPC reports a chain other than the catalog's
 /// chain or cannot serve the pinned block.
+const VERIFY_MAX_POOLS: usize = 0; // 0 = unlimited (public global sweep covers ~1M)
+
 pub fn verify_catalog<R: CatalogRpc>(
     candidates: Vec<CandidatePool>,
     factories: &[FactorySpec],
     block: u64,
     rpc: &R,
 ) -> Result<CatalogResult, CatalogError> {
-    if candidates.len() > 2_000 {
+    if VERIFY_MAX_POOLS != 0 && candidates.len() > VERIFY_MAX_POOLS {
         return Err(CatalogError::PoolCapExceeded);
     }
     let Some(expected) = candidates.first().map(|candidate| candidate.chain_id) else {
@@ -284,6 +286,7 @@ mod tests {
             profile: Profile::ConstantProduct,
             pool_id: None,
             source: "protocol deployment".to_owned(),
+            liquidity_usd: None,
         }
     }
 

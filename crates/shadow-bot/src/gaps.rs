@@ -149,13 +149,17 @@ pub struct PoolEntry {
 /// # Errors
 ///
 /// Returns the parser's message on a malformed row.
-pub fn load_catalog(path: &Path) -> Result<HashMap<[u8; 32], PoolEntry>, String> {
+pub fn load_catalog(
+    path: &Path,
+    min_liq_usd: Option<U256>,
+    max_liq_usd: Option<U256>,
+) -> Result<HashMap<[u8; 32], PoolEntry>, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut reader = csv::Reader::from_reader(file);
     let mut out = HashMap::new();
     // Expected header (see `enumerate-pools` writer):
     // `chain_id,pool_address,factory_address,token0,token1,fee_numerator,
-    //  fee_denominator,profile,pool_id,source`
+    //  fee_denominator,profile,pool_id,source,liquidity_usd`
     for record in reader.records() {
         let record = record.map_err(|e| e.to_string())?;
         let chain_id = record
@@ -219,6 +223,35 @@ pub fn load_catalog(path: &Path) -> Result<HashMap<[u8; 32], PoolEntry>, String>
         } else {
             venue.into_word().into()
         };
+
+        // Parse optional liquidity_usd (column 10, index 10 after source)
+        let liquidity_usd = record
+            .get(10)
+            .and_then(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse::<U256>().ok()
+                }
+            });
+
+        // Apply liquidity filter
+        if let Some(min) = min_liq_usd {
+            if let Some(liq) = liquidity_usd {
+                if liq < min {
+                    continue; // skip this pool
+                }
+            }
+        }
+        if let Some(max) = max_liq_usd {
+            if let Some(liq) = liquidity_usd {
+                if liq > max {
+                    continue; // skip this pool
+                }
+            }
+        }
+
         out.insert(
             key,
             PoolEntry {
@@ -521,7 +554,7 @@ pub fn restrict_to_manifest(
     profile_a: [u8; 2],
     profile_b: [u8; 2],
 ) -> Result<(Vec<PoolEntry>, Vec<PoolEntry>), String> {
-    let catalog = load_catalog(path)?;
+    let catalog = load_catalog(path, None, None)?;
     let mut a = Vec::new();
     let mut b = Vec::new();
     for entry in catalog.into_values() {
@@ -724,6 +757,101 @@ where
         }
     }
     Ok(latest)
+}
+
+/// Global `Swap` sweep — 1 req/venue/poll on public RHC, no address chunking.
+///
+/// V4 filters by the singleton `pool_manager` (all `PoolId`s via `topic1`);
+/// V3/Up use an empty address filter (all pools) and rely on the local
+/// `keys` whitelist to drop unrelated logs. `window 10` (not `1000`) keeps
+/// each `eth_getLogs` narrow for the gateway `10k cap` + `1-2 min` horizon;
+/// the dirty-set still only re-quotes `pair←pool`.
+///
+/// # Errors
+///
+/// Returns `TransportError` on empty filter or transport/budget failure.
+pub fn sweep_global_swaps<B, S>(
+    reader: &ChainReader<B, S>,
+    profile: [u8; 2],
+    pool_manager: Address,
+    keys: &[PoolEntry],
+    from: u64,
+    to: u64,
+    window: u64,
+    request_delay: Duration,
+) -> Result<RingSweepOutcome, TransportError>
+where
+    B: HttpBackend,
+    S: Sleeper,
+{
+    let topic = if profile == *b"v4" {
+        v4_swap_topic()
+    } else {
+        v3_swap_topic()
+    };
+    let alternates: Vec<B256> = if profile == *b"v4" {
+        vec![provider::v4_modify_liquidity_topic()]
+    } else {
+        vec![provider::v3_mint_topic(), provider::v3_burn_topic()]
+    };
+    let liquidity_topics: HashSet<[u8; 32]> = alternates.iter().map(|t| t.0).collect();
+    let mut outcome = RingSweepOutcome::default();
+    let ids: Option<HashSet<[u8; 32]>> = if profile == *b"v4" {
+        Some(keys.iter().map(|e| e.id).collect())
+    } else {
+        None
+    };
+    let mut start = from;
+    {
+        let mut ingest = swap_price_ingest(profile, &mut outcome.prices);
+        loop {
+            let end = start.saturating_add(window.saturating_sub(1)).min(to);
+            let addresses = if profile == *b"v4" {
+                vec![pool_manager]
+            } else {
+                Vec::new() // empty = no address filter → all Swaps in window
+            };
+            let logs = reader.get_logs_windowed(
+                &LogFilter {
+                    from_block: start,
+                    to_block: end,
+                    addresses,
+                    topic0: topic,
+                    topic0_alternates: alternates.clone(),
+                },
+                window,
+            )?;
+            // Liquidity-change invalidated keys (Mint/Burn/Modify without Swap)
+            for raw in &logs {
+                let Ok(envelope) = RawLogEnvelope::from_rpc_value(raw) else {
+                    continue;
+                };
+                if envelope
+                    .topics
+                    .first()
+                    .is_some_and(|t| liquidity_topics.contains(&t.0))
+                {
+                    let key = if profile == *b"v4" {
+                        envelope.topics.get(1).map_or([0u8; 32], |t| t.0)
+                    } else {
+                        envelope.address.into_word().into()
+                    };
+                    outcome.invalidated_keys.push(key);
+                }
+            }
+            ingest(&logs, ids.as_ref());
+            if !request_delay.is_zero() {
+                std::thread::sleep(request_delay);
+            }
+            if end == to {
+                break;
+            }
+            start = end + 1;
+        }
+    }
+    // Global covers every pool through `to` (no chunk gaps)
+    outcome.covered_keys = keys.iter().map(|e| (pool_key(e), to)).collect();
+    Ok(outcome)
 }
 
 /// Builds the shared `Swap`-log → latest-`PoolPrice` ingest closure used by
@@ -1289,7 +1417,7 @@ pub fn load_selected_pairs(path: &Path) -> Result<PairSet, String> {
 ///
 /// # Errors
 ///
-/// Returns an error when the expanded manifest exceeds `pool_cap`.
+/// Returns an error when the expanded manifest exceeds `pool_cap` (0 = unlimited).
 pub fn expand_manifest_catalog(
     a: &[PoolEntry],
     b: &[PoolEntry],
@@ -1308,7 +1436,7 @@ pub fn expand_manifest_catalog(
             {
                 continue;
             }
-            if out.len() >= pool_cap {
+            if pool_cap != 0 && out.len() >= pool_cap {
                 return Err(format!(
                     "manifest exceeds the {pool_cap}-pool cap while expanding catalog {label}"
                 ));
@@ -2639,7 +2767,7 @@ mod tests {
         )
         .unwrap();
         drop(f);
-        let map = load_catalog(&path).unwrap();
+        let map = load_catalog(&path, None, None).unwrap();
         assert_eq!(map.len(), 1);
         let entry = map.values().next().unwrap();
         assert_eq!(entry.profile, *b"v4");
@@ -2684,8 +2812,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let report = cross_measure(&m3, &m4);
         assert_eq!(report.cross_pairs, 3);
         assert_eq!(report.toll_free_cross_pairs, 3);
@@ -2721,8 +2849,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let report = cross_measure(&m3, &m4);
         assert_eq!(report.cross_pairs, 1);
         assert_eq!(report.three_hop_cycles, 0);
@@ -2755,8 +2883,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let (a_entries, b_entries) = restrict_to_cross(&m3, &m4);
         assert_eq!(a_entries.len(), 1);
         assert_eq!(b_entries.len(), 1);
@@ -2826,8 +2954,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let (a_entries, b_entries) = restrict_to_cross(&m3, &m4);
         let key3 = a_entries[0].venue.into_word().into();
         let key4 = b_entries[0].id;
@@ -2938,8 +3066,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let all_a: Vec<_> = m3.into_values().collect();
         let all_b: Vec<_> = m4.into_values().collect();
 
@@ -2985,8 +3113,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let all_a: Vec<_> = m3.into_values().collect();
         let all_b: Vec<_> = m4.into_values().collect();
         let selected = HashSet::from([pair_key(a.parse().unwrap(), b.parse().unwrap())]);
@@ -3017,7 +3145,7 @@ mod tests {
             )
             .unwrap();
         }
-        let m4 = load_catalog(&p4).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let all_b: Vec<_> = m4.into_values().collect();
         let selected = HashSet::from([pair_key(RHC_NATIVE, b.parse().unwrap())]);
         let kept = expand_manifest_catalog(&[], &all_b, &selected, 2_000).unwrap();
@@ -3134,8 +3262,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let a_entries: Vec<_> = m3.into_values().collect();
         let b_entries: Vec<_> = m4.into_values().collect();
 
@@ -3197,8 +3325,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let a_entries: Vec<_> = m3.into_values().collect();
         let b_entries: Vec<_> = m4.into_values().collect();
 
@@ -3253,8 +3381,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let a_entries: Vec<_> = m3.into_values().collect();
         let b_entries: Vec<_> = m4.into_values().collect();
 
@@ -3316,8 +3444,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let a_entries: Vec<_> = m3.into_values().collect();
         let b_entries: Vec<_> = m4.into_values().collect();
         assert!(a_entries.len() == 2 && b_entries.len() == 1);
@@ -3385,8 +3513,8 @@ mod tests {
             )
             .unwrap();
         }
-        let m3 = load_catalog(&p3).unwrap();
-        let m4 = load_catalog(&p4).unwrap();
+        let m3 = load_catalog(&p3, None, None).unwrap();
+        let m4 = load_catalog(&p4, None, None).unwrap();
         let a_entries: Vec<_> = m3.into_values().collect();
         let b_entries: Vec<_> = m4.into_values().collect();
         assert_eq!(a_entries.len(), 2);

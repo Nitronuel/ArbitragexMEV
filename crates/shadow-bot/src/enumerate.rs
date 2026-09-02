@@ -4,7 +4,8 @@ use std::time::Duration;
 use alloy_primitives::{Address, B256};
 use provider::{
     ChainReader, HttpBackend, LogFilter, RawLogEnvelope, Sleeper, TransportError,
-    decode_v3_pool_created, decode_v4_initialize, v3_pool_created_topic, v4_initialize_topic,
+    decode_up_pool_created, decode_v2_pair_created, decode_v3_pool_created, decode_v4_initialize,
+    up_pool_created_topic, v2_pair_created_topic, v3_pool_created_topic, v4_initialize_topic,
 };
 
 /// Paces an enumeration sweep: the number of blocks covered by each
@@ -27,6 +28,7 @@ impl Default for CrawlPace {
 /// The DEX venue whose pool-creation events a cursor enumerates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VenueKind {
+    V2,
     V3,
     V4,
     Up,
@@ -45,6 +47,11 @@ pub struct Venue {
 /// One pool-creation event decoded from a factory log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnumeratedPool {
+    V2 {
+        token0: Address,
+        token1: Address,
+        pool: Address,
+    },
     V3 {
         token0: Address,
         token1: Address,
@@ -69,6 +76,15 @@ pub enum EnumeratedPool {
 
 impl Venue {
     #[must_use]
+    pub fn v2_pools(factory: Address) -> Self {
+        Self {
+            address: factory,
+            topic: v2_pair_created_topic(),
+            kind: VenueKind::V2,
+        }
+    }
+
+    #[must_use]
     pub fn v3_pools(factory: Address) -> Self {
         Self {
             address: factory,
@@ -90,33 +106,37 @@ impl Venue {
     pub fn up_pools(factory: Address) -> Self {
         Self {
             address: factory,
-            topic: v3_pool_created_topic(),
+            topic: up_pool_created_topic(),
             kind: VenueKind::Up,
         }
     }
 
-    /// Decodes one raw `eth_getLogs` result into a pool-creation event, or
+    /// Decodes one `RawLogEnvelope` into a pool-creation event, or
     /// `None` when the log does not carry this venue's signature topic0.
     #[must_use]
-    pub fn decode(&self, raw: &serde_json::Value) -> Option<EnumeratedPool> {
-        let envelope = RawLogEnvelope::from_rpc_value(raw).ok()?;
+    pub fn decode(&self, envelope: &RawLogEnvelope) -> Option<EnumeratedPool> {
         if envelope.topics.first()? != &self.topic {
             return None;
         }
         match self.kind {
-            VenueKind::V3 => decode_v3_pool_created(&envelope).map(|pool| EnumeratedPool::V3 {
+            VenueKind::V2 => decode_v2_pair_created(envelope).map(|pool| EnumeratedPool::V2 {
+                token0: pool.token0,
+                token1: pool.token1,
+                pool: pool.pair,
+            }),
+            VenueKind::V3 => decode_v3_pool_created(envelope).map(|pool| EnumeratedPool::V3 {
                 token0: pool.token0,
                 token1: pool.token1,
                 fee: pool.fee,
                 pool: pool.pool,
             }),
-            VenueKind::Up => decode_v3_pool_created(&envelope).map(|pool| EnumeratedPool::Up {
+            VenueKind::Up => decode_up_pool_created(envelope).map(|pool| EnumeratedPool::Up {
                 token0: pool.token0,
                 token1: pool.token1,
                 fee: pool.fee,
                 pool: pool.pool,
             }),
-            VenueKind::V4 => decode_v4_initialize(&envelope).map(|pool| EnumeratedPool::V4 {
+            VenueKind::V4 => decode_v4_initialize(envelope).map(|pool| EnumeratedPool::V4 {
                 id: pool.id,
                 currency0: pool.currency0,
                 currency1: pool.currency1,
@@ -127,11 +147,12 @@ impl Venue {
         }
     }
 
-    /// The deduplication key for a decoded pool (V3 contract address, V4
+    /// The deduplication key for a decoded pool (V2/V3 contract address, V4
     /// `PoolId`).
     #[must_use]
     pub fn pool_key(pool: &EnumeratedPool) -> B256 {
         match pool {
+            EnumeratedPool::V2 { pool, .. } => pool.into_word(),
             EnumeratedPool::V3 { pool, .. } => pool.into_word(),
             EnumeratedPool::Up { pool, .. } => pool.into_word(),
             EnumeratedPool::V4 { id, .. } => *id,
@@ -143,6 +164,7 @@ impl EnumeratedPool {
     #[cfg(test)]
     fn fee(&self) -> u32 {
         match self {
+            EnumeratedPool::V2 { .. } => 3000, // V2 fixed 0.3%
             EnumeratedPool::V3 { fee, .. } | EnumeratedPool::Up { fee, .. } | EnumeratedPool::V4 { fee, .. } => *fee,
         }
     }
@@ -175,16 +197,7 @@ where
     let mut start = from;
     loop {
         let end = start.saturating_add(pace.window.saturating_sub(1)).min(to);
-        let logs = reader.get_logs_windowed(
-            &LogFilter {
-                from_block: start,
-                to_block: end,
-                addresses: vec![venue.address],
-                topic0: venue.topic,
-                topic0_alternates: Vec::new(),
-            },
-            pace.window,
-        )?;
+        let logs = fetch_with_retry(reader, venue, start, end, pace.window, 5)?;
         for raw in &logs {
             let Some(pool) = venue.decode(raw) else {
                 continue;
@@ -202,6 +215,48 @@ where
             std::thread::sleep(pace.delay);
         }
     }
+
+fn fetch_with_retry<B, S>(
+    reader: &ChainReader<B, S>,
+    venue: &Venue,
+    start: u64,
+    end: u64,
+    window: u64,
+    max_retries: u32,
+) -> Result<Vec<RawLogEnvelope>, TransportError>
+where
+    B: HttpBackend,
+    S: Sleeper,
+{
+    let mut delay = std::time::Duration::from_millis(2000);
+    for attempt in 0..=max_retries {
+        match reader.get_logs_windowed(
+            &LogFilter {
+                from_block: start,
+                to_block: end,
+                addresses: vec![venue.address],
+                topic0: venue.topic,
+                topic0_alternates: Vec::new(),
+            },
+            window,
+        ) {
+            Ok(raw_logs) => {
+                let envelopes: Vec<RawLogEnvelope> = raw_logs
+                    .into_iter()
+                    .filter_map(|v| RawLogEnvelope::from_rpc_value(&v).ok())
+                    .collect();
+                return Ok(envelopes);
+            }
+            Err(TransportError::Transient(msg)) if msg.contains("429") && attempt < max_retries => {
+                eprintln!("rate limited (429) on blocks [{}, {}], retry {}/{}: sleeping {:?}", start, end, attempt + 1, max_retries, delay);
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(TransportError::Transient("max retries exceeded for 429".to_owned()))
+}
     Ok(all)
 }
 
@@ -302,19 +357,17 @@ mod tests {
         }))
         .unwrap();
         assert!(decode_v3_pool_created(&envelope).is_none());
-        assert!(
-            venue
-                .decode(&json!({
-                    "address": format!("0x{}", alloy_primitives::hex::encode([0x10; 20])),
-                    "topics": [format!("0x{}", "ef".repeat(32))],
-                    "data": "0x",
-                    "blockNumber": "0x1",
-                    "transactionIndex": "0x0",
-                    "logIndex": "0x0",
-                    "removed": false,
-                }))
-                .is_none()
-        );
+        let bad_envelope = RawLogEnvelope::from_rpc_value(&json!({
+            "address": format!("0x{}", alloy_primitives::hex::encode([0x10; 20])),
+            "topics": [format!("0x{}", "ef".repeat(32))],
+            "data": "0x",
+            "blockNumber": "0x1",
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+            "removed": false,
+        }))
+        .unwrap();
+        assert!(venue.decode(&bad_envelope).is_none());
     }
 
     #[test]
@@ -334,7 +387,8 @@ mod tests {
             "logIndex": "0x0",
             "removed": false,
         });
-        let pool = venue.decode(&raw).expect("decodes");
+        let envelope = RawLogEnvelope::from_rpc_value(&raw).unwrap();
+        let pool = venue.decode(&envelope).expect("decodes");
         let EnumeratedPool::V3 {
             token0,
             token1,

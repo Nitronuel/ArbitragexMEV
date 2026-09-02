@@ -1,34 +1,37 @@
 use std::collections::HashSet;
 use std::io::Read;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use domain::{Chain, Fee, Profile};
 use serde::Deserialize;
 use thiserror::Error;
 
-const MAX_POOLS: usize = 2_000;
+const MAX_POOLS: usize = 0; // 0 = unlimited (covers full ~1M universe on public global sweep)
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidatePool {
-    pub chain_id: u64,
-    pub address: Address,
-    pub factory: Address,
-    pub token0: Address,
-    pub token1: Address,
-    pub fee: Fee,
-    pub profile: Profile,
-    /// Uniswap V4 `PoolId` (keccak of the pool key) for singleton-based pools.
-    /// Present when `profile` is `VolatileManaged`; a conventional address key
-    /// otherwise identifies the pool.
-    pub pool_id: Option<B256>,
-    pub source: String,
+	pub chain_id: u64,
+	pub address: Address,
+	pub factory: Address,
+	pub token0: Address,
+	pub token1: Address,
+	pub fee: Fee,
+	pub profile: Profile,
+	/// Uniswap V4 `PoolId` (keccak of the pool key) for singleton-based pools.
+	/// Present when `profile` is `VolatileManaged`; a conventional address key
+	/// otherwise identifies the pool.
+	pub pool_id: Option<B256>,
+	pub source: String,
+	/// Total liquidity in USD (fixed-point scale: 1 USD = 1e18).
+	/// None if not yet priced / not yet swept.
+	pub liquidity_usd: Option<U256>,
 }
 
 #[derive(Debug, Error)]
 pub enum ManifestError {
     #[error("failed to decode manifest row: {0}")]
     Csv(#[from] csv::Error),
-    #[error("manifest exceeds the {MAX_POOLS}-pool cap")]
+    #[error("manifest exceeds the pool cap (unlimited when MAX_POOLS=0)")]
     PoolCapExceeded,
     #[error("row {row} has unsupported chain ID {chain_id}")]
     InvalidChainId { row: usize, chain_id: u64 },
@@ -61,32 +64,35 @@ pub enum ManifestError {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestRow {
-    chain_id: u64,
-    pool_address: String,
-    factory_address: String,
-    token0: String,
-    token1: String,
-    fee_numerator: u32,
-    fee_denominator: u32,
-    #[serde(default)]
-    profile: Option<String>,
-    #[serde(default)]
-    pool_id: Option<String>,
-    source: String,
+	chain_id: u64,
+	pool_address: String,
+	factory_address: String,
+	token0: String,
+	token1: String,
+	fee_numerator: u32,
+	fee_denominator: u32,
+	#[serde(default)]
+	profile: Option<String>,
+	#[serde(default)]
+	pool_id: Option<String>,
+	source: String,
+	#[serde(default)]
+	liquidity_usd: Option<String>,
 }
 
-/// Parses and strictly validates a bounded candidate-pool CSV manifest.
+/// Parses and strictly validates a candidate-pool CSV manifest.
 ///
 /// # Errors
 ///
 /// Returns an error for malformed CSV, invalid or duplicate addresses, invalid
-/// chain or fee data, missing source metadata, or a manifest over 2,000 pools.
+/// chain or fee data, missing source metadata, or a capped manifest when
+/// `MAX_POOLS != 0` and the cap is exceeded.
 pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestError> {
     let mut pools = Vec::new();
     let mut identities: HashSet<B256> = HashSet::new();
     for (index, record) in csv::Reader::from_reader(reader).deserialize().enumerate() {
         let row_number = index + 2;
-        if pools.len() == MAX_POOLS {
+        if MAX_POOLS != 0 && pools.len() == MAX_POOLS {
             return Err(ManifestError::PoolCapExceeded);
         }
         let row: ManifestRow = record?;
@@ -98,28 +104,6 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
         }
         let address = parse_address(&row.pool_address, row_number, "pool_address")?;
         let factory = parse_address(&row.factory_address, row_number, "factory_address")?;
-        let token0 = parse_address(&row.token0, row_number, "token0")?;
-        let token1 = parse_address(&row.token1, row_number, "token1")?;
-        if token0 == token1 {
-            return Err(ManifestError::EqualTokens { row: row_number });
-        }
-        if row.fee_numerator == 0
-            || row.fee_denominator == 0
-            || row.fee_numerator > row.fee_denominator
-        {
-            return Err(ManifestError::UnsupportedFee {
-                row: row_number,
-                numerator: row.fee_numerator,
-                denominator: row.fee_denominator,
-            });
-        }
-        // The orientation of every downstream price/skew computation assumes
-        // the Uniswap canonical ordering (`token0` = lower address, enforced
-        // by V3 factories and the V4 PoolManager). Fail fast on catalogs that
-        // violate it.
-        if token0 > token1 {
-            return Err(ManifestError::UnsortedTokens { row: row_number });
-        }
         let source = row.source.trim().to_owned();
         if source.is_empty() {
             return Err(ManifestError::MissingSource { row: row_number });
@@ -136,6 +120,34 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
                 });
             }
         };
+        // V4 uses the native sentinel 0x000...000 on one side; allow zero only there.
+        let allow_zero_token = profile == Profile::VolatileManaged;
+        let token0 = parse_token_address(&row.token0, row_number, "token0", allow_zero_token)?;
+        let token1 = parse_token_address(&row.token1, row_number, "token1", allow_zero_token)?;
+        if token0 == token1 {
+            return Err(ManifestError::EqualTokens { row: row_number });
+        }
+        let is_v4_dynamic_sentinel = profile == Profile::VolatileManaged
+            && (row.fee_numerator == 0x80_0000 || row.fee_numerator == 0)
+            && row.fee_denominator == 1_000_000;
+        if !is_v4_dynamic_sentinel
+            && (row.fee_numerator == 0
+                || row.fee_denominator == 0
+                || row.fee_numerator > row.fee_denominator)
+        {
+            return Err(ManifestError::UnsupportedFee {
+                row: row_number,
+                numerator: row.fee_numerator,
+                denominator: row.fee_denominator,
+            });
+        }
+        // The orientation of every downstream price/skew computation assumes
+        // the Uniswap canonical ordering (`token0` = lower address, enforced
+        // by V3 factories and the V4 PoolManager). Fail fast on catalogs that
+        // violate it.
+        if token0 > token1 {
+            return Err(ManifestError::UnsortedTokens { row: row_number });
+        }
         let pool_id = match (&row.pool_id, profile) {
             (Some(raw), Profile::VolatileManaged) => {
                 let trimmed = raw.trim();
@@ -165,26 +177,72 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
         // rates, build-manifest output stores fee rates) — both were accepted
         // verbatim, and a `1/1` or nanoscopic row parsed silently. Require the
         // fraction to be plausible under at least one reading.
-        let fee = Fee::keep_rate(row.fee_numerator, row.fee_denominator)
-            .or_else(|_| Fee::fee_rate(row.fee_numerator, row.fee_denominator))
-            .map_err(|_| ManifestError::UnsupportedFee {
-                row: row_number,
+        // V4 dynamic sentinels (0 and 0x800000) bypass plausibility — their toll
+        // is resolved via observed swap fee at quote time (effective_leg_toll).
+        let fee = if is_v4_dynamic_sentinel {
+            Fee {
                 numerator: row.fee_numerator,
                 denominator: row.fee_denominator,
-            })?;
-        pools.push(CandidatePool {
-            chain_id: row.chain_id,
-            address,
-            factory,
-            token0,
-            token1,
-            fee,
-            profile,
-            pool_id,
-            source,
-        });
+            }
+        } else {
+            Fee::keep_rate(row.fee_numerator, row.fee_denominator)
+                .or_else(|_| Fee::fee_rate(row.fee_numerator, row.fee_denominator))
+                .map_err(|_| ManifestError::UnsupportedFee {
+                    row: row_number,
+                    numerator: row.fee_numerator,
+                    denominator: row.fee_denominator,
+                })?
+        };
+pools.push(CandidatePool {
+			chain_id: row.chain_id,
+			address,
+			factory,
+			token0,
+			token1,
+			fee,
+			profile,
+			pool_id,
+			source,
+			liquidity_usd: row.liquidity_usd
+				.and_then(|s| s.parse::<U256>().ok()),
+		});
     }
     Ok(pools)
+}
+
+/// Filters candidate pools by liquidity USD thresholds.
+/// Keeps pools with `liquidity_usd >= min_liq` and `liquidity_usd <= max_liq`.
+/// Pools with `liquidity_usd = None` are filtered out when a min threshold is set
+/// (tradeoff: aggressive dust filter cuts 50k→5-10k active; set min=None to revert
+///  to conservative where unknown liquidity passes). Recommended: min=$5k/max=$200k
+///  + trade_cap 0.5% V2 / 1% V3V4 (VPS 6×/11Gi validated, 5k manifest ~600M RAM).
+#[must_use]
+pub fn filter_by_liquidity(
+	pools: Vec<CandidatePool>,
+	min_liq_usd: Option<U256>,
+	max_liq_usd: Option<U256>,
+) -> Vec<CandidatePool> {
+	pools
+		.into_iter()
+		.filter(|p| {
+			match p.liquidity_usd {
+				Some(liq) => {
+					if let Some(min) = min_liq_usd {
+						if liq < min {
+							return false;
+						}
+					}
+					if let Some(max) = max_liq_usd {
+						if liq > max {
+							return false;
+						}
+					}
+					true
+				}
+				None => min_liq_usd.is_none(), // None liquidity only passes if no min threshold
+			}
+		})
+		.collect()
 }
 
 fn parse_pool_id(raw: &str) -> Option<B256> {
@@ -205,13 +263,30 @@ fn parse_address(value: &str, row: usize, field: &'static str) -> Result<Address
     Ok(address)
 }
 
+fn parse_token_address(
+    value: &str,
+    row: usize,
+    field: &'static str,
+    allow_zero: bool,
+) -> Result<Address, ManifestError> {
+    let address = Address::parse_checksummed(value.trim(), None)
+        .map_err(|_| ManifestError::InvalidAddress { row, field })?;
+    if address.is_zero() && !allow_zero {
+        return Err(ManifestError::ZeroAddress { row, field });
+    }
+    Ok(address)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
     use std::fmt::Write;
 
-    use super::{ManifestError, parse_manifest};
+    use alloy_primitives::{Address, U256};
+    use domain::{Fee, Profile};
+
+    use super::{filter_by_liquidity, ManifestError, parse_manifest, CandidatePool};
 
     const HEADER: &str = "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,source\n";
 
@@ -376,9 +451,13 @@ mod tests {
 
     #[test]
     fn rejects_more_than_pool_cap() {
+        // Cap is now 0 = unlimited (public global sweep covers full ~1M). The
+        // 5001-row manifest must now parse successfully.
         let mut input = String::from(HEADER);
-        for index in 1..=2_001_u64 {
-            let pool = format!("0x{index:040x}");
+        for index in 1..=5_001_u64 {
+            let mut bytes = [0u8; 32];
+            bytes[24..].copy_from_slice(&index.to_be_bytes());
+            let pool = Address::from_slice(&bytes[12..32]).to_checksum(None);
             input.push_str(&row(
                 &pool,
                 "0x0000000000000000000000000000000000003001",
@@ -386,7 +465,13 @@ mod tests {
                 "source",
             ));
         }
-        assert!(parse_manifest(input.as_bytes()).is_err());
+        let pools = parse_manifest(input.as_bytes()).unwrap();
+        assert_eq!(pools.len(), 5_001);
+    }
+
+    #[test]
+    fn cap_zero_means_unlimited() {
+        assert_eq!(super::MAX_POOLS, 0);
     }
 
     #[test]
@@ -419,5 +504,76 @@ mod tests {
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].chain_id, domain::ROBINHOOD_CHAIN_ID);
         assert_eq!(pools[0].chain_id, 4663);
+    }
+
+    #[test]
+    fn filter_by_liquidity_thresholds() {
+        use alloy_primitives::U256;
+        use super::filter_by_liquidity;
+
+        let pools = vec![
+            CandidatePool {
+                chain_id: 4663,
+                address: Address::repeat_byte(1),
+                factory: Address::repeat_byte(2),
+                token0: Address::repeat_byte(3),
+                token1: Address::repeat_byte(4),
+                fee: domain::Fee::keep_rate(3000, 1000000).unwrap(),
+                profile: domain::Profile::Concentrated,
+                pool_id: None,
+                source: "test".to_owned(),
+                liquidity_usd: Some(U256::from(10000000000000000000000u128)), // 10k
+            },
+            CandidatePool {
+                chain_id: 4663,
+                address: Address::repeat_byte(5),
+                factory: Address::repeat_byte(6),
+                token0: Address::repeat_byte(7),
+                token1: Address::repeat_byte(8),
+                fee: domain::Fee::keep_rate(3000, 1000000).unwrap(),
+                profile: domain::Profile::Concentrated,
+                pool_id: None,
+                source: "test".to_owned(),
+                liquidity_usd: Some(U256::from(5000000000000000000000u128)), // 5k
+            },
+            CandidatePool {
+                chain_id: 4663,
+                address: Address::repeat_byte(9),
+                factory: Address::repeat_byte(10),
+                token0: Address::repeat_byte(11),
+                token1: Address::repeat_byte(12),
+                fee: domain::Fee::keep_rate(3000, 1000000).unwrap(),
+                profile: domain::Profile::Concentrated,
+                pool_id: None,
+                source: "test".to_owned(),
+                liquidity_usd: Some(U256::from(200000000000000000000000u128)), // 200k
+            },
+            CandidatePool {
+                chain_id: 4663,
+                address: Address::repeat_byte(13),
+                factory: Address::repeat_byte(14),
+                token0: Address::repeat_byte(15),
+                token1: Address::repeat_byte(16),
+                fee: domain::Fee::keep_rate(3000, 1000000).unwrap(),
+                profile: domain::Profile::Concentrated,
+                pool_id: None,
+                source: "test".to_owned(),
+                liquidity_usd: None, // no liquidity data
+            },
+        ];
+
+        // Filter min=10k, max=100k
+        let filtered = filter_by_liquidity(pools.clone(), Some(U256::from(10000000000000000000000u128)), Some(U256::from(100000000000000000000000u128)));
+        assert_eq!(filtered.len(), 1); // only the 10k pool (5k too low, 200k too high, None is kept but 5k filtered)
+        assert_eq!(filtered[0].liquidity_usd, Some(U256::from(10000000000000000000000u128)));
+
+        // Filter min=10k only (no max)
+        let filtered = filter_by_liquidity(pools.clone(), Some(U256::from(10000000000000000000000u128)), None);
+        assert_eq!(filtered.len(), 2); // 10k and 200k (5k filtered, None kept)
+        assert_eq!(filtered[0].liquidity_usd, Some(U256::from(10000000000000000000000u128)));
+
+        // No filter
+        let filtered = filter_by_liquidity(pools, None, None);
+        assert_eq!(filtered.len(), 4); // all pools including None liquidity
     }
 }

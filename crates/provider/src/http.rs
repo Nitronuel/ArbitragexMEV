@@ -415,7 +415,10 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
         filter: &LogFilter,
         window: u64,
     ) -> Result<Vec<Value>, TransportError> {
-        if filter.addresses.is_empty() {
+        if filter.addresses.is_empty()
+            && filter.topic0.is_zero()
+            && filter.topic0_alternates.is_empty()
+        {
             return Err(TransportError::EmptyAddressFilter);
         }
         if filter.from_block > filter.to_block {
@@ -428,9 +431,17 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
             let end = start
                 .saturating_add(window.saturating_sub(1))
                 .min(filter.to_block);
-            let response = self.execute(&RpcRequest {
-                method: "eth_getLogs".to_owned(),
-                params: json!([{
+            let params = if filter.addresses.is_empty() {
+                json!([{
+                    "fromBlock": format!("0x{start:x}"),
+                    "toBlock": format!("0x{end:x}"),
+                    "topics": [topics_param(
+                        filter.topic0,
+                        &filter.topic0_alternates,
+                    )],
+                }])
+            } else {
+                json!([{
                     "fromBlock": format!("0x{start:x}"),
                     "toBlock": format!("0x{end:x}"),
                     "address": filter.addresses,
@@ -438,7 +449,11 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
                         filter.topic0,
                         &filter.topic0_alternates,
                     )],
-                }]),
+                }])
+            };
+            let response = self.execute(&RpcRequest {
+                method: "eth_getLogs".to_owned(),
+                params,
             })?;
             let chunk = response
                 .result
@@ -466,7 +481,11 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
     #[must_use]
     pub fn get_logs_with_progress(&self, filter: &LogFilter, window: u64) -> LogsProgress {
         let mut progress = LogsProgress::default();
-        if filter.addresses.is_empty() || filter.from_block > filter.to_block {
+        if (filter.addresses.is_empty()
+            && filter.topic0.is_zero()
+            && filter.topic0_alternates.is_empty())
+            || filter.from_block > filter.to_block
+        {
             progress.error = Some(TransportError::InvalidBlockRange);
             return progress;
         }
@@ -512,14 +531,23 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
         start: u64,
         end: u64,
     ) -> Result<Vec<Value>, TransportError> {
-        let response = self.execute(&RpcRequest {
-            method: "eth_getLogs".to_owned(),
-            params: json!([{
+        let params = if filter.addresses.is_empty() {
+            json!([{
+                "fromBlock": format!("0x{start:x}"),
+                "toBlock": format!("0x{end:x}"),
+                "topics": [filter.topic0],
+            }])
+        } else {
+            json!([{
                 "fromBlock": format!("0x{start:x}"),
                 "toBlock": format!("0x{end:x}"),
                 "address": filter.addresses,
                 "topics": [filter.topic0],
-            }]),
+            }])
+        };
+        let response = self.execute(&RpcRequest {
+            method: "eth_getLogs".to_owned(),
+            params,
         })?;
         response
             .result

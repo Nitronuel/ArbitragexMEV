@@ -36,7 +36,11 @@ pub fn v4_swap_topic() -> B256 {
 
 #[must_use]
 pub fn up_pool_created_topic() -> B256 {
-    keccak256("PoolCreated(address,address,uint24,int24,address)")
+    B256::from([
+        0xab, 0x0d, 0x57, 0xf0, 0xdf, 0x53, 0x7b, 0xb2, 0x5e, 0x80, 0x24, 0x5e, 0xf7, 0x74, 0x8f,
+        0xa6, 0x23, 0x53, 0x80, 0x8c, 0x54, 0xd6, 0xe5, 0x28, 0xa9, 0xdd, 0x20, 0x88, 0x7a, 0xed,
+        0x9a, 0xc2,
+    ])
 }
 
 #[must_use]
@@ -166,6 +170,25 @@ pub fn decode_v3_pool_created(envelope: &RawLogEnvelope) -> Option<V3PoolCreated
         token1: word_address(&envelope.topics[2]),
         fee,
         pool: right_aligned_address(&data[32..64]),
+    })
+}
+
+/// Decodes Up's `PoolCreated` (custom topic `0xab0d…`, fee as topic3, pool in first data word).
+#[must_use]
+pub fn decode_up_pool_created(envelope: &RawLogEnvelope) -> Option<V3PoolCreated> {
+    if envelope.topics.len() < 4 {
+        return None;
+    }
+    let data = envelope.data.as_ref();
+    if data.len() < 32 {
+        return None;
+    }
+    let fee = uint24(&envelope.topics[3][..]);
+    Some(V3PoolCreated {
+        token0: word_address(&envelope.topics[1]),
+        token1: word_address(&envelope.topics[2]),
+        fee,
+        pool: right_aligned_address(&data[..32]),
     })
 }
 

@@ -4,14 +4,14 @@
 # environment: ROBINHOOD_HTTP_RPC_URL and ROBINHOOD_WS_RPC_URL.
 chain_id = 4663
 max_hops = 4
-pool_cap = 2000
+pool_cap = 0 # 0 = unlimited (covers full 1M live via public global sweep)
 stale_timeout_seconds = 60
 recovery_gap_blocks = 1000
 dirty_lag_milliseconds = 500
 request_cu_ceiling = 24000000
 websocket_bytes_ceiling = 5000000000
 database_limit_bytes = 10000000000
-manifest_path = "data/pools-rhc.csv"
+manifest_path = "data/pools-all.csv"
 # Endpoint split (audit task 4.11): the public RHC endpoint is the default
 # for all polling, sweeps and enumeration; it is rate-limited but free.
 # Set ALCHEMY_RHC_HTTP_URL (and WSS if ever needed) only when a command

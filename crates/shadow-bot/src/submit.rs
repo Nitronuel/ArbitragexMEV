@@ -17,7 +17,7 @@ use alloy_primitives::{Address, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{SolCall, SolValue, sol};
+use alloy_sol_types::{SolCall, sol};
 
 use simulation::{RouteElement, encode_swap_calldata};
 
@@ -1104,28 +1104,8 @@ pub mod trade {
             let token = row.token_lo;
             let is_hybrid = row.legs.iter().any(|l| l.starts_with("v3:"));
             let legs_data = if is_hybrid {
-                // Hybrid V3+V4 via router flash: build 0x4d819a2a calldata and fund via PM.take
-                let elements = build_elements(submitter.provider_ref(), row, overrides).await?;
-                let min_out = {
-                    if slippage_bps >= 10_000 {
-                        return Err("slippage-bps must be below 10000".to_owned());
-                    }
-                    row.output
-                        .saturating_mul(U256::from(10_000_u64 - slippage_bps))
-                        / U256::from(10_000_u64)
-                };
-                let deadline = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| e.to_string())?
-                    .as_secs()
-                    + deadline_secs;
-                simulation::encode_swap_calldata(
-                    &elements,
-                    row.input,
-                    min_out,
-                    U256::from(deadline),
-                )
-                .map_err(|e| e.to_string())?
+                // Hybrid V3+V4 via direct leg loop in ExecutorV3: build HybridLeg[] ABI
+                crate::submit::build_hybrid_legs_data(row, overrides)?
             } else {
                 crate::submit::build_flash_legs_data(row, overrides)?
             };
