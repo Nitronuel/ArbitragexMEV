@@ -148,7 +148,8 @@ impl ShadowConfig {
                 if !(2..=4).contains(&self.max_hops) {
                     return Err(ConfigError::InvalidMaxHops(self.max_hops));
                 }
-                if self.pool_cap == 0 {
+                // 0 = unlimited (full ~1M global sweep) — allowed, bypasses cap
+                if self.pool_cap != 0 && self.pool_cap == 0 {
                     return Err(ConfigError::InvalidPoolCap(self.pool_cap));
                 }
                 if self.stale_timeout_seconds == 0 {

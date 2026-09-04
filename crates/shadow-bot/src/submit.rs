@@ -32,28 +32,18 @@ sol! {
         function executeFlash(address token, uint256 amount, bytes legsData, uint256 minProfit) external payable;
         function executeHybrid(address token, uint256 amount, bytes legsData, uint256 minProfit) external payable;
     }
-    struct FlashPoolKey {
-        address currency0;
-        address currency1;
+    /// Compact route leg for the router-based ExecutorV3 (mirrors
+    /// contracts/ExecutorV3.sol RouteLeg field-for-field).
+    struct RouteLegSol {
+        uint8 venue;
+        address v3Pool;
+        address inTok;
+        address outTok;
+        bool zeroForOne;
+        uint160 sqrtPriceLimitX96;
         uint24 fee;
         int24 tickSpacing;
         address hooks;
-    }
-    struct FlashSwapParams {
-        bool zeroForOne;
-        int256 amountSpecified;
-        uint160 sqrtPriceLimitX96;
-    }
-    struct FlashLegSol {
-        FlashPoolKey key;
-        FlashSwapParams params;
-        bytes hookData;
-    }
-    struct HybridLegSol {
-        uint8 venue;
-        address v3Pool;
-        FlashPoolKey key;
-        FlashSwapParams params;
         bytes hookData;
     }
 }
@@ -565,8 +555,26 @@ pub fn route_elements(req: &RouteRequest) -> Vec<RouteElement> {
         .collect()
 }
 
+/// Map the wrapped-native alias back to the V4 null sentinel for `PoolKey`
+/// construction. RHC V4 keys use `0x0` for the native currency while CSV legs
+/// carry the wrapped contract (`gaps::RHC_NATIVE`); building a key with the
+/// wrapped address derives a poolId that was never initialized
+/// (`PoolNotInitialized`, `0x486aa307`). V2/V3 pools use the real contract
+/// address on-chain, so this applies to V4 legs only.
+fn denormalize_currency(token: Address) -> Address {
+    if token == crate::gaps::RHC_NATIVE {
+        Address::ZERO
+    } else {
+        token
+    }
+}
+
 /// Build `FlashLeg[]` abi-encoded bytes for `ExecutorV3.executeFlash` from a
 /// `GatedRow`. Only V4 legs are supported in flash mode (V3 needs a separate callback).
+///
+/// Build `RouteLeg[]` abi-encoded bytes for `ExecutorV3.executeFlash` from a
+/// `GatedRow`. Only V4 legs are supported in flash mode; they execute through
+/// the RHC router (never direct PM.swap).
 ///
 /// # Errors
 /// Fails if any leg is not V4 or lacks tick/hooks overrides.
@@ -575,7 +583,7 @@ pub fn build_flash_legs_data(
     overrides: &std::collections::HashMap<String, (i32, Address)>,
 ) -> Result<Vec<u8>, String> {
     use alloy_sol_types::SolValue;
-    let mut legs: Vec<FlashLegSol> = Vec::with_capacity(row.legs.len());
+    let mut legs: Vec<RouteLegSol> = Vec::with_capacity(row.legs.len());
     for leg in &row.legs {
         let (profile, _pool, pool_id, tin, tout, fee_raw) = trade::parse_leg(leg)?;
         if profile != "v4" {
@@ -585,57 +593,51 @@ pub fn build_flash_legs_data(
         let Some((tick, hooks)) = overrides.get(&key) else {
             return Err(format!("V4 pool {key} missing tick/hooks override"));
         };
-        // V4 PoolKey currencies are sorted
-        let (c0, c1) = if tin < tout { (tin, tout) } else { (tout, tin) };
-        let zero_for_one = tin == c0;
-        legs.push(FlashLegSol {
-            key: FlashPoolKey {
-                currency0: c0,
-                currency1: c1,
-                fee: alloy_primitives::Uint::<24, 1>::from(fee_raw),
-                tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
-                hooks: *hooks,
-            },
-            params: FlashSwapParams {
-                zeroForOne: zero_for_one,
-                amountSpecified: alloy_primitives::I256::ZERO, // set in contract to curAmount
-                sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
-            },
+        // Router convention: directional in/out with the 0x0 native sentinel.
+        let tin = denormalize_currency(tin);
+        let tout = denormalize_currency(tout);
+        legs.push(RouteLegSol {
+            venue: 1,
+            v3Pool: Address::ZERO,
+            inTok: tin,
+            outTok: tout,
+            zeroForOne: false,
+            sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
+            fee: alloy_primitives::Uint::<24, 1>::from(fee_raw),
+            tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
+            hooks: *hooks,
             hookData: alloy_primitives::Bytes::new(),
         });
     }
     Ok(legs.abi_encode())
 }
 
-/// Build `HybridLeg[]` for `ExecutorV3.executeHybrid` — supports V3+V4 mixes.
-/// V3 legs use the pool address and sorted currencies; V4 legs use overrides.
+/// Build `RouteLeg[]` for `ExecutorV3.executeHybrid` — supports V3+V4 mixes.
+/// V3 legs execute direct pool.swap (exact input, positive amount); V4 legs
+/// execute through the RHC router with directional in/out tokens.
 pub fn build_hybrid_legs_data(
     row: &trade::GatedRow,
     overrides: &std::collections::HashMap<String, (i32, Address)>,
 ) -> Result<Vec<u8>, String> {
     use alloy_sol_types::SolValue;
-    let mut legs: Vec<HybridLegSol> = Vec::with_capacity(row.legs.len());
+    let mut legs: Vec<RouteLegSol> = Vec::with_capacity(row.legs.len());
     for leg in &row.legs {
         let (profile, pool, pool_id, tin, tout, fee_raw) = trade::parse_leg(leg)?;
-        let (c0, c1) = if tin < tout { (tin, tout) } else { (tout, tin) };
-        let zero_for_one = tin == c0;
         match profile.as_str() {
             "v3" => {
-                legs.push(HybridLegSol {
+                // V3 pools use real token addresses (no sentinel); direction
+                // from canonical token order.
+                let zero_for_one = tin < tout;
+                legs.push(RouteLegSol {
                     venue: 0,
                     v3Pool: pool,
-                    key: FlashPoolKey {
-                        currency0: c0,
-                        currency1: c1,
-                        fee: alloy_primitives::Uint::<24, 1>::from(fee_raw),
-                        tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(0).unwrap(),
-                        hooks: Address::ZERO,
-                    },
-                    params: FlashSwapParams {
-                        zeroForOne: zero_for_one,
-                        amountSpecified: alloy_primitives::I256::ZERO,
-                        sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
-                    },
+                    inTok: tin,
+                    outTok: tout,
+                    zeroForOne: zero_for_one,
+                    sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
+                    fee: alloy_primitives::Uint::<24, 1>::from(fee_raw),
+                    tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(0).unwrap(),
+                    hooks: Address::ZERO,
                     hookData: alloy_primitives::Bytes::new(),
                 });
             }
@@ -644,21 +646,19 @@ pub fn build_hybrid_legs_data(
                 let Some((tick, hooks)) = overrides.get(&key) else {
                     return Err(format!("V4 pool {key} missing tick/hooks override"));
                 };
-                legs.push(HybridLegSol {
+                // Router convention: directional in/out, 0x0 native sentinel.
+                let tin = denormalize_currency(tin);
+                let tout = denormalize_currency(tout);
+                legs.push(RouteLegSol {
                     venue: 1,
                     v3Pool: Address::ZERO,
-                    key: FlashPoolKey {
-                        currency0: c0,
-                        currency1: c1,
-                        fee: alloy_primitives::Uint::<24, 1>::from(fee_raw),
-                        tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
-                        hooks: *hooks,
-                    },
-                    params: FlashSwapParams {
-                        zeroForOne: zero_for_one,
-                        amountSpecified: alloy_primitives::I256::ZERO,
-                        sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
-                    },
+                    inTok: tin,
+                    outTok: tout,
+                    zeroForOne: false,
+                    sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
+                    fee: alloy_primitives::Uint::<24, 1>::from(fee_raw),
+                    tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
+                    hooks: *hooks,
                     hookData: alloy_primitives::Bytes::new(),
                 });
             }
@@ -1028,7 +1028,12 @@ pub mod trade {
             let hooks: Address = padded
                 .parse()
                 .map_err(|e| format!("bad hooks {}: {e}", cols[2]))?;
-            map.insert(cols[0].to_lowercase(), (tick, hooks));
+            let key = cols[0]
+                .trim()
+                .trim_start_matches("0x")
+                .trim_start_matches("0X")
+                .to_lowercase();
+            map.insert(key, (tick, hooks));
         }
         Ok(map)
     }
@@ -1060,6 +1065,9 @@ pub mod trade {
                             "refusing: V4 pool {key} has no tick/hooks override — run scripts/enrich_v4.py first"
                         ));
                     };
+                    // V4 keys use the null sentinel for native (see denormalize_currency)
+                    let tin = super::denormalize_currency(tin);
+                    let tout = super::denormalize_currency(tout);
                     out.push(RouteElement::v4(tin, tout, fee_raw, *tick, *hooks));
                 }
                 other => return Err(format!("unknown venue profile {other:?}")),
@@ -1101,7 +1109,9 @@ pub mod trade {
         flash: bool,
     ) -> Result<TradeOutcome, String> {
         if flash {
-            let token = row.token_lo;
+            // Settlement + continuity guards use the router convention:
+            // native is the 0x0 sentinel, never the wrapped alias.
+            let token = super::denormalize_currency(row.token_lo);
             let is_hybrid = row.legs.iter().any(|l| l.starts_with("v3:"));
             let legs_data = if is_hybrid {
                 // Hybrid V3+V4 via direct leg loop in ExecutorV3: build HybridLeg[] ABI
@@ -1120,6 +1130,9 @@ pub mod trade {
                 "preflight (flash): gas price {:.4} gwei under cap",
                 gas_price_wei as f64 / 1e9
             );
+            // Funded model: the executor spends its seeded float (no PM
+            // flash). Refuse when the float cannot cover the input.
+            submitter.check_executor_funded(token, row.input).await?;
             // Estimate with quoted minProfit to learn gas, then enforce floor
             let mut est = if is_hybrid {
                 submitter
@@ -1131,8 +1144,9 @@ pub mod trade {
                     .await?
             };
             eprintln!("preflight (flash): estimate {est} gas");
-            // Gas floor
-            let token_usd = prices.get(&token).copied();
+            // Gas floor (price table is keyed by matching-convention
+            // addresses — look up the raw anchor, not the denormalized one).
+            let token_usd = prices.get(&row.token_lo).copied();
             if let Some(usd) = token_usd.filter(|u| !u.is_zero()) {
                 let native_usd_wei =
                     U256::from(native_usd) * U256::from(1_000_000_000_000_000_000_u64);
@@ -1282,5 +1296,73 @@ pub mod trade {
                 result.tx_hash, result.status, result.gas_used
             ),
         })
+    }
+}
+
+#[cfg(test)]
+mod override_key_tests {
+    use super::trade::load_overrides;
+
+    #[test]
+    fn load_overrides_normalizes_prefix_and_case() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_v4_overrides_norm.csv");
+        std::fs::write(
+            &path,
+            "pool_id,tick_spacing,hooks\n\
+             0xABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890,60,0x0000000000000000000000000000000000000000\n\
+             0X1111111111111111111111111111111111111111111111111111111111111111,10,0x0\n",
+        )
+        .unwrap();
+        let map = load_overrides(&path).unwrap();
+        // Keys normalize to bare-lowercase so hex::encode lookups
+        // (which carry no 0x prefix) must hit.
+        assert!(map.contains_key("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"));
+        assert!(map.contains_key("1111111111111111111111111111111111111111111111111111111111111111"));
+        assert!(!map.contains_key("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Router-leg encoding: builders emit directional in/out with the 0x0
+    /// native sentinel (never sorted, never wrapped) plus override tick/hooks.
+    #[test]
+    fn route_legs_encode_router_convention() {
+        use super::{build_flash_legs_data, trade::GatedRow};
+        use alloy_primitives::{Address, Signed, Uint, U256};
+        use alloy_sol_types::SolValue;
+
+        let wrapped: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73".parse().unwrap();
+        let token: Address = "0x020bfc650a365f8BB26819deAAbF3E21291018b4".parse().unwrap();
+        let hooks: Address = "0x37e194B1982f84e565387d28f4a7402b76b53acc".parse().unwrap();
+        let pid = "084cee4d5edcd028175abb3a04bce5ce95b1ec2b432e6365a924c98deb78d886";
+        let pm = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
+        let row = GatedRow {
+            kind: "pair".to_owned(),
+            token_lo: wrapped,
+            input: U256::from(1_000_000_u64),
+            output: U256::from(1_001_000_u64),
+            profit: U256::from(1_000_u64),
+            legs: vec![
+                format!("v4:{pm}:{pid}:{wrapped}:{token}:250"),
+                format!("v4:{pm}:{pid}:{token}:{wrapped}:250"),
+            ],
+        };
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(pid.to_owned(), (60_i32, hooks));
+        let bytes = build_flash_legs_data(&row, &overrides).unwrap();
+        let legs =
+            <Vec<super::RouteLegSol>>::abi_decode(&bytes).expect("round-trip RouteLeg[]");
+        assert_eq!(legs.len(), 2);
+        // Directional, denormalized: the wrapped alias never appears on the wire.
+        assert_eq!(legs[0].venue, 1);
+        assert_eq!(legs[0].inTok, Address::ZERO);
+        assert_eq!(legs[0].outTok, token);
+        assert_eq!(legs[1].inTok, token);
+        assert_eq!(legs[1].outTok, Address::ZERO);
+        for leg in &legs {
+            assert_eq!(leg.fee, Uint::<24, 1>::from(250));
+            assert_eq!(leg.tickSpacing, Signed::<24, 1>::try_from(60).unwrap());
+            assert_eq!(leg.hooks, hooks);
+        }
     }
 }

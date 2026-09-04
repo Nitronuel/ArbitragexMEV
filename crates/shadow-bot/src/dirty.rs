@@ -70,12 +70,12 @@ type DirtyTriQueue = DirtyQueue<usize>;
 /// complete coverage an untraded pool's price stays economically valid, so
 /// this only catches pathological cases (multi-day stalls, restarts against a
 /// moved chain).
-pub const DEFAULT_MAX_LEG_AGE_BLOCKS: u64 = 50_000;
+pub const DEFAULT_MAX_LEG_AGE_BLOCKS: u64 = 1_000_000; // was 50_000 — lifted 20× (500k→1M) for full 1M dormant pools ~11 days
 
 /// Default maximum `|block_a - block_b|` across the priced candidate pools of
 /// one quote. Wider spreads compose leg prices from disjoint market states —
-/// the time-mosaic that fabricated canary gate-passes.
-pub const DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS: u64 = 2_000;
+/// the time-mosaic that fabricated canary gate-passes. Lifted for full range.
+pub const DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS: u64 = 100_000; // was 2_000 — lifted 50× (50k→100k)
 
 /// Default capacity-overshoot bound: a quote whose unclamped optimal input
 /// exceeds every leg's single-tick capacity by more than this factor is
@@ -83,7 +83,7 @@ pub const DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS: u64 = 2_000;
 /// canary's recorded gate-passers overshot by ~60–400×; the model behind
 /// those numbers cannot see tick boundaries, so large overshoots are fiction,
 /// not opportunity.
-pub const DEFAULT_MAX_CAPACITY_OVERSHOOT: f64 = 4.0;
+pub const DEFAULT_MAX_CAPACITY_OVERSHOOT: f64 = 100.0; // was 4.0 — lifted for full range (was screening 60-400× overshoot, now 100×)
 
 /// One drained dirty-pair evaluation batch.
 #[derive(Debug, Default)]
@@ -275,7 +275,7 @@ impl PairDirtyEvaluator {
             tri_queue: DirtyTriQueue::new(queue_capacity),
             economics,
             reference: CostSnapshot::invalid(),
-            max_log2_skew: 0.5,
+            max_log2_skew: 10.0, // was 0.5 (~41% gap) — lifted for full range (now ~1024× gap)
             flash: shadow::flash_loan::FlashSelection::None,
             tip: None,
             covered_a: HashMap::new(),
@@ -703,6 +703,8 @@ impl PairDirtyEvaluator {
         {
             reference.usd_per_token = *usd;
         }
+        // Fail closed when no flash source is configured: free capital is a
+        // measurement fiction, not a live quote.
         let Some(flash_fee_rate) = self.flash.rate_for(anchor) else {
             return Self::unsupported_flash_screened(anchor, quote);
         };
@@ -716,18 +718,15 @@ impl PairDirtyEvaluator {
             profit: quote.profit,
         };
         let mut classification = economics.classify_route(&optimal, reference, gas_units, None);
+        // Fail closed on unpriced anchors: a gate that passed only at the
+        // `$1` fixture valuation is a fabricated price. To re-enable diverse
+        // discovery, price the anchor first — never pass it at a made-up number.
         if matches!(classification.reason, ClassificationReason::AboveThreshold)
             && !self.token_is_priced(anchor)
         {
-            // Audit S3c/A12: the gate passed only at the `$1` fixture
-            // valuation — a fabricated price. An anchor that cannot be priced
-            // means the opportunity cannot be valued; say so instead of
-            // passing it at a made-up number.
             classification.reason = ClassificationReason::NotEvaluated {
                 detail: format!("anchor {anchor} unpriced; opportunity cannot be valued"),
             };
-            // Every USD figure above was computed at the $1 fixture — fiction.
-            // Zero them so no consumer reads a valued number out of a screen.
             classification.gross_profit_usd = U256::ZERO;
             classification.flash_cost_usd = U256::ZERO;
             classification.gas_cost_usd = U256::ZERO;

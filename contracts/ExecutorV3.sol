@@ -1,58 +1,51 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/// ExecutorV3 — PM flash for V4-native and hybrid V3+V4 cycles on RHC (4663).
+/// ExecutorV3 — float-funded V3-direct + V4-via-router cycles on RHC (4663).
 ///
-/// Flash: PM.unlock → direct PM.swap per V4 leg / pool.swap per V3 leg → settle/take profit.
-/// No upfront take: V4 swaps are natively flash — settle() nets deltas.
-/// Hybrid V3+V4 uses one PM lock; V3 swaps pay via callback from PM.take() funding.
-/// No router. Security: owner-only, reentrancy-gated, selector-bound settlement,
-/// minProfit enforced, no persistent approvals.
+/// No PM flash: RHC's PoolManager reverts nested unlocks (AlreadyUnlocked),
+/// and the router opens its own PM session per call, so flash-around-router
+/// is impossible and Balancer is undeployed. Instead the owner seeds a small
+/// float (native + anchor stables); every leg spends holdings physically:
+/// - V3 legs: direct pool.swap with callback paid from holdings (proven).
+/// - V4 legs: single-element call into the RHC router (0x4d819a2a), the only
+///   V4 execution path with live volume. Direct PM.swap is NOT used.
+/// Output is measured by balance delta per leg; minProfit is enforced on the
+/// final amount; dust leftovers are swept via rescue().
+/// Security: owner-only, reentrancy-gated, route-shape guards fail fast,
+/// no persistent approvals, no PM debt (CurrencyNotSettled impossible).
 
-/// V4 PoolManager key
-struct PoolKey {
-    address currency0;
-    address currency1;
+/// RHC router (proxy) for V4 legs. The V4 PoolManager singleton exists at
+/// 0x8366a39CC670B4001A1121B8F6A443A643e40951 but direct PM.swap is not
+/// used (see header).
+
+/// Compact route leg. V3 legs execute direct pool.swap; V4 legs execute one
+/// router element. Rust builders (submit.rs) encode this exact layout.
+struct RouteLeg {
+    uint8 venue; // 0 = V3 direct, 1 = V4 via router
+    address v3Pool; // V3 only
+    address inTok; // swap input, 0x0 = native
+    address outTok; // swap output, 0x0 = native
+    bool zeroForOne; // V3 only
+    uint160 sqrtPriceLimitX96; // V3 only, 0 = min/max default
+    uint24 fee; // V3: pool fee; V4: router fee field
+    int24 tickSpacing; // V4: router field
+    address hooks; // V4 only
+    bytes hookData; // V4 only
+}
+
+/// Single router element (matches 0x4d819a2a layout, round-trip verified).
+struct RouterEl {
+    uint8 venue;
+    address c0;
+    address c1;
+    address pool;
     uint24 fee;
     int24 tickSpacing;
     address hooks;
-}
-
-/// Swap parameters for PM.swap
-struct SwapParams {
-    bool zeroForOne;
-    int256 amountSpecified;
-    uint160 sqrtPriceLimitX96;
-}
-
-/// Flash leg for V4-only paths
-struct FlashLeg {
-    PoolKey key;
-    SwapParams params;
     bytes hookData;
-}
-
-/// Hybrid leg supporting V3 (venue=0) and V4 (venue=1)
-struct HybridLeg {
-    uint8 venue; // 0 = V3, 1 = V4
-    address v3Pool;
-    PoolKey key;
-    SwapParams params;
-    bytes hookData;
-}
-
-/// Balance delta from PM.swap
-struct BalanceDelta {
-    int256 amount0;
-    int256 amount1;
-}
-
-interface IPM {
-    function unlock(bytes calldata data) external returns (bytes memory);
-    function swap(PoolKey memory key, SwapParams memory params, bytes calldata hookData) external returns (BalanceDelta memory);
-    function take(address currency, address to, uint256 amount) external;
-    function settle() external payable returns (uint256);
-    function sync(address currency) external;
+    address pm;
+    bytes32 poolKey;
 }
 
 interface IUniswapV3Pool {
@@ -65,9 +58,20 @@ interface IERC20 {
     function approve(address, uint256) external returns (bool);
 }
 
+interface IWETH {
+    function deposit() external payable;
+    function withdraw(uint256) external;
+}
+
 contract ExecutorV3 {
     address public immutable owner;
     address public constant PM = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
+    /// RHC router (proxy) for V4 legs.
+    address public constant ROUTER = 0x65050A9b7E5075A2bA5cED7b1b64EE66262c40Dc;
+    /// Router entry selector.
+    bytes4 constant ROUTER_SWAP_SEL = bytes4(0x4d819a2a);
+    /// Wrapped native alias accepted wherever the null sentinel is (comparison only).
+    address constant RHC_WNATIVE = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
 
     // V4 sqrt price limits
     uint160 constant MIN_SQRT_PRICE = 4295128739 + 1;
@@ -78,9 +82,14 @@ contract ExecutorV3 {
     error NotPM();
     error Reentrancy();
     error RouteTooShort();
+    error RouteTooLong();
+    error RouteEmpty();
+    error BadVenue();
+    error NotCyclic();
+    error RouterFailed();
     error ProfitTooLow();
     error NoProfit();
-    error ArbitraryTargetBlocked();
+    error ShortBalance();
     error InvalidCallback();
 
     event ExecutedFlash(uint256 amountIn, uint256 profit, uint256 gasUsed);
@@ -91,8 +100,10 @@ contract ExecutorV3 {
 
     constructor() { owner = msg.sender; }
 
-    /// Flash entry. `legsData` = abi.encode(FlashLeg[]). `token` must be
-    /// address(0) (native) for the initial flash path.
+    /// Funded entry, V4 legs only. `legsData` = abi.encode(RouteLeg[]) with
+    /// every leg venue == 1 (V4 via router). `amount` of `token` is spent
+    /// from the owner-seeded float; it must be present (ShortBalance
+    /// otherwise — fail fast before any swap).
     function executeFlash(
         address token,
         uint256 amount,
@@ -100,10 +111,12 @@ contract ExecutorV3 {
         uint256 minProfit
     ) external onlyOwner nonReentrant {
         if (legsData.length < 32) revert RouteTooShort();
-        IPM(PM).unlock(abi.encode(token, amount, legsData, minProfit, msg.sender, false));
+        if (legsData.length > 8192) revert RouteTooLong();
+        _execute(token, amount, legsData, minProfit, false);
     }
 
-    /// Hybrid flash: V3+V4 legs. `legsData` = abi.encode(HybridLeg[]).
+    /// Funded entry, V3-direct + V4-via-router legs. `legsData` =
+    /// abi.encode(RouteLeg[]).
     function executeHybrid(
         address token,
         uint256 amount,
@@ -111,137 +124,227 @@ contract ExecutorV3 {
         uint256 minProfit
     ) external onlyOwner nonReentrant {
         if (legsData.length < 32) revert RouteTooShort();
-        IPM(PM).unlock(abi.encode(token, amount, legsData, minProfit, msg.sender, true));
+        if (legsData.length > 8192) revert RouteTooLong();
+        _execute(token, amount, legsData, minProfit, true);
     }
 
-    function unlockCallback(bytes calldata data) external returns (bytes memory) {
-        if (msg.sender != PM) revert NotPM();
-        if (locked != 2) revert Reentrancy();
-        (address token, uint256 amount, bytes memory legsData, uint256 minProfit, address owner_, bool isHybrid) =
-            abi.decode(data, (address, uint256, bytes, uint256, address, bool));
-        if (owner_ != owner) revert InvalidCallback();
+    /// Shared funded-route execution. No PM session is opened anywhere in
+    /// this contract (the router manages its own); every leg spends contract
+    /// holdings physically, chained output-to-input.
+    function _execute(
+        address token,
+        uint256 amount,
+        bytes calldata legsData,
+        uint256 minProfit,
+        bool isHybrid
+    ) internal {
         uint256 startGas = gasleft();
-        // Clear transient V3 state (whitelist + amount) — prevents cross-call stale authorization
-        delete s_v3Pools;
+        // Reset transient state.
         s_curAmount = 0;
+        s_activeV3Pool = address(0);
+        s_calledBack = false;
+        s_expectedOwed = 0;
+        s_expectedInTok = address(0);
 
+        // Route shape is validated BEFORE any swap so malformed routes fail
+        // fast instead of burning gas leg by leg. Token identity is
+        // native-alias tolerant (0x0 vs wrapped) via _sameToken.
+        RouteLeg[] memory legs = abi.decode(legsData, (RouteLeg[]));
+        if (legs.length == 0) revert RouteEmpty();
+        if (legs[0].venue > 1) revert BadVenue();
+        if (!_sameToken(legs[0].inTok, token)) revert NotCyclic();
+        if (!isHybrid) {
+            for (uint256 i = 0; i < legs.length; i++) {
+                if (legs[i].venue != 1) revert BadVenue();
+            }
+        }
+        for (uint256 i = 1; i < legs.length; i++) {
+            if (legs[i].venue > 1) revert BadVenue();
+            if (!_sameToken(legs[i].inTok, legs[i - 1].outTok)) revert NotCyclic();
+        }
+        if (!_sameToken(legs[legs.length - 1].outTok, token)) revert NotCyclic();
+        // V3 pools settle in real token contracts (never the 0x0 sentinel).
+        for (uint256 i = 0; i < legs.length; i++) {
+            if (legs[i].venue == 0 && (legs[i].inTok == address(0) || legs[i].outTok == address(0))) {
+                revert BadVenue();
+            }
+        }
+        // First-leg funding comes from the float, converting across the
+        // native alias when the other side covers it — fail fast when short.
+        _fundLeg(legs[0].inTok, amount);
+        if (_balanceOf(legs[0].inTok) < amount) revert ShortBalance();
+
+        // Funded accounting model: every leg spends contract holdings
+        // physically, chained output-to-input. No PM session exists, so
+        // there is no debt to track — the float check above is the only
+        // funding gate.
         uint256 curAmount = amount;
-        if (isHybrid) {
-            HybridLeg[] memory legs = abi.decode(legsData, (HybridLeg[]));
-            for (uint256 i = 0; i < legs.length; i++) {
-                HybridLeg memory leg = legs[i];
-                if (leg.venue == 1) {
-                    // V4 leg: direct PM.swap
-                    leg.params.amountSpecified = int256(curAmount);
-                    if (leg.params.sqrtPriceLimitX96 == 0) {
-                        leg.params.sqrtPriceLimitX96 =
-                            leg.params.zeroForOne ? MIN_SQRT_PRICE : MAX_SQRT_PRICE;
-                    }
-                    BalanceDelta memory delta = IPM(PM).swap(leg.key, leg.params, leg.hookData);
-                    int256 d0 = delta.amount0;
-                    int256 d1 = delta.amount1;
-                    if (leg.params.zeroForOne) {
-                        curAmount = d1 > 0 ? uint256(d1) : 0;
-                    } else {
-                        curAmount = d0 > 0 ? uint256(d0) : 0;
-                    }
-                } else {
-                    // V3 leg: pool.swap with callback; PM takes input from our balance
-                    if (curAmount == 0) revert NoProfit();
-                    IPM(PM).take(token, address(this), curAmount);
-                    s_v3Pools.push(leg.v3Pool);
-                    IUniswapV3Pool(leg.v3Pool).swap(
-                        address(this),
-                        leg.params.zeroForOne,
-                        int256(curAmount),
-                        leg.params.sqrtPriceLimitX96 == 0
-                            ? (leg.params.zeroForOne ? MIN_SQRT_PRICE : MAX_SQRT_PRICE)
-                            : leg.params.sqrtPriceLimitX96,
-                        abi.encode(leg.key.currency0, leg.key.currency1, leg.key.fee)
-                    );
-                    curAmount = s_curAmount;
-                }
-                if (curAmount == 0) revert NoProfit();
+
+        for (uint256 i = 0; i < legs.length; i++) {
+            RouteLeg memory leg = legs[i];
+            if (curAmount == 0) revert NoProfit();
+            // Alias-mixed routes convert here (wrap/unwrap) or fail fast.
+            _fundLeg(leg.inTok, curAmount);
+            if (leg.venue == 1) {
+                // V4 leg via the router, spent from holdings.
+                curAmount = _routerSwap(leg, curAmount);
+            } else {
+                // V3 leg: direct pool.swap, exact input (positive amount =
+                // exact-in on V3 — proven by RHC fork replay), paid from
+                // holdings in the callback.
+                if (curAmount > uint256(type(int256).max)) revert NoProfit();
+                s_activeV3Pool = leg.v3Pool;
+                s_calledBack = false;
+                s_expectedOwed = curAmount;
+                s_expectedInTok = leg.inTok;
+                // Callback data carries canonical (sorted) currencies; V3
+                // pools use real token addresses (never the 0x0 sentinel).
+                (address cc0, address cc1) = leg.inTok < leg.outTok
+                    ? (leg.inTok, leg.outTok)
+                    : (leg.outTok, leg.inTok);
+                IUniswapV3Pool(leg.v3Pool).swap(
+                    address(this),
+                    leg.zeroForOne,
+                    int256(curAmount),
+                    leg.sqrtPriceLimitX96 == 0
+                        ? (leg.zeroForOne ? MIN_SQRT_PRICE : MAX_SQRT_PRICE)
+                        : leg.sqrtPriceLimitX96,
+                    abi.encode(cc0, cc1, leg.fee)
+                );
+                s_activeV3Pool = address(0);
+                if (!s_calledBack) revert InvalidCallback();
+                curAmount = s_curAmount;
             }
-        } else {
-            // Pure V4 path
-            FlashLeg[] memory legs = abi.decode(legsData, (FlashLeg[]));
-            for (uint256 i = 0; i < legs.length; i++) {
-                legs[i].params.amountSpecified = int256(curAmount);
-                if (legs[i].params.sqrtPriceLimitX96 == 0) {
-                    legs[i].params.sqrtPriceLimitX96 =
-                        legs[i].params.zeroForOne ? MIN_SQRT_PRICE : MAX_SQRT_PRICE;
-                }
-                BalanceDelta memory delta = IPM(PM).swap(legs[i].key, legs[i].params, legs[i].hookData);
-                int256 d0 = delta.amount0;
-                int256 d1 = delta.amount1;
-                if (legs[i].params.zeroForOne) {
-                    curAmount = d1 > 0 ? uint256(d1) : 0;
-                } else {
-                    curAmount = d0 > 0 ? uint256(d0) : 0;
-                }
-                if (curAmount == 0) revert NoProfit();
-            }
+            if (curAmount == 0) revert NoProfit();
         }
 
         if (curAmount <= amount) revert ProfitTooLow();
         uint256 profit = curAmount - amount;
         if (profit < minProfit) revert ProfitTooLow();
 
-        // Settlement
-        if (isHybrid) {
-            // Hybrid: V3 legs funded by PM.take(), repaid via settle(); profit via PM.take
-            if (token == address(0)) {
-                IPM(PM).settle{value: amount}();
-                IPM(PM).take(token, owner, profit);
-            } else {
-                IERC20(token).transfer(PM, amount);
-                IPM(PM).settle();
-                IPM(PM).take(token, owner, profit);
-            }
+        // Settlement: the float advanced `amount` and now holds
+        // `amount + profit` in the terminal leg's currency (alias-correct;
+        // native and wrapped are 1:1 for profit denomination). Send the
+        // profit to the owner; the float (and any dust) stays for next time.
+        address outTok = legs[legs.length - 1].outTok;
+        if (outTok == address(0)) {
+            if (address(this).balance < amount + profit) revert ShortBalance();
+            (bool ok,) = payable(owner).call{value: profit}("");
+            require(ok, "profit transfer failed");
         } else {
-            // Pure V4: no take, just settle deltas
-            if (token == address(0)) {
-                IPM(PM).settle{value: amount}();
-                IPM(PM).take(token, owner, profit);
-            } else {
-                IERC20(token).transfer(PM, amount);
-                IPM(PM).settle();
-                IPM(PM).take(token, owner, profit);
-            }
+            if (IERC20(outTok).balanceOf(address(this)) < amount + profit) revert ShortBalance();
+            require(IERC20(outTok).transfer(owner, profit), "profit transfer failed");
         }
         emit ExecutedFlash(amount, profit, startGas - gasleft());
         // Clear transient state
-        delete s_v3Pools;
+        s_activeV3Pool = address(0);
+        s_calledBack = false;
+        s_expectedOwed = 0;
+        s_expectedInTok = address(0);
         s_curAmount = 0;
-        return "";
     }
 
-    // Transient storage for V3 callback -> unlockCallback communication (single tx, safe)
-    uint256 private s_curAmount;
-    address[] private s_v3Pools;
+    /// Execute one V4 leg through the RHC router: single-element 0x4d819a2a
+    /// swap with recipient 0x0 (output returns to this contract — any other
+    /// recipient reverts BAD_ARGS), minOut 1, deadline 0 (both proven live).
+    /// ERC20 input is approved exact-then-cleared; native input is forwarded
+    /// as value. Output is measured by balance delta (fee-on-transfer safe).
+    /// Returns the received output amount.
+    function _routerSwap(RouteLeg memory leg, uint256 amountIn) internal returns (uint256) {
+        RouterEl[] memory els = new RouterEl[](1);
+        els[0] = RouterEl({
+            venue: 2,
+            c0: leg.inTok,
+            c1: leg.outTok,
+            pool: address(0),
+            fee: leg.fee,
+            tickSpacing: leg.tickSpacing,
+            hooks: leg.hooks,
+            hookData: leg.hookData,
+            pm: PM,
+            poolKey: bytes32(0)
+        });
+        bytes memory cd = abi.encodeWithSelector(
+            ROUTER_SWAP_SEL, els, address(0), amountIn, uint256(1), uint256(0)
+        );
+        uint256 outBefore = _balanceOf(leg.outTok);
+        bool ok;
+        bytes memory ret;
+        if (leg.inTok == address(0)) {
+            (ok, ret) = ROUTER.call{value: amountIn}(cd);
+        } else {
+            require(IERC20(leg.inTok).approve(ROUTER, amountIn), "router approve failed");
+            (ok, ret) = ROUTER.call(cd);
+            require(IERC20(leg.inTok).approve(ROUTER, 0), "approve clear failed");
+        }
+        if (!ok) {
+            // Bubble the router's reason (BAD_ARGS etc.) for diagnostics.
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+        uint256 outAfter = _balanceOf(leg.outTok);
+        if (outAfter <= outBefore) revert NoProfit();
+        return outAfter - outBefore;
+    }
 
-    /// V3 swap callback: pays the pool from PM.take() funding.
+    function _balanceOf(address tok) internal view returns (uint256) {
+        return tok == address(0) ? address(this).balance : IERC20(tok).balanceOf(address(this));
+    }
+
+    /// Ensure `need` of `inTok` is held, converting across the native alias
+    /// when the other side covers it (standard WETH deposit/withdraw, no
+    /// callbacks). Anything else fails fast — never a partial fund.
+    function _fundLeg(address inTok, uint256 need) internal {
+        if (_balanceOf(inTok) >= need) return;
+        if (inTok == address(0)) {
+            IWETH(RHC_WNATIVE).withdraw(need);
+        } else if (inTok == RHC_WNATIVE) {
+            IWETH(RHC_WNATIVE).deposit{value: need}();
+        } else {
+            revert ShortBalance();
+        }
+        if (_balanceOf(inTok) < need) revert ShortBalance();
+    }
+
+    /// Native-alias-tolerant token identity: 0x0 and the wrapped contract
+    /// denote the same currency across venue conventions.
+    function _sameToken(address a, address b) internal pure returns (bool) {
+        if (a == b) return true;
+        return
+            (a == address(0) && b == RHC_WNATIVE) ||
+            (a == RHC_WNATIVE && b == address(0));
+    }
+
+    // Per-unlock state for the V3 callback (single slot — scoped to the leg
+    // currently swapping, cleared before/after each swap and at unlock end).
+    uint256 private s_curAmount;
+    address private s_activeV3Pool;
+    bool private s_calledBack;
+    // Expected callback payment: exact-input means the pool is owed exactly
+    // the funded input in the input token — enforced in the callback.
+    uint256 private s_expectedOwed;
+    address private s_expectedInTok;
+
+    /// V3 swap callback: pays the pool from contract holdings (float-funded).
     function uniswapV3SwapCallback(
         int256 amount0Delta,
         int256 amount1Delta,
         bytes calldata data
     ) external {
-        if (msg.sender == address(0)) revert InvalidCallback();
-        // Whitelist: callback must come from a V3 pool in our hybrid legs
-        bool authorized = false;
-        for (uint256 i = 0; i < s_v3Pools.length; i++) {
-            if (s_v3Pools[i] == msg.sender) {
-                authorized = true;
-                break;
-            }
-        }
-        if (!authorized) revert InvalidCallback();
+        // One-shot whitelist: only the V3 pool currently being swapped
+        // inside our route may call, exactly once. The slot is consumed
+        // before paying so a re-enterant pool cannot double-collect.
+        if (msg.sender != s_activeV3Pool) revert InvalidCallback();
+        s_activeV3Pool = address(0);
+        s_calledBack = true;
 
         (address c0, address c1, uint24 fee) = abi.decode(data, (address, address, uint24));
         fee; // silence unused
 
-        // Positive delta = pool is owed that amount
+        // Positive delta = pool is owed that amount. Exact-input binds it:
+        // an honest pool demands exactly the funded input in the input
+        // token — anything else is a malicious overcharge, refused here.
         uint256 owed;
         address owedToken;
         if (amount0Delta > 0) {
@@ -253,13 +356,14 @@ contract ExecutorV3 {
         } else {
             revert NoProfit();
         }
+        if (owed != s_expectedOwed || owedToken != s_expectedInTok) revert InvalidCallback();
 
         // Output is the negative delta
         int256 outDelta = amount0Delta < 0 ? amount0Delta : amount1Delta;
         uint256 outAmount = uint256(-outDelta);
         s_curAmount = outAmount;
 
-        // Pay the pool from this contract's balance (funded by PM.take)
+        // Pay the pool from this contract's float balance.
         if (owedToken == address(0)) {
             (bool ok,) = payable(msg.sender).call{value: owed}("");
             require(ok, "V3 native pay failed");

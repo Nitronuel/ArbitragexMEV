@@ -19,7 +19,7 @@ pub const V4_DYNAMIC_FEE_FLAG: u32 = 0x0080_0000;
 /// (honeypots, "rejected" high-fee pools, or catalog noise), never viable round
 /// trips. `leg_toll` yields `None` for them so selection, ranking, and quoting
 /// all exclude the dead tail instead of paying its toll inside `margin`.
-pub const MAX_QUOTABLE_FEE: f64 = 0.5;
+pub const MAX_QUOTABLE_FEE: f64 = 0.9; // was 0.5 (50%) — lifted for full range (was filtering >50% fee honeypots, now 90%)
 
 /// The sqrtPriceX96 convention factor in [`price_out`]: raw wei price × K.
 const SQRT_PRICE_CONVENTION_K: f64 = 79_228_162_514_264_337_593_543_950_336.0;
@@ -2123,7 +2123,16 @@ pub fn enumerate_triangles(a: &[PoolEntry], b: &[PoolEntry]) -> Vec<TokenTriple>
     // BOTH venues, so the cyclic round trip can actually cross venues.
     let mut quotable_both: HashSet<([u8; 20], [u8; 20])> = HashSet::new();
     let mut per_pair: HashMap<([u8; 20], [u8; 20]), u8> = HashMap::new();
-    let usable = |e: &PoolEntry| leg_toll(e.fee, e.fee_denominator, e.profile).is_some();
+    // Full-range: use effective_leg_toll (observed_fee re-admits ~101k V4 dynamic) was leg_toll that censored 101k dynamic + 99% fee >0.9
+    let usable = |e: &PoolEntry| {
+        // For enumeration we consider a pool quotable if its static toll is quotable
+        // OR it is V4 dynamic (fee sentinel) that could be quoted via observed_fee later.
+        // Keep high-fee >0.9 still filtered (honeypot), but admit dynamic.
+        if e.profile == *b"v4" && (e.fee == 0 || e.fee == 8388608) {
+            return true;
+        }
+        leg_toll(e.fee, e.fee_denominator, e.profile).is_some()
+    };
     for e in a.iter().filter(|e| usable(e)) {
         let k = pair_key(e.token0, e.token1);
         *per_pair.entry(k).or_default() |= 1;

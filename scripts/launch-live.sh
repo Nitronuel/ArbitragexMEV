@@ -27,10 +27,14 @@ else
   BROADCAST_FLAG=""
 fi
 NATIVE_USD="${1:-2488}"
+# run-pairs --native-usd is 1e18 fixed-point USD (main.rs docs), while
+# NATIVE_USD stays human-readable whole dollars here.
+NATIVE_USD_FP="${NATIVE_USD}000000000000000000"
 
 OWNER="0x3219E15A8d1e82368340dfB6697fE6a6B41d686D"
-EXECUTOR="0xE1dB326DC4B0853914EA455E7ED49d970d59180d"
+EXECUTOR="0xaAeBdb1001974506bfDB24Bc70D7A9b88f2ad09c" # ExecutorV3 2026-09-04 float-funded router+V3 (was 0xdbcA... stale direct-swap build)
 TRADE_ATTEMPTS="${TRADE_ATTEMPTS:-2}"
+GAS_CAP_GWEI="${GAS_CAP_GWEI:-1.0}"
 RPC="https://rpc.mainnet.chain.robinhood.com"
 CSV="logs/live/trades.csv"
 RUNPAIRS_LOG="logs/live/run-pairs.log"
@@ -48,7 +52,7 @@ fi
 
 mkdir -p logs/live
 touch "$CSV"
-if ! head -c 1 "$CSV" | grep -q "kind"; then
+if ! head -n 1 "$CSV" | grep -q "^kind,"; then
   echo "kind,token_lo,token_hi,to_block,input,output,profit,log2_skew,gross_profit_usd,net_profit_usd,shortfall_usd,threshold_usd,floor_ratio,optimal_unclamped,input_capacity,reason_code,reason_detail,anchor_priced,legs" > "$CSV"
 fi
 
@@ -57,10 +61,11 @@ echo "launch-live: broadcast=${BROADCAST_FLAG:-DRY-RUN} native_usd=$NATIVE_USD e
 run_pairs_loop() {
   while true; do
     ./target/debug/shadow-bot run-pairs \
-      --a data/pools-rhc-v3.csv --b data/pools-rhc-v4.csv \
-      --manifest data/manifest-activity.csv --prices data/prices-seed.csv \
-      --rpc "$RPC" --native-usd "$NATIVE_USD" \
-      --window 4000 --poll-ms 2000 --delay-ms 1500 --max-swaps 0 \
+      --a data/pools-all.csv --b data/pools-all.csv \
+      --manifest data/pools-all.csv --prices data/prices-live.csv \
+      --rpc "$RPC" --native-usd "$NATIVE_USD_FP" \
+      --window 10 --poll-ms 3000 --delay-ms 200 --max-swaps 0 --max-skew 10 --global \
+      --flash-provider auto --flash-support data/flash-support.csv \
       --csv "$CSV" >> "$RUNPAIRS_LOG" 2>&1
     echo "$(date -u +%FT%TZ) run-pairs exited; restarting in 5s" >> "$RUNPAIRS_LOG"
     sleep 5
@@ -71,7 +76,7 @@ trade_loop() {
   while true; do
     ./target/debug/shadow-bot trade \
       --executor "$EXECUTOR" --csv "$CSV" --overrides "$OVERRIDES" \
-      --flash --max-attempts "$TRADE_ATTEMPTS" \
+      --flash --max-attempts "$TRADE_ATTEMPTS" --gas-cap-gwei "$GAS_CAP_GWEI" \
       $BROADCAST_FLAG >> "$TRADE_LOG" 2>&1
     echo "$(date -u +%FT%TZ) trade exited; restarting in 5s" >> "$TRADE_LOG"
     sleep 5

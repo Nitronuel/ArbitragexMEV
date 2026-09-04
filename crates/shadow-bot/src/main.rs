@@ -33,8 +33,8 @@ mod ws_probe;
 
 const QUEUE_CAPACITY: usize = 100_000;
 const CYCLE_LIMITS: CycleLimits = CycleLimits {
-    max_cycles: 1_000_000,
-    max_cycles_per_pool: 10_000,
+    max_cycles: 10_000_000, // was 1_000_000 — lifted for full 1M+ graph (10×)
+    max_cycles_per_pool: 100_000, // was 10_000 — lifted 10×
     max_hops: 4,
 };
 
@@ -311,8 +311,8 @@ enum Command {
         #[arg(long, default_value_t = 0.0)]
         min_margin: f64,
         /// Drop pairs whose |log2 skew| exceeds this cap (catches degenerate
-        /// near-empty pool price gaps that are not captureable).
-        #[arg(long, default_value = "0.5")]
+        /// near-empty pool price gaps that are not captureable). Lifted for full range.
+        #[arg(long, default_value = "10.0")]
         max_skew: f64,
         /// Write each selected pair as one CSV row to this path (overwrites).
         #[arg(long)]
@@ -2332,7 +2332,9 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         flash_fee_rate: U256::ZERO,
         gas_cost_usd: GAS_COST_USD,
         expected_win_rate: EXPECTED_WIN_RATE,
-        native_token_usd: U256::from(FIXED_POINT_SCALE),
+        // Live native price from --native-usd (1e18 fixed-point USD).
+        // A $1 default keeps the placeholder warning below honest.
+        native_token_usd: args.native_usd,
         da_fee_usd: U256::ZERO,
     };
     let reference = CostSnapshot {
@@ -3450,8 +3452,8 @@ fn run(
     // because gas is dust and the win rate is 100%.
     let economics = Economics {
         flash_fee_rate: U256::ZERO,
-        gas_cost_usd: shadow::gate_defaults::MEASUREMENT_GAS_COST_WEI,
-        expected_win_rate: shadow::gate_defaults::MEASUREMENT_EXPECTED_WIN_RATE,
+        gas_cost_usd: GAS_COST_USD,
+        expected_win_rate: EXPECTED_WIN_RATE,
         native_token_usd: U256::from(FIXED_POINT_SCALE),
         da_fee_usd: U256::ZERO,
     };
