@@ -77,6 +77,15 @@ pub const DEFAULT_MAX_LEG_AGE_BLOCKS: u64 = 1_000_000; // was 50_000 — lifted 
 /// the time-mosaic that fabricated canary gate-passes. Lifted for full range.
 pub const DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS: u64 = 100_000; // was 2_000 — lifted 50× (50k→100k)
 
+/// Default swap-activity bound: a priced pool whose last observed Swap is
+/// older than this many blocks behind the tip screens the quote. Swap-sweep
+/// prices carry `block` = the swap's block, so this is a pure activity
+/// signal from already-fetched logs (zero extra RPC, no `eth_call` per
+/// quote). Catches drained-but-initialized pools whose stale cached reserves
+/// quote phantom profit (ghost-pool report 2026-09-06: 357/357 gates).
+/// At ~10 blocks/s on RHC, 600 blocks ≈ 1 minute of market silence.
+pub const DEFAULT_MAX_SWAP_AGE_BLOCKS: u64 = 600;
+
 /// Default capacity-overshoot bound: a quote whose unclamped optimal input
 /// exceeds every leg's single-tick capacity by more than this factor is
 /// screened rather than gated on its clamped remainder (audit S1). The
@@ -169,6 +178,10 @@ pub struct PairDirtyEvaluator {
     /// Maximum `|block_a - block_b|` across the priced candidate pools of one
     /// quote; wider spreads compose prices from disjoint market states.
     max_leg_age_spread_blocks: u64,
+    /// Maximum age of a priced pool's last observed Swap behind the tip.
+    /// Pools refreshed live via slot0 (`block == u64::MAX`, zero-liquidity
+    /// excluded at refresh) are exempt — that path is already live truth.
+    max_swap_age_blocks: u64,
 }
 
 impl PairDirtyEvaluator {
@@ -282,6 +295,7 @@ impl PairDirtyEvaluator {
             covered_b: HashMap::new(),
             max_leg_age_blocks: DEFAULT_MAX_LEG_AGE_BLOCKS,
             max_leg_age_spread_blocks: DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS,
+            max_swap_age_blocks: DEFAULT_MAX_SWAP_AGE_BLOCKS,
             max_capacity_overshoot: DEFAULT_MAX_CAPACITY_OVERSHOOT,
         }
     }
@@ -323,6 +337,13 @@ impl PairDirtyEvaluator {
     ) {
         self.max_leg_age_blocks = max_leg_age_blocks;
         self.max_leg_age_spread_blocks = max_leg_age_spread_blocks;
+    }
+
+    /// Overrides the swap-activity bound (default
+    /// [`DEFAULT_MAX_SWAP_AGE_BLOCKS`]). `0` screens every swap-priced pool;
+    /// live slot0 refreshes stay exempt.
+    pub fn set_max_swap_age_blocks(&mut self, max_swap_age_blocks: u64) {
+        self.max_swap_age_blocks = max_swap_age_blocks;
     }
 
     /// Overrides the single-tick capacity overshoot bound (default
@@ -429,6 +450,19 @@ impl PairDirtyEvaluator {
                         "leg age {age} blocks exceeds max {}",
                         self.max_leg_age_blocks
                     ));
+                }
+                // Swap-activity screen (ghost-pool report 2026-09-06): a
+                // pool with no observed Swap inside the activity window may
+                // be drained — its cached reserves quote phantom profit.
+                // Live slot0 refreshes (block == u64::MAX) are exempt.
+                if price.block != u64::MAX {
+                    let swap_age = tip.saturating_sub(price.block);
+                    if swap_age > self.max_swap_age_blocks {
+                        return Err(format!(
+                            "swap inactivity {swap_age} blocks exceeds max {}",
+                            self.max_swap_age_blocks
+                        ));
+                    }
                 }
                 oldest = Some(oldest.map_or(price.block, |o: u64| o.min(price.block)));
                 newest = Some(newest.map_or(price.block, |n: u64| n.max(price.block)));
@@ -1839,6 +1873,9 @@ mod tests {
         evaluator.set_reference(valid_reference());
         evaluator.set_max_log2_skew(4.0);
         evaluator.set_staleness_bounds(DEFAULT_MAX_LEG_AGE_BLOCKS, spread_max);
+        // This test exercises the spread bound with a 1000-block leg gap;
+        // disable the swap-activity screen so it tests spread, not activity.
+        evaluator.set_max_swap_age_blocks(u64::MAX);
         let tip = 50_000u64;
         evaluator.apply_swap(
             *b"v3",
@@ -1883,6 +1920,88 @@ mod tests {
             "{:?}",
             outcome.stale_screened[0].1
         );
+    }
+
+    #[test]
+    fn swap_inactivity_boundary() {
+        // Ghost-pool screen (report 2026-09-06): a priced pool whose last
+        // observed Swap is older than the activity bound screens even with
+        // full coverage and a fresh-enough leg age; exactly at the bound
+        // passes. Live slot0 refreshes (block == u64::MAX, zero-liquidity
+        // excluded at refresh) stay exempt.
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let swap_max = 600u64;
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        evaluator.set_staleness_bounds(
+            DEFAULT_MAX_LEG_AGE_BLOCKS,
+            u64::MAX, // spread has its own test; this one targets activity
+        );
+        evaluator.set_max_swap_age_blocks(swap_max);
+        let tip = 200_000u64;
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                tip - swap_max,
+            ),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, tip),
+        );
+        evaluator.set_tip(tip);
+        evaluator.mark_swept(*b"v3", &a_pools, tip);
+        evaluator.mark_swept(*b"v4", &b_pools, tip);
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+        assert!(
+            evaluator.quote_pair(pair).is_some(),
+            "swap age == bound must pass"
+        );
+
+        // One block older: screened as swap inactivity despite full coverage.
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                tip - swap_max - 1,
+            ),
+        );
+        let outcome = {
+            evaluator.mark_pool(*b"v3", key_a);
+            evaluator.run_once()
+        };
+        assert_eq!(outcome.stale_screened.len(), 1, "{outcome:?}");
+        assert!(
+            outcome.stale_screened[0].1.contains("swap inactivity"),
+            "{:?}",
+            outcome.stale_screened[0].1
+        );
+
+        // Live slot0 refresh exemption: block u64::MAX passes the screen.
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                u64::MAX,
+            ),
+        );
+        let outcome = {
+            evaluator.mark_pool(*b"v3", key_a);
+            evaluator.run_once()
+        };
+        assert_eq!(outcome.stale_screened.len(), 0, "{outcome:?}");
+        assert!(!outcome.pair_results.is_empty(), "{outcome:?}");
     }
 
     #[test]

@@ -633,6 +633,13 @@ enum Command {
         /// states and are screened instead of gated.
         #[arg(long, default_value_t = dirty::DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS)]
         max_leg_age_spread_blocks: u64,
+        /// Swap-activity bound: a priced pool whose last observed Swap is
+        /// older than this many blocks behind the tip screens the quote.
+        /// Catches drained-but-initialized pools quoting phantom profit off
+        /// stale reserves (ghost-pool report 2026-09-06). Live slot0
+        /// refreshes stay exempt. 0 screens every swap-priced pool.
+        #[arg(long, default_value_t = dirty::DEFAULT_MAX_SWAP_AGE_BLOCKS)]
+        max_swap_age_blocks: u64,
     },
 }
 
@@ -935,6 +942,7 @@ fn main() {
             simulate,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
+            max_swap_age_blocks,
         } => run_pairs_command(&RunPairsArgs {
             a: &a,
             b: &b,
@@ -965,6 +973,7 @@ fn main() {
             simulate,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
+            max_swap_age_blocks,
         }),
     };
     if let Err(error) = outcome {
@@ -2221,6 +2230,8 @@ struct RunPairsArgs<'a> {
     max_leg_age_blocks: u64,
     /// Maximum block spread across one quote's priced candidate pools.
     max_leg_age_spread_blocks: u64,
+    /// Maximum age of a priced pool's last observed Swap behind the tip.
+    max_swap_age_blocks: u64,
     /// Capacity-overshoot factor above which quotes are screened.
     max_capacity_overshoot: f64,
     /// USD per whole native token for gas conversion.
@@ -2370,6 +2381,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     }
     evaluator.set_flash_selection(flash_selection);
     evaluator.set_staleness_bounds(args.max_leg_age_blocks, args.max_leg_age_spread_blocks);
+    evaluator.set_max_swap_age_blocks(args.max_swap_age_blocks);
     evaluator.set_max_capacity_overshoot(args.max_capacity_overshoot);
     if let Some(path) = prices_path {
         let prices = gaps::load_prices(path)?;
