@@ -32,9 +32,12 @@ NATIVE_USD="${1:-2488}"
 NATIVE_USD_FP="${NATIVE_USD}000000000000000000"
 
 OWNER="0x3219E15A8d1e82368340dfB6697fE6a6B41d686D"
-EXECUTOR="0xaAeBdb1001974506bfDB24Bc70D7A9b88f2ad09c" # ExecutorV3 2026-09-04 float-funded router+V3 (was 0xdbcA... stale direct-swap build)
+EXECUTOR="0x727f41B647e9F0958dd539b0dFff4fc46A90A950" # ExecutorUUPS proxy 2026-09-06 (was 0xaAeB... V3 bare)
 TRADE_ATTEMPTS="${TRADE_ATTEMPTS:-2}"
 GAS_CAP_GWEI="${GAS_CAP_GWEI:-1.0}"
+# Capital source: morpho (Morpho Blue flash, no float, any gas-covered wallet
+# can trade) or float (legacy owner-seeded executor balance).
+CAPITAL_SOURCE="${CAPITAL_SOURCE:-morpho}"
 RPC="https://rpc.mainnet.chain.robinhood.com"
 CSV="logs/live/trades.csv"
 RUNPAIRS_LOG="logs/live/run-pairs.log"
@@ -58,9 +61,10 @@ fi
 
 echo "launch-live: broadcast=${BROADCAST_FLAG:-DRY-RUN} native_usd=$NATIVE_USD executor=$EXECUTOR"
 
+RUNPAIRS_BIN="${SHADOW_BIN:-./target/release/shadow-bot}"
 run_pairs_loop() {
   while true; do
-    ./target/debug/shadow-bot run-pairs \
+    "$RUNPAIRS_BIN" run-pairs \
       --a data/pools-all.csv --b data/pools-all.csv \
       --manifest data/pools-all.csv --prices data/prices-live.csv \
       --rpc "$RPC" --native-usd "$NATIVE_USD_FP" \
@@ -74,9 +78,9 @@ run_pairs_loop() {
 
 trade_loop() {
   while true; do
-    ./target/debug/shadow-bot trade \
+    "$RUNPAIRS_BIN" trade \
       --executor "$EXECUTOR" --csv "$CSV" --overrides "$OVERRIDES" \
-      --flash --max-attempts "$TRADE_ATTEMPTS" --gas-cap-gwei "$GAS_CAP_GWEI" \
+      --flash --capital-source "$CAPITAL_SOURCE" --max-attempts "$TRADE_ATTEMPTS" --gas-cap-gwei "$GAS_CAP_GWEI" \
       $BROADCAST_FLAG >> "$TRADE_LOG" 2>&1
     echo "$(date -u +%FT%TZ) trade exited; restarting in 5s" >> "$TRADE_LOG"
     sleep 5

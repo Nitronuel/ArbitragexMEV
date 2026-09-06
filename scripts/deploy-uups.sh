@@ -90,7 +90,13 @@ echo "proxy (PERMANENT): $PROXY_ADDR"
 
 echo "verifying through proxy..."
 cast call "$PROXY_ADDR" "owner()(address)" --rpc-url "$RPC_URL"
-cast call "$PROXY_ADDR" "proxiableUUID()(bytes32)" --rpc-url "$RPC_URL"
+# NOTE: proxiableUUID() carries OZ v5's notDelegated guard — it MUST be called
+# on the implementation directly (calling it through the proxy reverts by
+# design, ERC-1822). The proxy side is checked via its ERC1967 slot instead.
+cast call "$IMPL_ADDR" "proxiableUUID()(bytes32)" --rpc-url "$RPC_URL"
+cast storage "$PROXY_ADDR" \
+  0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc \
+  --rpc-url "$RPC_URL" # expect the implementation address
 
 BLOCK="$(cast block-number --rpc-url "$RPC_URL")"
 mkdir -p deployments

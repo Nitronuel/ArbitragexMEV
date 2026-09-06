@@ -1,0 +1,10 @@
+[
+  {
+    "proxy": "0x727f41B647e9F0958dd539b0dFff4fc46A90A950",
+    "implementation": "0x6067f08f8c852B6f897A40A644e82e76cB99bEcC",
+    "contract": "ExecutorUUPS",
+    "owner": "0x3219E15A8d1e82368340dfB6697fE6a6B41d686D",
+    "date": "2026-09-06",
+    "note": "day-0 UUPS deploy; proxiableUUID verified on impl, ERC1967 slot verified on proxy"
+  }
+]
