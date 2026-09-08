@@ -5,7 +5,7 @@
 #   OWNER WALLET (0x3219E15A...)  — holds the key + ALL funds as gas money.
 #     It is the only account that can call the executor (owner is immutable).
 #     Trade capital comes from Morpho Blue flash loans (free, per-trade), so
-#     the wallet needs only gas: any balance can trade, no float, no cap.
+#     the wallet needs only gas: minimum $5 balance, gas per attempt ≤ $1.5.
 #   EXECUTOR (0x727f41B647e9F0958dd539b0dFff4fc46A90A950, UUPS proxy live
 #     since 2026-09-06) — routes trades, accumulates profit (native or
 #     ERC20 per route's final asset). Retired V3 0xaAeBdb1001974506bfDB24Bc70D7A9b88f2ad09c.
@@ -18,12 +18,17 @@
 # Key handling: ARBITRAGE_WALLET_PRIVATE_KEY from the environment only; if
 # unset, only the anchored assignment line is sourced from ~/.bashrc. The key
 # is never printed, logged, or written to any file.
+# Trading rules (2026-09-08 operator update): wallet min $5, gas/attempt ≤ $1.5,
+# gate floor ~$3 (win_rate 33%, live gas-cost). Broadcast requires gate pass + approval.
 set -euo pipefail
 
 RPC_URL="https://rpc.mainnet.chain.robinhood.com"
 OWNER="0x3219E15A8d1e82368340dfB6697fE6a6B41d686D"
 EXECUTOR="0x727f41B647e9F0958dd539b0dFff4fc46A90A950"
 NATIVE="0x0000000000000000000000000000000000000000"
+# Trading constraints (operator 2026-09-08):
+MIN_WALLET_USD=5              # minimum wallet balance to trade
+MAX_GAS_USD_PER_ATTEMPT=1.5   # max gas cost per attempt (USD)
 # Gas reserve (wei) the wallet will never spend below when sweeping:
 # ~3 rescue/fund ops at ~0.14 gwei * 100k gas each, rounded up.
 GAS_RESERVE_WEI_DEFAULT=30000000000
@@ -37,6 +42,11 @@ wei_to_eth() {
   cast from-wei "$1" 2>/dev/null || echo "0"
 }
 
+usd_to_wei() {
+  # $1 = USD amount (e.g., "5" or "1.5"), $2 = native USD price (wei per ETH, 1e18 scale)
+  python3 -c "print(int(float('$1') * $2 / 1e18))" 2>/dev/null || echo "0"
+}
+
 cmd="${1:-balance}"
 case "$cmd" in
   balance)
@@ -48,14 +58,40 @@ case "$cmd" in
       echo "FATAL: chain id $CHAIN != 4663" >&2
       exit 1
     fi
+    # Fetch native USD price for gas calculations (fallback $2500)
+    NATIVE_USD="$(python3 -c "print(2500 * 10**18)" 2>/dev/null || echo "2500000000000000000000")"
+    GP_GWEI=$(( GP / 1000000000 ))
+    GP_MGWEI=$(( (GP / 1000000) % 1000 ))
     echo "chain:        4663 ok"
-    echo "gas price:    $GP wei ($(( GP / 1000000000 )).$(( (GP / 1000000) % 1000 )) gwei)"
-    echo "owner wallet: $OW wei (~$(wei_to_eth "$OW") ETH)"
-    echo "executor:     $EX wei (~$(wei_to_eth "$EX") ETH)"
-    echo "combined:     $(( OW + EX )) wei (~$(wei_to_eth $(( OW + EX ))) ETH)"
-    # attempts at 400k and 500k gas
+    echo "gas price:    $GP wei ($GP_GWEI.$GP_MGWEI gwei)"
+    OW_ETH=$(wei_to_eth "$OW")
+    EX_ETH=$(wei_to_eth "$EX")
+    COMBINED_ETH=$(wei_to_eth $(( OW + EX )))
+    echo "owner wallet: $OW wei (~$OW_ETH ETH)"
+    echo "executor:     $EX wei (~$EX_ETH ETH)"
+    echo "combined:     $(( OW + EX )) wei (~$COMBINED_ETH ETH)"
+    # Gas cost estimates at 400k and 500k gas
     if [[ "$GP" -gt 0 ]]; then
-      echo "attempts@400k gas: $(( OW / (400000 * GP) ))   @500k: $(( OW / (500000 * GP) ))"
+      GAS_COST_400K=$(( 400000 * GP ))
+      GAS_COST_500K=$(( 500000 * GP ))
+      GAS_USD_400K=$(python3 -c "print(round($GAS_COST_400K * $NATIVE_USD / 1e36, 2))" 2>/dev/null || echo "?")
+      GAS_USD_500K=$(python3 -c "print(round($GAS_COST_500K * $NATIVE_USD / 1e36, 2))" 2>/dev/null || echo "?")
+      echo "gas/400k:     $GAS_COST_400K wei (~\$${GAS_USD_400K})"
+      echo "gas/500k:     $GAS_COST_500K wei (~\$${GAS_USD_500K})"
+      echo "attempts@400k: $(( OW / GAS_COST_400K ))   @500k: $(( OW / GAS_COST_500K ))"
+    fi
+    # Wallet trading readiness check
+    MIN_WEI=$(usd_to_wei "$MIN_WALLET_USD" "$NATIVE_USD")
+    MAX_GAS_WEI=$(usd_to_wei "$MAX_GAS_USD_PER_ATTEMPT" "$NATIVE_USD")
+    if (( OW >= MIN_WEI )); then
+      echo "wallet:       OK (≥\$$MIN_WALLET_USD)"
+    else
+      echo "wallet:       LOW (<\$$MIN_WALLET_USD, need $(python3 -c "print(round(($MIN_WEI - OW) / 1e18, 4))" 2>/dev/null || echo "?") ETH more)"
+    fi
+    if (( GAS_COST_400K <= MAX_GAS_WEI )); then
+      echo "gas/attempt:  OK (≤\$$MAX_GAS_USD_PER_ATTEMPT)"
+    else
+      echo "gas/attempt:  HIGH (>\\\$$MAX_GAS_USD_PER_ATTEMPT, 400k gas = \$${GAS_USD_400K})"
     fi
     ;;
 

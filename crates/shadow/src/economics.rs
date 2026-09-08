@@ -10,18 +10,16 @@ pub mod gate_defaults {
     use alloy_primitives::U256;
 
     /// Conservative gas cost of one cross-venue attempt, USD fixed-point
-    /// (~$0.03, per the project budget rules).
-    pub const STANDARD_GAS_COST_USD: U256 = U256::from_limbs([30_000_000_000_000_000, 0, 0, 0]);
-    /// Expected win rate for the submission-gate floor (15%).
+    /// (~$1.00 at current RHC gas ~0.41 gwei for 3-hop).
+    pub const STANDARD_GAS_COST_USD: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
+    /// Expected win rate for the submission-gate floor (33%).
     ///
-    /// Operator decision 2026-08-22: raised from the original 10% to loosen
-    /// the gate floor from $0.30 ($0.03/0.10) to **$0.20** ($0.03/0.15).
-    /// Trade-off to remember: if the true win rate stays at 10%, each accepted
-    /// submission has expected value ≈ −$0.01 instead of breakeven —
-    /// acceptable for shadow-mode measurement, must be revisited before any
-    /// live submission.
+    /// Operator decision 2026-09-08: set to ~33% so the gate floor
+    /// (gas_cost / win_rate) is ~$3 at current ~$1 gas cost.
+    /// Trade-off: if true win rate is lower, EV is negative — acceptable
+    /// per operator for live measurement; revisit if loss rate exceeds expectation.
     pub const STANDARD_EXPECTED_WIN_RATE: U256 =
-        U256::from_limbs([150_000_000_000_000_000, 0, 0, 0]);
+        U256::from_limbs([333_333_333_333_333_333, 0, 0, 0]);
 
     /// Measurement-mode overrides used by the dormant `run` pipeline
     /// (audit A15): its `interesting=` counts are meant to observe every

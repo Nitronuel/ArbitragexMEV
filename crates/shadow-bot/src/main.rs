@@ -153,7 +153,7 @@ enum Command {
         #[arg(long, default_value = "data/prices-seed.csv")]
         prices: PathBuf,
         /// Expected win rate in percent — divides the gas cost for the floor.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 33)]
         win_rate_pct: u64,
         /// Native token USD price (gas-cost conversion).
         #[arg(long, default_value_t = 2488)]
