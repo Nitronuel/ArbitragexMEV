@@ -555,3 +555,80 @@ fn quote_manifest_rejects_unknown_venue_without_rpc_access() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("unsupported venue"));
 }
+
+#[test]
+fn ws_probe_without_provider_env_reports_chainstack_chain() {
+    // Endpoint resolution precedes any socket: with a cleared env this must
+    // fail fast offline naming the Chainstack-first chain (no secrets).
+    let output = run(
+        &[
+            "ws-probe",
+            "--manifest",
+            manifest_path().to_str().unwrap(),
+            "--duration-secs",
+            "1",
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("CHAINSTACK_RHC_WSS_URL"));
+}
+
+#[test]
+fn run_pairs_rejects_unknown_events_mode_offline() {
+    // `--events` validation precedes catalog load and any RPC contact.
+    let output = run(
+        &[
+            "run-pairs",
+            "--a",
+            manifest_path().to_str().unwrap(),
+            "--b",
+            manifest_path().to_str().unwrap(),
+            "--rpc",
+            "https://example.test/rpc",
+            "--events",
+            "smoke-signal",
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("expected http or ws"));
+}
+
+#[test]
+fn run_pairs_ws_mode_without_provider_env_fails_fast_offline() {
+    let directory = tempfile::tempdir().unwrap();
+    let csv = directory.path().join("pools.csv");
+    fs::write(
+        &csv,
+        "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,profile,pool_id,source\n\
+         4663,0xfa00000000000000000000000000000000000001,0x0000000000000000000000000000000000000000,0x1000000000000000000000000000000000000000,0x2000000000000000000000000000000000000000,3000,1000000,v3,,\n",
+    )
+    .unwrap();
+    // Catalogs load offline; endpoint resolution fails before any socket.
+    let output = run(
+        &[
+            "run-pairs",
+            "--a",
+            csv.to_str().unwrap(),
+            "--b",
+            csv.to_str().unwrap(),
+            "--rpc",
+            "https://example.test/rpc",
+            "--events",
+            "ws",
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("CHAINSTACK_RHC_WSS_URL"));
+}
+
+#[test]
+fn pool_lens_rejects_invalid_token_offline() {
+    // Token parsing precedes any RPC contact: invalid address fails fast
+    // with no network (env cleared).
+    let output = run(&["pool-lens", "--token", "not-an-address"], &[]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("invalid --token"));
+}

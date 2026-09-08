@@ -9,8 +9,11 @@ via_ir = false
 ffi = false
 fs_permissions = [{ access = "read", path = "./"}]
 
-[profile.default.model_checker]
-engine = "chc"
+remappings = [
+    "@openzeppelin-upgradeable/=node_modules/@openzeppelin/contracts-upgradeable/",
+    "@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+    "@openzeppelin/=node_modules/@openzeppelin/contracts/",
+]
 
 [rpc_endpoints]
 rhc = "https://rpc.mainnet.chain.robinhood.com"

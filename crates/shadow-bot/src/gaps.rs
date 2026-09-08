@@ -225,16 +225,14 @@ pub fn load_catalog(
         };
 
         // Parse optional liquidity_usd (column 10, index 10 after source)
-        let liquidity_usd = record
-            .get(10)
-            .and_then(|s| {
-                let s = s.trim();
-                if s.is_empty() {
-                    None
-                } else {
-                    s.parse::<U256>().ok()
-                }
-            });
+        let liquidity_usd = record.get(10).and_then(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                s.parse::<U256>().ok()
+            }
+        });
 
         // Apply liquidity filter
         if let Some(min) = min_liq_usd {
@@ -854,6 +852,60 @@ where
     Ok(outcome)
 }
 
+/// Ingests one decoded Swap-log envelope into latest pool prices, shared by
+/// the HTTP sweeps and the WebSocket event lane. V3 rows key on the
+/// emitting pool address; V4 rows key on the swap `topic1` `PoolId`, kept
+/// only when listed in `keep_ids`. Envelopes that do not decode into a
+/// price (foreign layout, unlisted pool) leave `latest` untouched.
+/// Newer-or-equal blocks overwrite; older blocks never clobber fresher state.
+pub fn ingest_envelope(
+    profile: [u8; 2],
+    latest: &mut HashMap<[u8; 32], PoolPrice>,
+    envelope: &RawLogEnvelope,
+    keep_ids: Option<&HashSet<[u8; 32]>>,
+) {
+    let (key, parsed): (Option<[u8; 32]>, Option<(U256, U256)>) = if profile == *b"v4" {
+        if envelope.topics.len() < 2 {
+            (None, None)
+        } else {
+            let id = envelope.topics[1].0;
+            if keep_ids.is_some_and(|m| m.contains(&id)) {
+                (
+                    Some(id),
+                    decode_v4_swap(envelope).map(|s| (s.sqrt_price_x96, s.liquidity)),
+                )
+            } else {
+                (None, None)
+            }
+        }
+    } else {
+        let key = envelope.address.into_word().into();
+        (
+            Some(key),
+            decode_v3_swap(envelope).map(|s| (s.sqrt_price_x96, s.liquidity)),
+        )
+    };
+    let observed_fee = if profile == *b"v4" {
+        decode_v4_swap(envelope).map(|swap| swap.fee)
+    } else {
+        None
+    };
+    if let (Some(key), Some((sqrt, liquidity))) = (key, parsed) {
+        let entry = latest.entry(key).or_insert(PoolPrice {
+            sqrt,
+            liquidity,
+            block: 0,
+            observed_fee: None,
+        });
+        if envelope.block_number >= entry.block {
+            entry.sqrt = sqrt;
+            entry.liquidity = liquidity;
+            entry.block = envelope.block_number;
+            entry.observed_fee = observed_fee;
+        }
+    }
+}
+
 /// Builds the shared `Swap`-log → latest-`PoolPrice` ingest closure used by
 /// the price sweeps. V3 rows key on the emitting pool address; V4 rows key on
 /// the swap `topic1` `PoolId`, kept only when listed in `keep_ids`.
@@ -866,46 +918,7 @@ fn swap_price_ingest(
             let Ok(envelope) = RawLogEnvelope::from_rpc_value(raw) else {
                 continue;
             };
-            let (key, parsed): (Option<[u8; 32]>, Option<(U256, U256)>) = if profile == *b"v4" {
-                if envelope.topics.len() < 2 {
-                    (None, None)
-                } else {
-                    let id = envelope.topics[1].0;
-                    if keep_ids.is_some_and(|m| m.contains(&id)) {
-                        (
-                            Some(id),
-                            decode_v4_swap(&envelope).map(|s| (s.sqrt_price_x96, s.liquidity)),
-                        )
-                    } else {
-                        (None, None)
-                    }
-                }
-            } else {
-                let key = envelope.address.into_word().into();
-                (
-                    Some(key),
-                    decode_v3_swap(&envelope).map(|s| (s.sqrt_price_x96, s.liquidity)),
-                )
-            };
-            let observed_fee = if profile == *b"v4" {
-                decode_v4_swap(&envelope).map(|swap| swap.fee)
-            } else {
-                None
-            };
-            if let (Some(key), Some((sqrt, liquidity))) = (key, parsed) {
-                let entry = latest.entry(key).or_insert(PoolPrice {
-                    sqrt,
-                    liquidity,
-                    block: 0,
-                    observed_fee: None,
-                });
-                if envelope.block_number >= entry.block {
-                    entry.sqrt = sqrt;
-                    entry.liquidity = liquidity;
-                    entry.block = envelope.block_number;
-                    entry.observed_fee = observed_fee;
-                }
-            }
+            ingest_envelope(profile, latest, &envelope, keep_ids);
         }
     }
 }
@@ -925,6 +938,29 @@ pub fn sweep_chunk_count(profile: [u8; 2], keys: &[PoolEntry]) -> usize {
 /// stalled chunk by at most this many blocks, bounding worst-case latency and
 /// CU burn per poll after a long stall. The next call continues from there.
 pub const DEFAULT_MAX_CATCHUP_BLOCKS: u64 = 20_000;
+
+/// Catch-up cap for the global topic-only sweep (`sweep_global_swaps`):
+/// one poll covers at most this many blocks behind the lagged tip. Without
+/// it, a stalled water mark turns every poll into an unbounded catch-up
+/// burst (hundreds of `eth_getLogs` in seconds), which trips provider
+/// throttling and wedges the loop in a retry storm that never advances —
+/// observed 2026-09-07. The cap also keeps single polls inside Chainstack
+/// free's getLogs recency window (~50-100 blocks measured 2026-09-07;
+/// older ranges fail `-32002` archive-gating). Skipped ranges are
+/// fail-closed downstream: pools whose only recent swap falls in the gap
+/// keep their older observed price and trip the swap-age screen.
+pub const DEFAULT_GLOBAL_CATCHUP_BLOCKS: u64 = 50;
+
+/// True when a sweep failure is archive-gating (`-32002`) rather than
+/// throttling: the requested range predates the free plan's getLogs
+/// recency window (~50-100 blocks on Chainstack, measured 2026-09-07).
+/// Callers skip the stale range forward instead of retry-storming a wall
+/// that can never succeed.
+#[must_use]
+pub fn is_archive_walled(error: &TransportError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("-32002") || message.contains("archive")
+}
 
 /// One [`sweep_swap_prices_ring`] call's result.
 #[derive(Debug, Default)]
@@ -1118,9 +1154,13 @@ where
 ///
 /// Refetches fresh `slot0`/`liquidity` for pools invalidated by a
 /// liquidity-change event (audit task 1.3 completion): instead of pausing
-/// quotes until the pool's next Swap, one eth_call pair restores the cache
-/// immediately. Returns only pools that refreshed successfully; failures
-/// simply stay paused.
+/// quotes until the pool's next Swap, immediate reads restore the cache.
+/// V3 pools use `slot0()`/`liquidity()` on the pool address; V4 pools have
+/// no address, so their price root and liquidity come from the PoolManager
+/// mapping (`pool_v4_state`) — calling the V3 selectors on the manager
+/// reverts and used to leave V4 pools paused forever (fixed 2026-09-07).
+/// Returns only pools that refreshed successfully; failures simply stay
+/// paused.
 ///
 /// Bounded by `max_refetch` so a liquidity-change storm cannot dominate
 /// poll CU spend. `block` is stamped as [`u64::MAX`] — the freshest possible
@@ -1131,6 +1171,7 @@ pub fn refetch_invalidated_prices<B, S>(
     entries: &[PoolEntry],
     keys: &[[u8; 32]],
     max_refetch: usize,
+    pool_manager: Address,
 ) -> HashMap<[u8; 32], PoolPrice>
 where
     B: HttpBackend,
@@ -1141,26 +1182,42 @@ where
         let Some(entry) = entries.iter().find(|e| pool_key(e) == *key) else {
             continue;
         };
-        let (Ok((sqrt, _tick)), Ok(liquidity)) = (
-            reader.pool_slot0(entry.venue),
-            reader.pool_liquidity(entry.venue),
-        ) else {
-            continue;
-        };
-        if sqrt.is_zero() || liquidity.is_zero() {
-            continue;
-        }
-        refreshed.insert(
-            *key,
-            PoolPrice {
+        let refreshed_price = if entry.profile == *b"v4" {
+            match reader.pool_v4_state(pool_manager, entry.id) {
+                Ok((sqrt, liquidity)) if !sqrt.is_zero() && !liquidity.is_zero() => {
+                    Some(PoolPrice {
+                        sqrt,
+                        liquidity,
+                        block: u64::MAX,
+                        // slot0 carries no fee; a dynamic pool refreshed here stays
+                        // excluded from tolling until its next Swap re-observes one.
+                        observed_fee: None,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            let (Ok((sqrt, _tick)), Ok(liquidity)) = (
+                reader.pool_slot0(entry.venue),
+                reader.pool_liquidity(entry.venue),
+            ) else {
+                continue;
+            };
+            if sqrt.is_zero() || liquidity.is_zero() {
+                continue;
+            }
+            Some(PoolPrice {
                 sqrt,
                 liquidity,
                 block: u64::MAX,
                 // slot0 carries no fee; a dynamic pool refreshed here stays
                 // excluded from tolling until its next Swap re-observes one.
                 observed_fee: None,
-            },
-        );
+            })
+        };
+        if let Some(price) = refreshed_price {
+            refreshed.insert(*key, price);
+        }
     }
     refreshed
 }
@@ -1970,6 +2027,54 @@ pub fn quote_pair_anchored(
     prices_b: &HashMap<[u8; 32], PoolPrice>,
     preferred_anchor: Option<Address>,
 ) -> Result<Option<PairQuote>, String> {
+    let Some(sel) = select_pair_cycle(a_entries, b_entries, prices_a, prices_b, preferred_anchor)?
+    else {
+        return Ok(None);
+    };
+    // Clamp the trade to what every leg can absorb within one liquidity
+    // cell; beyond it the constant-product model is fiction (audit S1).
+    let (input, output, profit) =
+        finalize_capacity_checked(&sel.cycle, &sel.states, &sel.leg_caps, sel.unclamped)?;
+    Ok(Some(finish_pair_quote(&sel, input, output, profit)))
+}
+
+/// One solved orientation: unclamped optimiser quote, its cycle, reserve
+/// states, and per-hop single-tick capacities.
+type BestPick = (
+    v2_math::OptimalQuote,
+    domain::Cycle,
+    Vec<domain::PoolState>,
+    Vec<U256>,
+);
+
+/// Selected pair cycle with everything needed to price it at any input:
+/// the solved orientation, reserve states, per-leg capacities, legs, tolls,
+/// and the optimiser's unclamped quote.
+pub struct PairCycleSel {
+    pub anchor: Address,
+    pub other: Address,
+    pub first_leg: PoolEntry,
+    pub second_leg: PoolEntry,
+    pub toll_a: f64,
+    pub toll_b: f64,
+    pub leg_price_a: PoolPrice,
+    pub leg_price_b: PoolPrice,
+    pub cycle: domain::Cycle,
+    pub states: Vec<domain::PoolState>,
+    pub leg_caps: Vec<U256>,
+    pub unclamped: v2_math::OptimalQuote,
+}
+
+/// Cheapest-priced leg per venue plus same-pair enforcement and orientation
+/// solving, shared by [`quote_pair_anchored`] and the small-size probes.
+/// Returns `Ok(None)` when no orientation solves.
+pub fn select_pair_cycle(
+    a_entries: &[PoolEntry],
+    b_entries: &[PoolEntry],
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+    preferred_anchor: Option<Address>,
+) -> Result<Option<PairCycleSel>, String> {
     let best_leg = |entries: &[PoolEntry],
                     prices: &HashMap<[u8; 32], PoolPrice>|
      -> Option<(PoolEntry, PoolPrice, f64)> {
@@ -2025,6 +2130,53 @@ pub fn quote_pair_anchored(
     let Some((unclamped_quote, cycle, states, leg_caps)) = best else {
         return Ok(None);
     };
+    Ok(Some(PairCycleSel {
+        anchor,
+        other,
+        first_leg,
+        second_leg,
+        toll_a,
+        toll_b,
+        leg_price_a,
+        leg_price_b,
+        cycle,
+        states,
+        leg_caps,
+        unclamped: unclamped_quote,
+    }))
+}
+
+/// Price the selected cycle at the optimiser's input (clamped to capacity).
+/// This is the long-standing optimal-row math, shared by
+/// [`quote_pair_anchored`] and the dirty hot path.
+pub fn price_optimal(sel: &PairCycleSel) -> Result<(U256, U256, U256), String> {
+    finalize_capacity_checked(&sel.cycle, &sel.states, &sel.leg_caps, sel.unclamped)
+}
+
+/// Price the selected cycle at an explicit input (at or below capacity),
+/// reusing the capacity clamp + `quote_cycle` machinery. Returns zeros when
+/// the requested size is empty or fully capacity-blocked.
+pub fn finalize_at_input(
+    cycle: &domain::Cycle,
+    states: &[domain::PoolState],
+    leg_caps: &[U256],
+    probe: U256,
+) -> Result<(U256, U256, U256), String> {
+    if probe.is_zero() {
+        return Ok((U256::ZERO, U256::ZERO, U256::ZERO));
+    }
+    let clamped = capacity_bounded_input(cycle, states, leg_caps, probe);
+    if clamped.is_zero() {
+        return Ok((U256::ZERO, U256::ZERO, U256::ZERO));
+    }
+    let output = v2_math::quote_cycle(clamped, cycle, states)
+        .map_err(|e| format!("probe quote failed: {e}"))?;
+    let profit = output.saturating_sub(clamped);
+    Ok((clamped, output, profit))
+}
+
+/// Assemble the final [`PairQuote`] for a priced input on the selected cycle.
+pub fn finish_pair_quote(sel: &PairCycleSel, input: U256, output: U256, profit: U256) -> PairQuote {
     let leg_route = |entry: PoolEntry, token_in: Address, token_out: Address| LegRoute {
         profile: entry.profile,
         pool: entry.venue,
@@ -2034,38 +2186,28 @@ pub fn quote_pair_anchored(
         fee_raw: entry.fee,
     };
     let legs = vec![
-        leg_route(first_leg, anchor, other),
-        leg_route(second_leg, other, anchor),
+        leg_route(sel.first_leg, sel.anchor, sel.other),
+        leg_route(sel.second_leg, sel.other, sel.anchor),
     ];
-    // Clamp the trade to what every leg can absorb within one liquidity
-    // cell; beyond it the constant-product model is fiction (audit S1).
-    let (input, output, profit) =
-        finalize_capacity_checked(&cycle, &states, &leg_caps, unclamped_quote)?;
-    // See `oriented_pair_skew`: raw pool prices must be re-expressed in the
-    // canonical pair direction before comparing venues.
-    let skew = oriented_pair_skew(&leg_a, &leg_price_a, &leg_b, &leg_price_b, anchor);
-    Ok(Some(PairQuote {
-        token_lo: anchor,
-        token_hi: other,
+    PairQuote {
+        token_lo: sel.anchor,
+        token_hi: sel.other,
         input,
         output,
         profit,
-        toll: toll_a + toll_b,
-        log2_skew: skew,
-        optimal_unclamped: unclamped_quote.input,
-        input_capacity: input.min(unclamped_quote.input),
+        toll: sel.toll_a + sel.toll_b,
+        log2_skew: oriented_pair_skew(
+            &sel.first_leg,
+            &sel.leg_price_a,
+            &sel.second_leg,
+            &sel.leg_price_b,
+            sel.anchor,
+        ),
+        optimal_unclamped: sel.unclamped.input,
+        input_capacity: input.min(sel.unclamped.input),
         legs,
-    }))
+    }
 }
-
-/// One solved orientation: unclamped optimiser quote, its cycle, reserve
-/// states, and per-hop single-tick capacities.
-type BestPick = (
-    v2_math::OptimalQuote,
-    domain::Cycle,
-    Vec<domain::PoolState>,
-    Vec<U256>,
-);
 
 /// Quotes every cross-venue pair that has at least one priced leg on each
 /// venue and returns the captureable quotes (positive-profit round trips),
@@ -2128,7 +2270,7 @@ pub fn enumerate_triangles(a: &[PoolEntry], b: &[PoolEntry]) -> Vec<TokenTriple>
         // For enumeration we consider a pool quotable if its static toll is quotable
         // OR it is V4 dynamic (fee sentinel) that could be quoted via observed_fee later.
         // Keep high-fee >0.9 still filtered (honeypot), but admit dynamic.
-        if e.profile == *b"v4" && (e.fee == 0 || e.fee == 8388608) {
+        if e.profile == *b"v4" && (e.fee == 0 || e.fee == 8_388_608) {
             return true;
         }
         leg_toll(e.fee, e.fee_denominator, e.profile).is_some()
@@ -2513,6 +2655,7 @@ pub fn cross_measure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::Bytes;
 
     #[test]
     fn normalizes_native_sentinel() {
@@ -2559,8 +2702,9 @@ mod tests {
             "free pools stay excluded from toll math but are not errors"
         );
 
-        // Absurd observed fee stays rejected by the band.
-        price.observed_fee = Some(900_000);
+        // Absurd observed fee stays rejected by the band (ceiling is now
+        // 90%, lifted from 50% for full range — so the probe must clear it).
+        price.observed_fee = Some(950_000);
         assert_eq!(effective_leg_toll(&entry, &price), None);
 
         // Canonical catalog fees still take the legacy path untouched.
@@ -4407,5 +4551,257 @@ mod tests {
         assert_eq!(top.swaps_a, 5);
         assert_eq!(top.swaps_b, 3);
         assert_eq!(top.score, 3, "score is the quieter side");
+    }
+
+    fn v3_swap_envelope(pool: Address, block: u64, sqrt: u16, liquidity: u64) -> RawLogEnvelope {
+        let mut data = vec![0u8; 160];
+        data[94..96].copy_from_slice(&sqrt.to_be_bytes());
+        data[96..128].copy_from_slice(&U256::from(liquidity).to_be_bytes::<32>());
+        RawLogEnvelope {
+            address: pool,
+            topics: vec![provider::v3_swap_topic(), B256::default()],
+            data: Bytes::from(data),
+            block_number: block,
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+            block_hash: B256::default(),
+        }
+    }
+
+    fn v4_swap_envelope(id: [u8; 32], block: u64, sqrt: u16, fee: u32) -> RawLogEnvelope {
+        let mut data = vec![0u8; 192];
+        data[94..96].copy_from_slice(&sqrt.to_be_bytes());
+        data[96..128].copy_from_slice(&U256::from(7u64).to_be_bytes::<32>());
+        data[188..192].copy_from_slice(&fee.to_be_bytes());
+        RawLogEnvelope {
+            address: Address::repeat_byte(0x83),
+            topics: vec![provider::v4_swap_topic(), B256::from(id), B256::default()],
+            data: Bytes::from(data),
+            block_number: block,
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+            block_hash: B256::default(),
+        }
+    }
+
+    #[test]
+    fn ingest_envelope_keys_v3_by_pool_address() {
+        let pool = Address::repeat_byte(0x11);
+        let mut latest = HashMap::new();
+        ingest_envelope(
+            *b"v3",
+            &mut latest,
+            &v3_swap_envelope(pool, 100, 0xDEAD, 500),
+            None,
+        );
+        let key: [u8; 32] = pool.into_word().into();
+        let price = latest.get(&key).expect("v3 pool priced");
+        assert_eq!(price.sqrt, U256::from(0xDEAD_u64));
+        assert_eq!(price.liquidity, U256::from(500u64));
+        assert_eq!(price.block, 100);
+        assert_eq!(price.observed_fee, None);
+    }
+
+    #[test]
+    fn ingest_envelope_filters_v4_by_listed_id_and_keeps_fee() {
+        let listed = [7u8; 32];
+        let keep: HashSet<[u8; 32]> = HashSet::from([listed]);
+        let mut latest = HashMap::new();
+        ingest_envelope(
+            *b"v4",
+            &mut latest,
+            &v4_swap_envelope(listed, 200, 0xBEEF, 3000),
+            Some(&keep),
+        );
+        let price = latest.get(&listed).expect("listed v4 pool priced");
+        assert_eq!(price.sqrt, U256::from(0xBEEF_u64));
+        assert_eq!(price.block, 200);
+        assert_eq!(price.observed_fee, Some(3000));
+        // Unlisted PoolId is dropped even with a decodable body.
+        ingest_envelope(
+            *b"v4",
+            &mut latest,
+            &v4_swap_envelope([9u8; 32], 201, 0xBEEF, 3000),
+            Some(&keep),
+        );
+        assert_eq!(latest.len(), 1, "unlisted id must not price");
+    }
+
+    #[test]
+    fn ingest_envelope_never_clobbers_fresher_state() {
+        let pool = Address::repeat_byte(0x22);
+        let mut latest = HashMap::new();
+        ingest_envelope(
+            *b"v3",
+            &mut latest,
+            &v3_swap_envelope(pool, 300, 0xAAAA, 1),
+            None,
+        );
+        ingest_envelope(
+            *b"v3",
+            &mut latest,
+            &v3_swap_envelope(pool, 299, 0xBBBB, 2),
+            None,
+        );
+        let key: [u8; 32] = pool.into_word().into();
+        let price = latest.get(&key).unwrap();
+        assert_eq!(
+            price.sqrt,
+            U256::from(0xAAAA_u64),
+            "older block must not win"
+        );
+        assert_eq!(price.block, 300);
+        // Same-block redelivery overwrites (matches sweep semantics).
+        ingest_envelope(
+            *b"v3",
+            &mut latest,
+            &v3_swap_envelope(pool, 300, 0xCCCC, 3),
+            None,
+        );
+        assert_eq!(latest.get(&key).unwrap().sqrt, U256::from(0xCCCC_u64));
+    }
+
+    #[test]
+    fn ingest_envelope_ignores_undecodable_body() {
+        let pool = Address::repeat_byte(0x33);
+        let mut latest = HashMap::new();
+        let mut short = v3_swap_envelope(pool, 400, 0xDEAD, 1);
+        short.data = Bytes::from(vec![0u8; 32]);
+        ingest_envelope(*b"v3", &mut latest, &short, None);
+        assert!(latest.is_empty(), "short body must not price");
+    }
+
+    #[test]
+    fn archive_gating_detected_by_code_or_keyword() {
+        // 2026-09-07: Chainstack free serves getLogs ~50-100 blocks back;
+        // older ranges fail `-32002` (HTTP 403 with body) and must skip
+        // forward, never retry-storm.
+        assert!(is_archive_walled(&TransportError::Transient(
+            "HTTP status 403: {\"code\":-32002,\"message\":\"Archive, Debug and Trace\"}"
+                .to_owned(),
+        )));
+        assert!(is_archive_walled(&TransportError::Permanent(
+            "HTTP status 403: archive not available".to_owned(),
+        )));
+        assert!(!is_archive_walled(&TransportError::Transient(
+            "HTTP status 429: Too Many Requests".to_owned(),
+        )));
+        assert!(!is_archive_walled(&TransportError::Permanent(
+            "HTTP status 400: invalid range".to_owned(),
+        )));
+    }
+
+    /// Scripted backend for refetch tests: `eth_getStorageAt` serves the
+    /// V4 mapping words by slot; `eth_call` serves V3 `slot0()`/`liquidity()`.
+    struct RefetchBackend {
+        storage_words: std::collections::HashMap<String, String>,
+        v3_sqrt: &'static str,
+        v3_liquidity: &'static str,
+    }
+
+    impl provider::HttpBackend for RefetchBackend {
+        fn request(
+            &self,
+            request: &provider::RpcRequest,
+        ) -> Result<provider::HttpResponse, TransportError> {
+            let word = if request.method == "eth_getStorageAt" {
+                let slot = request.params[1].as_str().unwrap().to_owned();
+                self.storage_words
+                    .get(&slot)
+                    .cloned()
+                    .unwrap_or_else(|| format!("0x{}", "00".repeat(32)))
+            } else if request.params[0]["data"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("3850c7bd")
+            {
+                self.v3_sqrt.to_owned()
+            } else {
+                self.v3_liquidity.to_owned()
+            };
+            Ok(provider::HttpResponse {
+                result: serde_json::Value::String(word),
+                response_bytes: 10,
+            })
+        }
+    }
+
+    fn refetch_reader(backend: RefetchBackend) -> ChainReader<RefetchBackend, NoSleeper> {
+        ChainReader::new(
+            backend,
+            NoSleeper,
+            provider::ProviderBudget::new(u64::MAX, 1 << 24),
+            provider::RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            4663,
+        )
+    }
+
+    #[test]
+    fn refetch_routes_v4_through_pool_manager_mapping() {
+        let pm = Address::repeat_byte(0x83);
+        let v4_id = [0x9cu8; 32];
+        let v3_venue = Address::repeat_byte(0x71);
+        // V4 slot0 word: sqrt = 2^100, tick = 100; liquidity word: 777.
+        let sqrt_v4: U256 = U256::from(1u64) << 100;
+        let mut slot_bytes = [0u8; 32];
+        slot_bytes[12..].copy_from_slice(&sqrt_v4.to_be_bytes::<32>()[12..]);
+        slot_bytes[9..12].copy_from_slice(&[0x00, 0x00, 0x64]);
+        let base = provider::v4_pool_slot(v4_id);
+        let hex_slot = |slot: U256| format!("0x{slot:064x}");
+        let hex_word = |bytes: [u8; 32]| format!("0x{}", alloy_primitives::hex::encode(bytes));
+        let mut liq_bytes = [0u8; 32];
+        liq_bytes[24..].copy_from_slice(&777u64.to_be_bytes());
+        let mut words = std::collections::HashMap::new();
+        words.insert(hex_slot(base), hex_word(slot_bytes));
+        words.insert(
+            hex_slot(base.wrapping_add(U256::from(3u64))),
+            hex_word(liq_bytes),
+        );
+        // V3 slot0 ABI tuple: sqrt word + tick word (tick 200 in low 3 bytes).
+        let sqrt_v3: U256 = U256::from(1u64) << 110;
+        let mut tick_word = [0u8; 32];
+        tick_word[29..].copy_from_slice(&[0x00, 0x00, 0xc8]);
+        // NOTE: pool_slot0 needs a 64-byte ABI response; emulate by
+        // concatenating both words (result_bytes accepts byte data).
+        let v3_response = {
+            let mut both = vec![0u8; 64];
+            both[..32].copy_from_slice(&sqrt_v3.to_be_bytes::<32>());
+            both[32..].copy_from_slice(&tick_word);
+            format!("0x{}", alloy_primitives::hex::encode(both))
+        };
+        let backend = RefetchBackend {
+            storage_words: words,
+            v3_sqrt: Box::leak(v3_response.into_boxed_str()),
+            v3_liquidity: "0x309",
+        };
+        let reader = refetch_reader(backend);
+        let v4_entry = catalog_entry(*b"v4", pm, v4_id);
+        let v3_key: [u8; 32] = v3_venue.into_word().into();
+        let v3_entry = catalog_entry(*b"v3", v3_venue, [0u8; 32]);
+        let out = refetch_invalidated_prices(
+            &reader,
+            &[v4_entry, v3_entry],
+            &[v4_id, v3_key, [0xabu8; 32]],
+            10,
+            pm,
+        );
+        // V4 key refreshes through the manager mapping (block MAX).
+        let v4_price = out.get(&v4_id).expect("v4 pool refetches");
+        assert_eq!(v4_price.sqrt, sqrt_v4);
+        assert_eq!(v4_price.liquidity, U256::from(777u64));
+        assert_eq!(v4_price.block, u64::MAX);
+        // V3 key refreshes through the pool contract as before.
+        let v3_price = out.get(&v3_key).expect("v3 pool refetches");
+        assert_eq!(v3_price.sqrt, sqrt_v3);
+        assert_eq!(v3_price.block, u64::MAX);
+        // Unknown keys and uninitialized pools are skipped.
+        assert!(!out.contains_key(&[0xabu8; 32]));
+        assert_eq!(out.len(), 2);
     }
 }

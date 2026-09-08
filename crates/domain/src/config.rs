@@ -58,28 +58,28 @@ impl fmt::Display for RpcUrl {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShadowConfig {
-	pub chain_id: u64,
-	pub max_hops: u8,
-	pub pool_cap: u32,
-	pub stale_timeout_seconds: u64,
-	pub recovery_gap_blocks: u64,
-	pub dirty_lag_milliseconds: u64,
-	pub request_cu_ceiling: u64,
-	pub websocket_bytes_ceiling: u64,
-	pub database_limit_bytes: u64,
-	/// Path to the offline catalog (pools CSV) used by offline commands.
-	pub manifest_path: Option<PathBuf>,
-	/// Liquidity filtering thresholds (USD fixed-point 1e18 scale, as decimal string)
-	pub min_liquidity_usd: Option<String>,
-	pub max_liquidity_usd: Option<String>,
-	pub max_trade_size_bps_v2: Option<u32>,
-	pub max_trade_size_bps_v3_v4: Option<u32>,
-	#[serde(skip, default)]
-	pub chain: Option<Chain>,
-	#[serde(skip)]
-	pub http_rpc_url: Option<RpcUrl>,
-	#[serde(skip)]
-	pub websocket_rpc_url: Option<RpcUrl>,
+    pub chain_id: u64,
+    pub max_hops: u8,
+    pub pool_cap: u32,
+    pub stale_timeout_seconds: u64,
+    pub recovery_gap_blocks: u64,
+    pub dirty_lag_milliseconds: u64,
+    pub request_cu_ceiling: u64,
+    pub websocket_bytes_ceiling: u64,
+    pub database_limit_bytes: u64,
+    /// Path to the offline catalog (pools CSV) used by offline commands.
+    pub manifest_path: Option<PathBuf>,
+    /// Liquidity filtering thresholds (USD fixed-point 1e18 scale, as decimal string)
+    pub min_liquidity_usd: Option<String>,
+    pub max_liquidity_usd: Option<String>,
+    pub max_trade_size_bps_v2: Option<u32>,
+    pub max_trade_size_bps_v3_v4: Option<u32>,
+    #[serde(skip, default)]
+    pub chain: Option<Chain>,
+    #[serde(skip)]
+    pub http_rpc_url: Option<RpcUrl>,
+    #[serde(skip)]
+    pub websocket_rpc_url: Option<RpcUrl>,
 }
 
 impl ShadowConfig {
@@ -148,10 +148,10 @@ impl ShadowConfig {
                 if !(2..=4).contains(&self.max_hops) {
                     return Err(ConfigError::InvalidMaxHops(self.max_hops));
                 }
-                // 0 = unlimited (full ~1M global sweep) — allowed, bypasses cap
-                if self.pool_cap != 0 && self.pool_cap == 0 {
-                    return Err(ConfigError::InvalidPoolCap(self.pool_cap));
-                }
+                // 0 = unlimited (full ~1M global sweep) — allowed, bypasses cap.
+                // (A prior `pool_cap != 0 && pool_cap == 0` check was dead code
+                // — always false — and contradicted the 0-means-unlimited
+                // design, so it was removed rather than repaired.)
                 if self.stale_timeout_seconds == 0 {
                     return Err(ConfigError::InvalidStaleTimeout(self.stale_timeout_seconds));
                 }
@@ -172,47 +172,53 @@ impl ShadowConfig {
                     return Err(ConfigError::InvalidDatabaseLimit(self.database_limit_bytes));
                 }
                 // dirty_lag_milliseconds may be zero (no lag) — allowed.
-				// Validate liquidity filtering config if provided
-				let min_liq = self.min_liquidity_usd.as_ref().and_then(|s| s.parse::<U256>().ok());
-				let max_liq = self.max_liquidity_usd.as_ref().and_then(|s| s.parse::<U256>().ok());
-				if let Some(min_liq) = min_liq {
-					if min_liq == U256::ZERO {
-						return Err(ConfigError::InvalidMinLiquidity(min_liq));
-					}
-				}
-				if let Some(max_liq) = max_liq {
-					if max_liq == U256::ZERO {
-						return Err(ConfigError::InvalidMaxLiquidity(max_liq));
-					}
-					if let Some(min_liq) = min_liq {
-						if max_liq <= min_liq {
-							return Err(ConfigError::InvalidLiquidityRange(min_liq, max_liq));
-						}
-					}
-				}
-				if let Some(v2_bps) = self.max_trade_size_bps_v2 {
-					if v2_bps == 0 || v2_bps > 10000 {
-						return Err(ConfigError::InvalidMaxTradeSizeBps(v2_bps));
-					}
-				}
-if let Some(v3_v4_bps) = self.max_trade_size_bps_v3_v4 {
-				if v3_v4_bps == 0 || v3_v4_bps > 10000 {
-					return Err(ConfigError::InvalidMaxTradeSizeBps(v3_v4_bps));
-				}
-			}
-			Ok(chain)
-		})
-	}
+                // Validate liquidity filtering config if provided
+                let min_liq = self
+                    .min_liquidity_usd
+                    .as_ref()
+                    .and_then(|s| s.parse::<U256>().ok());
+                let max_liq = self
+                    .max_liquidity_usd
+                    .as_ref()
+                    .and_then(|s| s.parse::<U256>().ok());
+                if let Some(min_liq) = min_liq
+                    && min_liq == U256::ZERO
+                {
+                    return Err(ConfigError::InvalidMinLiquidity(min_liq));
+                }
+                if let Some(max_liq) = max_liq {
+                    if max_liq == U256::ZERO {
+                        return Err(ConfigError::InvalidMaxLiquidity(max_liq));
+                    }
+                    if let Some(min_liq) = min_liq
+                        && max_liq <= min_liq
+                    {
+                        return Err(ConfigError::InvalidLiquidityRange(min_liq, max_liq));
+                    }
+                }
+                if let Some(v2_bps) = self.max_trade_size_bps_v2
+                    && !(1..=10000).contains(&v2_bps)
+                {
+                    return Err(ConfigError::InvalidMaxTradeSizeBps(v2_bps));
+                }
+                if let Some(v3_v4_bps) = self.max_trade_size_bps_v3_v4
+                    && !(1..=10000).contains(&v3_v4_bps)
+                {
+                    return Err(ConfigError::InvalidMaxTradeSizeBps(v3_v4_bps));
+                }
+                Ok(chain)
+            })
+    }
 }
 
 impl fmt::Display for ShadowConfig {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(
-			formatter,
-			"ShadowConfig(chain_id={}, max_hops={}, pool_cap={}, http_rpc_url=[REDACTED], websocket_rpc_url=[REDACTED])",
-			self.chain_id, self.max_hops, self.pool_cap
-		)
-	}
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "ShadowConfig(chain_id={}, max_hops={}, pool_cap={}, http_rpc_url=[REDACTED], websocket_rpc_url=[REDACTED])",
+            self.chain_id, self.max_hops, self.pool_cap
+        )
+    }
 }
 
 #[derive(Debug, Error)]
@@ -227,8 +233,6 @@ pub enum ConfigError {
     InvalidChainId(u64),
     #[error("max_hops must be in 2..=4, got {0}")]
     InvalidMaxHops(u8),
-    #[error("pool_cap must be > 0, got {0}")]
-    InvalidPoolCap(u32),
     #[error("stale_timeout_seconds must be > 0, got {0}")]
     InvalidStaleTimeout(u64),
     #[error("recovery_gap_blocks must be > 0, got {0}")]

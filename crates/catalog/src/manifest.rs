@@ -10,21 +10,21 @@ const MAX_POOLS: usize = 0; // 0 = unlimited (covers full ~1M universe on public
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidatePool {
-	pub chain_id: u64,
-	pub address: Address,
-	pub factory: Address,
-	pub token0: Address,
-	pub token1: Address,
-	pub fee: Fee,
-	pub profile: Profile,
-	/// Uniswap V4 `PoolId` (keccak of the pool key) for singleton-based pools.
-	/// Present when `profile` is `VolatileManaged`; a conventional address key
-	/// otherwise identifies the pool.
-	pub pool_id: Option<B256>,
-	pub source: String,
-	/// Total liquidity in USD (fixed-point scale: 1 USD = 1e18).
-	/// None if not yet priced / not yet swept.
-	pub liquidity_usd: Option<U256>,
+    pub chain_id: u64,
+    pub address: Address,
+    pub factory: Address,
+    pub token0: Address,
+    pub token1: Address,
+    pub fee: Fee,
+    pub profile: Profile,
+    /// Uniswap V4 `PoolId` (keccak of the pool key) for singleton-based pools.
+    /// Present when `profile` is `VolatileManaged`; a conventional address key
+    /// otherwise identifies the pool.
+    pub pool_id: Option<B256>,
+    pub source: String,
+    /// Total liquidity in USD (fixed-point scale: 1 USD = 1e18).
+    /// None if not yet priced / not yet swept.
+    pub liquidity_usd: Option<U256>,
 }
 
 #[derive(Debug, Error)]
@@ -64,20 +64,20 @@ pub enum ManifestError {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestRow {
-	chain_id: u64,
-	pool_address: String,
-	factory_address: String,
-	token0: String,
-	token1: String,
-	fee_numerator: u32,
-	fee_denominator: u32,
-	#[serde(default)]
-	profile: Option<String>,
-	#[serde(default)]
-	pool_id: Option<String>,
-	source: String,
-	#[serde(default)]
-	liquidity_usd: Option<String>,
+    chain_id: u64,
+    pool_address: String,
+    factory_address: String,
+    token0: String,
+    token1: String,
+    fee_numerator: u32,
+    fee_denominator: u32,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    pool_id: Option<String>,
+    source: String,
+    #[serde(default)]
+    liquidity_usd: Option<String>,
 }
 
 /// Parses and strictly validates a candidate-pool CSV manifest.
@@ -87,6 +87,7 @@ struct ManifestRow {
 /// Returns an error for malformed CSV, invalid or duplicate addresses, invalid
 /// chain or fee data, missing source metadata, or a capped manifest when
 /// `MAX_POOLS != 0` and the cap is exceeded.
+#[allow(clippy::too_many_lines)] // single-pass row validator; splitting would scatter the fail-fast checks
 pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestError> {
     let mut pools = Vec::new();
     let mut identities: HashSet<B256> = HashSet::new();
@@ -110,9 +111,10 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
         }
         let profile = match row.profile.as_deref() {
             None | Some("v2" | "constant_product" | "ConstantProduct") => Profile::ConstantProduct,
-            Some("v3" | "concentrated" | "Concentrated") => Profile::Concentrated,
+            Some("v3" | "concentrated" | "Concentrated" | "up" | "Up" | "UP") => {
+                Profile::Concentrated
+            }
             Some("v4" | "volatile_managed" | "VolatileManaged") => Profile::VolatileManaged,
-            Some("up" | "Up" | "UP") => Profile::Concentrated,
             Some(other) => {
                 return Err(ManifestError::UnsupportedProfile {
                     row: row_number,
@@ -193,19 +195,18 @@ pub fn parse_manifest(reader: impl Read) -> Result<Vec<CandidatePool>, ManifestE
                     denominator: row.fee_denominator,
                 })?
         };
-pools.push(CandidatePool {
-			chain_id: row.chain_id,
-			address,
-			factory,
-			token0,
-			token1,
-			fee,
-			profile,
-			pool_id,
-			source,
-			liquidity_usd: row.liquidity_usd
-				.and_then(|s| s.parse::<U256>().ok()),
-		});
+        pools.push(CandidatePool {
+            chain_id: row.chain_id,
+            address,
+            factory,
+            token0,
+            token1,
+            fee,
+            profile,
+            pool_id,
+            source,
+            liquidity_usd: row.liquidity_usd.and_then(|s| s.parse::<U256>().ok()),
+        });
     }
     Ok(pools)
 }
@@ -214,35 +215,35 @@ pools.push(CandidatePool {
 /// Keeps pools with `liquidity_usd >= min_liq` and `liquidity_usd <= max_liq`.
 /// Pools with `liquidity_usd = None` are filtered out when a min threshold is set
 /// (tradeoff: aggressive dust filter cuts 50k→5-10k active; set min=None to revert
-///  to conservative where unknown liquidity passes). Recommended: min=$5k/max=$200k
-///  + trade_cap 0.5% V2 / 1% V3V4 (VPS 6×/11Gi validated, 5k manifest ~600M RAM).
+/// to conservative where unknown liquidity passes). Recommended: min=$5k/max=$200k
+/// + `trade_cap` 0.5% V2 / 1% V3V4 (VPS 6×/11Gi validated, 5k manifest ~600M RAM).
 #[must_use]
 pub fn filter_by_liquidity(
-	pools: Vec<CandidatePool>,
-	min_liq_usd: Option<U256>,
-	max_liq_usd: Option<U256>,
+    pools: Vec<CandidatePool>,
+    min_liq_usd: Option<U256>,
+    max_liq_usd: Option<U256>,
 ) -> Vec<CandidatePool> {
-	pools
-		.into_iter()
-		.filter(|p| {
-			match p.liquidity_usd {
-				Some(liq) => {
-					if let Some(min) = min_liq_usd {
-						if liq < min {
-							return false;
-						}
-					}
-					if let Some(max) = max_liq_usd {
-						if liq > max {
-							return false;
-						}
-					}
-					true
-				}
-				None => min_liq_usd.is_none(), // None liquidity only passes if no min threshold
-			}
-		})
-		.collect()
+    pools
+        .into_iter()
+        .filter(|p| {
+            match p.liquidity_usd {
+                Some(liq) => {
+                    if let Some(min) = min_liq_usd
+                        && liq < min
+                    {
+                        return false;
+                    }
+                    if let Some(max) = max_liq_usd
+                        && liq > max
+                    {
+                        return false;
+                    }
+                    true
+                }
+                None => min_liq_usd.is_none(), // None liquidity only passes if no min threshold
+            }
+        })
+        .collect()
 }
 
 fn parse_pool_id(raw: &str) -> Option<B256> {
@@ -283,10 +284,9 @@ mod tests {
 
     use std::fmt::Write;
 
-    use alloy_primitives::{Address, U256};
-    use domain::{Fee, Profile};
+    use alloy_primitives::Address;
 
-    use super::{filter_by_liquidity, ManifestError, parse_manifest, CandidatePool};
+    use super::{CandidatePool, ManifestError, parse_manifest};
 
     const HEADER: &str = "chain_id,pool_address,factory_address,token0,token1,fee_numerator,fee_denominator,source\n";
 
@@ -508,8 +508,8 @@ mod tests {
 
     #[test]
     fn filter_by_liquidity_thresholds() {
-        use alloy_primitives::U256;
         use super::filter_by_liquidity;
+        use alloy_primitives::U256;
 
         let pools = vec![
             CandidatePool {
@@ -518,11 +518,11 @@ mod tests {
                 factory: Address::repeat_byte(2),
                 token0: Address::repeat_byte(3),
                 token1: Address::repeat_byte(4),
-                fee: domain::Fee::keep_rate(3000, 1000000).unwrap(),
+                fee: domain::Fee::keep_rate(3000, 1_000_000).unwrap(),
                 profile: domain::Profile::Concentrated,
                 pool_id: None,
                 source: "test".to_owned(),
-                liquidity_usd: Some(U256::from(10000000000000000000000u128)), // 10k
+                liquidity_usd: Some(U256::from(10_000_000_000_000_000_000_000_u128)), // 10k
             },
             CandidatePool {
                 chain_id: 4663,
@@ -530,11 +530,11 @@ mod tests {
                 factory: Address::repeat_byte(6),
                 token0: Address::repeat_byte(7),
                 token1: Address::repeat_byte(8),
-                fee: domain::Fee::keep_rate(3000, 1000000).unwrap(),
+                fee: domain::Fee::keep_rate(3000, 1_000_000).unwrap(),
                 profile: domain::Profile::Concentrated,
                 pool_id: None,
                 source: "test".to_owned(),
-                liquidity_usd: Some(U256::from(5000000000000000000000u128)), // 5k
+                liquidity_usd: Some(U256::from(5_000_000_000_000_000_000_000_u128)), // 5k
             },
             CandidatePool {
                 chain_id: 4663,
@@ -542,11 +542,11 @@ mod tests {
                 factory: Address::repeat_byte(10),
                 token0: Address::repeat_byte(11),
                 token1: Address::repeat_byte(12),
-                fee: domain::Fee::keep_rate(3000, 1000000).unwrap(),
+                fee: domain::Fee::keep_rate(3000, 1_000_000).unwrap(),
                 profile: domain::Profile::Concentrated,
                 pool_id: None,
                 source: "test".to_owned(),
-                liquidity_usd: Some(U256::from(200000000000000000000000u128)), // 200k
+                liquidity_usd: Some(U256::from(200_000_000_000_000_000_000_000_u128)), // 200k
             },
             CandidatePool {
                 chain_id: 4663,
@@ -554,7 +554,7 @@ mod tests {
                 factory: Address::repeat_byte(14),
                 token0: Address::repeat_byte(15),
                 token1: Address::repeat_byte(16),
-                fee: domain::Fee::keep_rate(3000, 1000000).unwrap(),
+                fee: domain::Fee::keep_rate(3000, 1_000_000).unwrap(),
                 profile: domain::Profile::Concentrated,
                 pool_id: None,
                 source: "test".to_owned(),
@@ -563,14 +563,28 @@ mod tests {
         ];
 
         // Filter min=10k, max=100k
-        let filtered = filter_by_liquidity(pools.clone(), Some(U256::from(10000000000000000000000u128)), Some(U256::from(100000000000000000000000u128)));
+        let filtered = filter_by_liquidity(
+            pools.clone(),
+            Some(U256::from(10_000_000_000_000_000_000_000_u128)),
+            Some(U256::from(100_000_000_000_000_000_000_000_u128)),
+        );
         assert_eq!(filtered.len(), 1); // only the 10k pool (5k too low, 200k too high, None is kept but 5k filtered)
-        assert_eq!(filtered[0].liquidity_usd, Some(U256::from(10000000000000000000000u128)));
+        assert_eq!(
+            filtered[0].liquidity_usd,
+            Some(U256::from(10_000_000_000_000_000_000_000_u128))
+        );
 
         // Filter min=10k only (no max)
-        let filtered = filter_by_liquidity(pools.clone(), Some(U256::from(10000000000000000000000u128)), None);
+        let filtered = filter_by_liquidity(
+            pools.clone(),
+            Some(U256::from(10_000_000_000_000_000_000_000_u128)),
+            None,
+        );
         assert_eq!(filtered.len(), 2); // 10k and 200k (5k filtered, None kept)
-        assert_eq!(filtered[0].liquidity_usd, Some(U256::from(10000000000000000000000u128)));
+        assert_eq!(
+            filtered[0].liquidity_usd,
+            Some(U256::from(10_000_000_000_000_000_000_000_u128))
+        );
 
         // No filter
         let filtered = filter_by_liquidity(pools, None, None);

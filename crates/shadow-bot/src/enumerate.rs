@@ -152,9 +152,9 @@ impl Venue {
     #[must_use]
     pub fn pool_key(pool: &EnumeratedPool) -> B256 {
         match pool {
-            EnumeratedPool::V2 { pool, .. } => pool.into_word(),
-            EnumeratedPool::V3 { pool, .. } => pool.into_word(),
-            EnumeratedPool::Up { pool, .. } => pool.into_word(),
+            EnumeratedPool::V2 { pool, .. }
+            | EnumeratedPool::V3 { pool, .. }
+            | EnumeratedPool::Up { pool, .. } => pool.into_word(),
             EnumeratedPool::V4 { id, .. } => *id,
         }
     }
@@ -165,7 +165,9 @@ impl EnumeratedPool {
     fn fee(&self) -> u32 {
         match self {
             EnumeratedPool::V2 { .. } => 3000, // V2 fixed 0.3%
-            EnumeratedPool::V3 { fee, .. } | EnumeratedPool::Up { fee, .. } | EnumeratedPool::V4 { fee, .. } => *fee,
+            EnumeratedPool::V3 { fee, .. }
+            | EnumeratedPool::Up { fee, .. }
+            | EnumeratedPool::V4 { fee, .. } => *fee,
         }
     }
 }
@@ -215,6 +217,8 @@ where
             std::thread::sleep(pace.delay);
         }
     }
+    Ok(all)
+}
 
 fn fetch_with_retry<B, S>(
     reader: &ChainReader<B, S>,
@@ -228,7 +232,7 @@ where
     B: HttpBackend,
     S: Sleeper,
 {
-    let mut delay = std::time::Duration::from_millis(2000);
+    let mut delay = std::time::Duration::from_secs(2);
     for attempt in 0..=max_retries {
         match reader.get_logs_windowed(
             &LogFilter {
@@ -248,16 +252,23 @@ where
                 return Ok(envelopes);
             }
             Err(TransportError::Transient(msg)) if msg.contains("429") && attempt < max_retries => {
-                eprintln!("rate limited (429) on blocks [{}, {}], retry {}/{}: sleeping {:?}", start, end, attempt + 1, max_retries, delay);
+                eprintln!(
+                    "rate limited (429) on blocks [{}, {}], retry {}/{}: sleeping {:?}",
+                    start,
+                    end,
+                    attempt + 1,
+                    max_retries,
+                    delay
+                );
                 std::thread::sleep(delay);
                 delay = delay.saturating_mul(2);
             }
             Err(e) => return Err(e),
         }
     }
-    Err(TransportError::Transient("max retries exceeded for 429".to_owned()))
-}
-    Ok(all)
+    Err(TransportError::Transient(
+        "max retries exceeded for 429".to_owned(),
+    ))
 }
 
 #[cfg(test)]

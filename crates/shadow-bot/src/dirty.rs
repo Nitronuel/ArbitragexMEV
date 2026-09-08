@@ -157,6 +157,12 @@ pub struct PairDirtyEvaluator {
     /// `AboveThreshold` at absurd USD values (same bound as `gap-vs-toll
     /// --max-skew`).
     max_log2_skew: f64,
+    /// When an optimal quote clears the floor at an input too large for a
+    /// small float, also price fixed fractions (1/4, 1/16, 1/64) of the
+    /// clamped input and emit the smallest size still clearing the floor.
+    /// Profit is concave in input, so a passing optimal quote is the only
+    /// case a smaller size can pass — probes never run otherwise.
+    prefer_small: bool,
     /// How each quote's borrow cost is selected. Quotes whose anchor has no
     /// configured flash-loan source are never gated.
     flash: shadow::flash_loan::FlashSelection,
@@ -289,6 +295,7 @@ impl PairDirtyEvaluator {
             economics,
             reference: CostSnapshot::invalid(),
             max_log2_skew: 10.0, // was 0.5 (~41% gap) — lifted for full range (now ~1024× gap)
+            prefer_small: true,
             flash: shadow::flash_loan::FlashSelection::None,
             tip: None,
             covered_a: HashMap::new(),
@@ -306,11 +313,63 @@ impl PairDirtyEvaluator {
     }
 
     /// Bounds the `|log2 skew|` a quote may carry and still be classified
-    /// normally (default `0.5`, matching `gap-vs-toll --max-skew`). Quotes
-    /// above the cap are screened out of gating instead of surfacing as
-    /// `AboveThreshold` at degenerate empty-pool USD values.
+    /// normally (default `10.0`, lifted from `0.5` for full range — matches
+    /// `gap-vs-toll --max-skew` when set explicitly). Quotes above the cap
+    /// are screened out of gating instead of surfacing as `AboveThreshold`
+    /// at degenerate empty-pool USD values.
     pub fn set_max_log2_skew(&mut self, max_log2_skew: f64) {
         self.max_log2_skew = max_log2_skew;
+    }
+
+    /// Enables/disables small-size probes (default on): when the optimal
+    /// quote clears the floor, re-price 1/4, 1/16, 1/64 of its input and
+    /// emit the smallest size still clearing it.
+    #[cfg_attr(not(test), allow(dead_code))] // off-switch for a future CLI flag; probes default on
+    pub fn set_prefer_small(&mut self, prefer_small: bool) {
+        self.prefer_small = prefer_small;
+    }
+
+    /// Given a passing optimal quote, price fixed fractions of its input on
+    /// the same cycle and return the smallest size still clearing the floor.
+    /// Returns the original `(quote, classification)` when no smaller size
+    /// passes. Callers must only invoke this for `AboveThreshold` optimal
+    /// quotes: profit is concave in input, so a failing optimal quote has
+    /// no passing smaller size, and probing it would only burn CPU.
+    fn smallest_passing_size(
+        &self,
+        sel: &crate::gaps::PairCycleSel,
+        anchor: Address,
+        input: U256,
+        quote: crate::gaps::PairQuote,
+        classification: shadow::Classification,
+    ) -> (crate::gaps::PairQuote, shadow::Classification) {
+        for divisor in [64_u64, 16, 4] {
+            let probe = input / U256::from(divisor);
+            if probe.is_zero() {
+                continue;
+            }
+            let Ok((p_in, p_out, p_profit)) =
+                crate::gaps::finalize_at_input(&sel.cycle, &sel.states, &sel.leg_caps, probe)
+            else {
+                continue;
+            };
+            if p_profit.is_zero() {
+                continue;
+            }
+            let mut probe_quote = quote.clone();
+            probe_quote.input = p_in;
+            probe_quote.output = p_out;
+            probe_quote.profit = p_profit;
+            probe_quote.input_capacity = p_in.min(quote.input_capacity);
+            let probe_class = self.classify_anchor(anchor, &probe_quote);
+            if matches!(
+                probe_class.reason,
+                shadow::ClassificationReason::AboveThreshold
+            ) {
+                return (probe_quote, probe_class);
+            }
+        }
+        (quote, classification)
     }
 
     /// Sets how each quote's borrow cost is selected. In
@@ -464,8 +523,14 @@ impl PairDirtyEvaluator {
                         ));
                     }
                 }
-                oldest = Some(oldest.map_or(price.block, |o: u64| o.min(price.block)));
-                newest = Some(newest.map_or(price.block, |n: u64| n.max(price.block)));
+                // Live slot0 refreshes (block == u64::MAX) are fresh live
+                // reads, not aged prices: exclude them from the spread so a
+                // single refetched leg can quote against a normally-aged
+                // leg instead of self-screening on a ~u64::MAX spread.
+                if price.block != u64::MAX {
+                    oldest = Some(oldest.map_or(price.block, |o: u64| o.min(price.block)));
+                    newest = Some(newest.map_or(price.block, |n: u64| n.max(price.block)));
+                }
             }
             Ok(())
         };
@@ -591,7 +656,7 @@ impl PairDirtyEvaluator {
             // legacy lexicographic choice excluded native-anchored pairs (the
             // chain's highest-volume) from honest gating entirely.
             let anchor = self.select_anchor(pair);
-            let Ok(Some(quote)) = crate::gaps::quote_pair_anchored(
+            let Ok(Some(sel)) = crate::gaps::select_pair_cycle(
                 a_pools,
                 b_pools,
                 &self.prices_a,
@@ -602,8 +667,26 @@ impl PairDirtyEvaluator {
                 continue;
             };
             outcome.evaluated.push(pair);
+            // Optimal row (existing behavior, unchanged math).
+            let Ok((input, output, profit)) = crate::gaps::price_optimal(&sel) else {
+                outcome.not_evaluated.push(pair);
+                continue;
+            };
+            let quote = crate::gaps::finish_pair_quote(&sel, input, output, profit);
 
             let classification = self.classify_anchor(anchor, &quote);
+            // Small-size probes: profit is concave in input, so only a
+            // passing optimal quote can have a smaller passing size. Price
+            // 1/64, 1/16, 1/4 of the clamped input and emit the smallest
+            // size still clearing the floor — the only rows a small float
+            // can execute.
+            let (quote, classification) = if self.prefer_small
+                && matches!(classification.reason, ClassificationReason::AboveThreshold)
+            {
+                self.smallest_passing_size(&sel, anchor, input, quote, classification)
+            } else {
+                (quote, classification)
+            };
             if matches!(classification.reason, ClassificationReason::AboveThreshold) {
                 outcome.interesting.push(pair);
             }
@@ -1351,14 +1434,14 @@ mod tests {
             token_a(),
             vec![
                 shadow::flash_loan::FlashLoanProvider::AaveV3,
-                shadow::flash_loan::FlashLoanProvider::BalancerV2,
+                shadow::flash_loan::FlashLoanProvider::MorphoFlash,
             ],
         );
         evaluator.set_flash_selection(shadow::flash_loan::FlashSelection::Auto(support));
         price_anchor(&mut evaluator);
         let pair = price_one_pair(&mut evaluator, key_a, key_b);
 
-        // Balancer is free: the quote still clears the gate exactly as with
+        // Morpho is free: the quote still clears the gate exactly as with
         // the legacy zero-fee assumption.
         let outcome = evaluator.run_once();
         assert_eq!(outcome.interesting.len(), 1);
@@ -1520,8 +1603,11 @@ mod tests {
             price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, 2),
         );
 
-        // Default `max_log2_skew` is 0.5 but the 2x fixture skew is ~1.0, so
-        // the same quote that clears the gate above is screened out here.
+        // The 2x fixture skew is ~1.0: pin the bound at the legacy 0.5 so
+        // the same quote that clears the gate below is screened out here.
+        // (The operational default is now 10.0 for full range; the mechanism
+        // under test is bound-vs-screen, not the default value.)
+        evaluator.set_max_log2_skew(0.5);
         let pair = crate::gaps::pair_key(token_a(), token_b());
         let (quote, classification) = evaluator.quote_pair(pair).expect("quote present");
         assert!(
@@ -1919,6 +2005,47 @@ mod tests {
             outcome.stale_screened[0].1.contains("leg spread"),
             "{:?}",
             outcome.stale_screened[0].1
+        );
+    }
+
+    #[test]
+    fn live_refetch_excluded_from_spread() {
+        // A live slot0-refreshed leg (block == u64::MAX) is a fresh read,
+        // not an aged price: paired with a normally-aged leg it must quote
+        // instead of self-screening on a ~u64::MAX leg spread.
+        let (a_pools, b_pools, key_a, key_b) = one_pair_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&a_pools, &b_pools, interesting_economics(), 100);
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(4.0);
+        evaluator.set_staleness_bounds(
+            DEFAULT_MAX_LEG_AGE_BLOCKS,
+            DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS,
+        );
+        evaluator.set_max_swap_age_blocks(u64::MAX);
+        let tip = 50_000u64;
+        evaluator.apply_swap(
+            *b"v3",
+            key_a,
+            price(
+                U256::from(1u64) << 97,
+                10_000_000_000_000_000_000_000,
+                u64::MAX,
+            ),
+        );
+        evaluator.apply_swap(
+            *b"v4",
+            key_b,
+            price(U256::from(1u64) << 98, 10_000_000_000_000_000_000_000, tip),
+        );
+        evaluator.set_tip(tip);
+        evaluator.mark_swept(*b"v3", &a_pools, tip);
+        evaluator.mark_swept(*b"v4", &b_pools, tip);
+        let pair = crate::gaps::pair_key(token_a(), token_b());
+        assert!(
+            evaluator.quote_pair(pair).is_some(),
+            "refetched leg must not widen the spread"
         );
     }
 

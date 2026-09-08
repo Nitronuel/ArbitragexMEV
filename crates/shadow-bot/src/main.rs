@@ -14,8 +14,8 @@ use domain::ShadowConfig;
 use enumerate::{CrawlPace, Venue, sweep_venue};
 use provider::{
     ChainReader, LiveHttp, LiveHttpProbe, LiveRpc, LiveWsClient, LogStream, ProviderBudget,
-    RedactedUrl, RetryPolicy, StreamItem, SubscriptionFilter, ThreadSleeper, TransportError,
-    WsProbe,
+    RawLogEnvelope, RedactedUrl, RetryPolicy, StreamItem, SubscriptionFilter, ThreadSleeper,
+    TransportError, WsProbe, v3_swap_topic, v4_swap_topic,
 };
 use shadow::RetentionPolicy;
 use shadow::{
@@ -28,6 +28,7 @@ use storage::Storage;
 mod dirty;
 mod enumerate;
 mod gaps;
+mod pool_lens;
 mod submit;
 mod ws_probe;
 
@@ -77,6 +78,33 @@ struct Cli {
     command: Command,
 }
 
+/// WebSocket event-lane options for `run-pairs --events ws`. Boxed at the
+/// `Command::RunPairs` site to keep the command enum under the
+/// large-variant lint.
+#[derive(Debug, clap::Args)]
+struct WsLaneArgs {
+    /// Event source: `http` (global/ring getLogs sweeps, default) or
+    /// `ws` (filtered Swap subscriptions feed the dirty set push-style;
+    /// the HTTP global sweep runs as supervisor every
+    /// `--ws-supervisor-secs` for coverage vouchers and
+    /// Mint/Burn invalidation).
+    #[arg(long, default_value = "http")]
+    events: String,
+    /// WebSocket endpoint override for `--events ws` (URL or
+    /// `env:VAR_NAME`); defaults to the Chainstack-first env chain.
+    #[arg(long)]
+    ws_url: Option<String>,
+    /// Per-tick WebSocket drain budget per subscription in ms (ws mode).
+    #[arg(long, default_value_t = 250)]
+    ws_drain_ms: u64,
+    /// HTTP supervisor sweep cadence in seconds (ws mode).
+    #[arg(long, default_value_t = 15)]
+    ws_supervisor_secs: u64,
+    /// Idle sleep in ms on ws ticks with nothing to evaluate.
+    #[arg(long, default_value_t = 250)]
+    ws_idle_ms: u64,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Preflights and (with --broadcast) submits one executor route.
@@ -84,7 +112,7 @@ enum Command {
         /// RPC endpoint (defaults to the RHC gateway).
         #[arg(long, default_value = "https://rpc.mainnet.chain.robinhood.com")]
         rpc: String,
-        /// Deployed `ExecutorV2` address.
+        /// Deployed executor address (ExecutorV2 `execute` entry).
         #[arg(long)]
         executor: String,
         /// Route JSON file (`token`, `amount_in`, `min_out`, `min_profit_wei`, `deadline`, `elements`).
@@ -103,7 +131,8 @@ enum Command {
         /// RPC endpoint (defaults to the RHC gateway).
         #[arg(long, default_value = "https://rpc.mainnet.chain.robinhood.com")]
         rpc: String,
-        /// Deployed `ExecutorV2` address.
+        /// Deployed executor address (ExecutorV3 float entries or
+        /// ExecutorV4Morpho flash entries, selected by --capital-source).
         #[arg(long)]
         executor: String,
         /// run-pairs CSV to tail (`--csv` output of a concurrent `run-pairs`).
@@ -115,6 +144,11 @@ enum Command {
         /// Use PM flash (borrow input via ExecutorV3) instead of funded-caller.
         #[arg(long, default_value_t = false)]
         flash: bool,
+        /// Where trade capital comes from: `morpho` (Morpho Blue flash loan —
+        /// no float, no minimum; any gas-covered wallet can trade) or `float`
+        /// (legacy owner-seeded executor balance, refused when short).
+        #[arg(long, default_value = "morpho")]
+        capital_source: String,
         /// Token price table (`token,usd_per_token`, 1e18-scaled USD).
         #[arg(long, default_value = "data/prices-seed.csv")]
         prices: PathBuf,
@@ -145,6 +179,16 @@ enum Command {
         /// Broadcast when every gate passes; without it, dry-run only.
         #[arg(long, default_value_t = false)]
         broadcast: bool,
+    },
+    /// Verifies Morpho Blue holds every `morpho`-labeled support token
+    /// (read-only, no key). Exits nonzero when nothing is flash-fundable.
+    VerifyBlue {
+        /// RPC endpoint (defaults to the RHC gateway).
+        #[arg(long, default_value = "https://rpc.mainnet.chain.robinhood.com")]
+        rpc: String,
+        /// Support CSV (`token,provider`) to check against Blue's holdings.
+        #[arg(long)]
+        support: PathBuf,
     },
     /// Validates the TOML configuration and RPC environment redaction.
     ValidateConfig {
@@ -205,6 +249,13 @@ enum Command {
         /// Bench sidecar poll interval in ms (0 = off).
         #[arg(long, default_value_t = 0)]
         bench_http_ms: u64,
+    },
+    /// Inspects one token: every known pool, live price/depth board, and a
+    /// spread matrix. Read-only; no transactions.
+    PoolLens {
+        /// Pool-lens options (boxed: keeps the command enum small).
+        #[command(flatten)]
+        lens: Box<pool_lens::PoolLensArgs>,
     },
     /// Runs the observation pipeline. Use `--manifest` for a bounded live run,
     /// otherwise an offline snapshot fixture.
@@ -605,7 +656,7 @@ enum Command {
         #[arg(long, default_value_t = 0.5)]
         max_skew: f64,
         /// Flash-loan source for gating costs: `none` (legacy zero-fee
-        /// assumption), a provider name (`balancer-v2`, `uniswap-v4`,
+        /// assumption), a provider name (`morpho`, `uniswap-v4`,
         /// `aave-v3`), or `auto` to pick the cheapest supporting provider per
         /// anchor token from `--flash-support`. In `auto` mode an anchor with
         /// no supporting provider is screened out instead of gated.
@@ -640,6 +691,9 @@ enum Command {
         /// refreshes stay exempt. 0 screens every swap-priced pool.
         #[arg(long, default_value_t = dirty::DEFAULT_MAX_SWAP_AGE_BLOCKS)]
         max_swap_age_blocks: u64,
+        /// WebSocket event-lane options (boxed: keeps the command enum small).
+        #[command(flatten)]
+        ws: Box<WsLaneArgs>,
     },
 }
 
@@ -669,6 +723,7 @@ fn main() {
             csv,
             overrides,
             flash,
+            capital_source,
             prices,
             win_rate_pct,
             native_usd,
@@ -697,7 +752,12 @@ fn main() {
                 poll_ms,
                 max_attempts,
                 broadcast,
+                &capital_source,
             ))
+        }
+        Command::VerifyBlue { rpc, support } => {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(submit::command::verify_blue_command(&rpc, &support))
         }
         Command::ValidateConfig { config } => validate_config(&config),
         Command::VerifyCatalog { manifest, config } => verify_catalog_command(manifest, config),
@@ -735,6 +795,7 @@ fn main() {
                 bench_http_ms,
             },
         ),
+        Command::PoolLens { lens } => pool_lens::run_pool_lens(&lens),
         Command::Run {
             config,
             snapshot,
@@ -768,7 +829,17 @@ fn main() {
             checkpoint,
             resume,
             out,
-        } => enumerate_pools_command(&venue, factory, from, to, window, delay_ms, &checkpoint, resume, &out),
+        } => enumerate_pools_command(
+            &venue,
+            factory,
+            from,
+            to,
+            window,
+            delay_ms,
+            &checkpoint,
+            resume,
+            &out,
+        ),
         Command::MeasureCrossVenues { a, b } => measure_cross_venues_command(&a, &b),
         Command::GapVsToll {
             a,
@@ -943,6 +1014,7 @@ fn main() {
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
             max_swap_age_blocks,
+            ws,
         } => run_pairs_command(&RunPairsArgs {
             a: &a,
             b: &b,
@@ -974,6 +1046,11 @@ fn main() {
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
             max_swap_age_blocks,
+            events: &ws.events,
+            ws_url: ws.ws_url.as_deref(),
+            ws_drain_ms: ws.ws_drain_ms,
+            ws_supervisor_secs: ws.ws_supervisor_secs,
+            ws_idle_ms: ws.ws_idle_ms,
         }),
     };
     if let Err(error) = outcome {
@@ -1031,9 +1108,9 @@ fn enumerate_pools_command(
     resume: bool,
     out: &std::path::Path,
 ) -> Result<(), String> {
-    use std::io::Write;
+    use serde_json::{Value, json};
     use std::fs;
-    use serde_json::{json, Value};
+    use std::io::Write;
 
     // Checkpoint key for this venue
     let checkpoint_key = match venue_name {
@@ -1054,11 +1131,17 @@ fn enumerate_pools_command(
 
     // Load checkpoint if resuming
     let (start_block, mut checkpoint_json) = if resume {
-        let content = fs::read_to_string(checkpoint_path)
-            .map_err(|e| format!("failed to read checkpoint {}: {}", checkpoint_path.display(), e))?;
+        let content = fs::read_to_string(checkpoint_path).map_err(|e| {
+            format!(
+                "failed to read checkpoint {}: {}",
+                checkpoint_path.display(),
+                e
+            )
+        })?;
         let json: Value = serde_json::from_str(&content)
             .map_err(|e| format!("invalid checkpoint JSON: {}", e))?;
-        let start = json.get(checkpoint_key)
+        let start = json
+            .get(checkpoint_key)
             .and_then(|v| v.as_u64())
             .ok_or_else(|| format!("checkpoint missing key {checkpoint_key}"))?;
         println!("resuming {venue_name} from checkpoint block {start}");
@@ -1134,7 +1217,9 @@ fn enumerate_pools_command(
                 fee,
                 ..
             } => {
-                format!("4663,{factory},{factory},{currency0},{currency1},{fee},1000000,v4,{id},v4\n")
+                format!(
+                    "4663,{factory},{factory},{currency0},{currency1},{fee},1000000,v4,{id},v4\n"
+                )
             }
         };
         writer
@@ -1154,7 +1239,10 @@ fn enumerate_pools_command(
         .map_err(|e| format!("failed to serialize checkpoint: {}", e))?;
     fs::write(checkpoint_path, updated)
         .map_err(|e| format!("failed to write checkpoint: {}", e))?;
-    println!("checkpoint updated: {} ({checkpoint_key}={head})", checkpoint_path.display());
+    println!(
+        "checkpoint updated: {} ({checkpoint_key}={head})",
+        checkpoint_path.display()
+    );
     Ok(())
 }
 
@@ -1338,7 +1426,9 @@ fn gap_vs_toll_command(args: &GapVsTollArgs<'_>) -> Result<(), String> {
     );
     for (label, profile) in [(profile_a, &profile_bytes_a), (profile_b, &profile_bytes_b)] {
         if profile != b"v3" && profile != b"v4" && profile != b"up" {
-            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
+            return Err(format!(
+                "unsupported venue {label:?}: expected v3, v4 or up"
+            ));
         }
     }
     let http_url: RedactedUrl = rpc
@@ -1477,7 +1567,9 @@ fn rank_activity_command(args: &RankActivityArgs<'_>) -> Result<(), String> {
         (args.profile_b, &profile_bytes_b),
     ] {
         if profile != b"v3" && profile != b"v4" && profile != b"up" {
-            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
+            return Err(format!(
+                "unsupported venue {label:?}: expected v3, v4 or up"
+            ));
         }
     }
     if args.from > args.to {
@@ -1810,7 +1902,9 @@ fn quote_manifest_command(args: &QuoteManifestArgs<'_>) -> Result<(), String> {
         .map_err(|_| format!("profile_b must be exactly 2 bytes, got {profile_b}"))?;
     for (label, profile) in [(profile_a, &profile_bytes_a), (profile_b, &profile_bytes_b)] {
         if profile != b"v3" && profile != b"v4" && profile != b"up" {
-            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
+            return Err(format!(
+                "unsupported venue {label:?}: expected v3, v4 or up"
+            ));
         }
     }
 
@@ -1986,7 +2080,9 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
         (args.profile_b, &profile_bytes_b),
     ] {
         if profile != b"v3" && profile != b"v4" && profile != b"up" {
-            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
+            return Err(format!(
+                "unsupported venue {label:?}: expected v3, v4 or up"
+            ));
         }
     }
 
@@ -2190,7 +2286,7 @@ fn build_flash_selection(
         }
         other => FlashLoanProvider::parse(other)
             .map(FlashSelection::Fixed)
-            .ok_or_else(|| format!("unknown --flash-provider {other:?} (expected none, auto, balancer-v2, uniswap-v4, aave-v3)")),
+            .ok_or_else(|| format!("unknown --flash-provider {other:?} (expected none, auto, morpho, uniswap-v4, aave-v3)")),
     }
 }
 
@@ -2242,6 +2338,17 @@ struct RunPairsArgs<'a> {
     request_cu_ceiling: u64,
     /// Per-poll cap on invalidated-price refreshes.
     max_price_refreshes: usize,
+    /// Event source: `http` (sweeps) or `ws` (push subscriptions +
+    /// HTTP supervisor).
+    events: &'a str,
+    /// WebSocket endpoint override for `--events ws` (URL or `env:VAR`).
+    ws_url: Option<&'a str>,
+    /// Per-tick WS drain budget per subscription in ms.
+    ws_drain_ms: u64,
+    /// HTTP supervisor sweep cadence in seconds (ws mode).
+    ws_supervisor_secs: u64,
+    /// Idle sleep in ms on ws ticks with nothing to evaluate.
+    ws_idle_ms: u64,
 }
 
 /// Polls Swap events from the chain tip and re-checks only the cross-venue
@@ -2254,6 +2361,12 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
 
     if args.window == 0 {
         return Err("--window must be at least 1 block".to_owned());
+    }
+    if args.events != "http" && args.events != "ws" {
+        return Err(format!(
+            "unknown --events {:?} (expected http or ws)",
+            args.events
+        ));
     }
     let a_path: &std::path::Path = args.a;
     let b_path: &std::path::Path = args.b;
@@ -2301,7 +2414,9 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         .map_err(|_| format!("profile_b must be exactly 2 bytes, got {profile_b}"))?;
     for (label, profile) in [(profile_a, &profile_bytes_a), (profile_b, &profile_bytes_b)] {
         if profile != b"v3" && profile != b"v4" && profile != b"up" {
-            return Err(format!("unsupported venue {label:?}: expected v3, v4 or up"));
+            return Err(format!(
+                "unsupported venue {label:?}: expected v3, v4 or up"
+            ));
         }
     }
 
@@ -2338,6 +2453,63 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             profile_bytes_a[1]
         ));
     }
+    // WS lane timing (http mode ignores these): push drains are frequent
+    // and cheap; the HTTP supervisor keeps coverage honest.
+    let ws_mode = args.events == "ws";
+    let drain_budget = Duration::from_millis(args.ws_drain_ms);
+    let supervisor_every = Duration::from_secs(args.ws_supervisor_secs.max(1));
+    let idle = Duration::from_millis(args.ws_idle_ms.max(50));
+    // WS event lane setup precedes the first network call so a missing
+    // endpoint fails fast offline: push subscriptions feed prices while the
+    // HTTP global sweep runs as supervisor for coverage vouchers and
+    // Mint/Burn invalidation. Connections open lazily on the first drain;
+    // `--events http` (default) never touches the socket.
+    let mut ws_lane: Option<WsLane> = if ws_mode {
+        let ws_endpoint = match args.ws_url {
+            Some(value) => value.strip_prefix("env:").map_or_else(
+                || Ok(value.to_owned()),
+                |var| std::env::var(var).map_err(|_| format!("missing {var}")),
+            )?,
+            None => resolve_env_url_chain(&[
+                "CHAINSTACK_RHC_WSS_URL",
+                "ROBINHOOD_WS_RPC_URL",
+                "ALCHEMY_RHC_WS_URL",
+            ])?,
+        };
+        let ws_url: RedactedUrl = ws_endpoint
+            .parse::<RedactedUrl>()
+            .map_err(|error| error.to_string())?;
+        let slots = build_ws_lane_slots(
+            profile_bytes_a,
+            &a_entries,
+            profile_bytes_b,
+            &b_entries,
+            pool_manager.unwrap_or(V4_POOL_MANAGER),
+        )?;
+        eprintln!(
+            "run-pairs: ws event lane: {} subscriptions, supervisor every {}s",
+            slots.len(),
+            args.ws_supervisor_secs,
+        );
+        Some(WsLane {
+            url: ws_url,
+            // Generous WS byte accounting: the push stream carries ~6 MB per
+            // 100 s at full V4 flow; the HTTP reader budget stays untouched.
+            stream: LogStream::new(ProviderBudget::new(args.request_cu_ceiling, 1 << 40)),
+            slots,
+            pending: Vec::new(),
+            last_covered_a: Vec::new(),
+            last_covered_b: Vec::new(),
+            last_supervisor: None,
+            http_tip: 0,
+            http_tip_at: None,
+            ws_max_block: 0,
+            ws_events: 0,
+            ws_drops: 0,
+        })
+    } else {
+        None
+    };
 
     let economics = Economics {
         flash_fee_rate: U256::ZERO,
@@ -2412,6 +2584,9 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut near_misses = 0usize;
     let mut provisionals = 0usize;
     let mut last_window = 0u64;
+    // Last evaluated (or heartbeat) poll-line emission: quiet WS ticks skip
+    // logging, so a dead-quiet market still feeds the cadence watchdog.
+    let mut last_poll_line: Option<Instant> = None;
     // Per-chunk high-water marks: chunk c is observed through water[c]. Each
     // poll sweeps the most-behind chunks and advances only their marks, so
     // ring-skipped chunks keep their position instead of silently losing the
@@ -2421,7 +2596,6 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut water_b =
         vec![start.saturating_sub(1); gaps::sweep_chunk_count(profile_bytes_b, &b_entries)];
     let v3_chunks_per_poll_eff = usize::try_from(args.v3_chunks_per_poll).unwrap_or(usize::MAX);
-
     loop {
         if stop.flag.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -2433,122 +2607,282 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             eprintln!("run-pairs: duration reached after {duration_secs}s");
             break;
         }
-        let latest = match reader.current_block() {
-            Ok(block) => block,
-            Err(TransportError::Transient(message)) => {
-                eprintln!("run-pairs: transient error reading latest block; retrying: {message}");
-                std::thread::sleep(poll);
-                continue;
+        // WS mode reads the HTTP tip at most every 5 s (plus every
+        // supervisor tick): tip polls cost ~0.2 RPS against the free
+        // budget, while every WS envelope already carries its block.
+        let latest = if let Some(lane) = ws_lane.as_mut() {
+            let now = Instant::now();
+            if lane
+                .http_tip_at
+                .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(5))
+            {
+                match reader.current_block() {
+                    Ok(block) => {
+                        lane.http_tip = block;
+                        lane.http_tip_at = Some(now);
+                    }
+                    Err(TransportError::Transient(message)) => {
+                        eprintln!(
+                            "run-pairs: transient error reading latest block; retrying: {message}"
+                        );
+                        std::thread::sleep(idle);
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
             }
-            Err(error) => return Err(error.to_string()),
+            lane.http_tip.max(lane.ws_max_block)
+        } else {
+            match reader.current_block() {
+                Ok(block) => block,
+                Err(TransportError::Transient(message)) => {
+                    eprintln!(
+                        "run-pairs: transient error reading latest block; retrying: {message}"
+                    );
+                    std::thread::sleep(poll);
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
         };
         // Sweep up to the confirmation-lagged tip: reorged-out logs are
         // never applied as canonical, and coverage is stamped at the lagged
         // block, not the raw tip.
         let to_eff = latest.saturating_sub(args.confirm_lag_blocks);
-        // Global topic-only sweep (Phase 4): 1 req/venue/poll, `window 10`, public `0 CU`.
+        let supervisor_tick = ws_lane.as_ref().is_some_and(|lane| {
+            lane.last_supervisor
+                .is_none_or(|at| at.elapsed() >= supervisor_every)
+        });
+        // WS fast path: drained push events seed this tick; coverage
+        // vouchers carry over from the last supervisor sweep. Supervisor
+        // ticks (and all HTTP-mode ticks) run the sweep below and refresh
+        // the vouchers. Quiet fast ticks skip evaluation entirely.
+        let mut ws_priced_a = HashMap::new();
+        let mut ws_priced_b = HashMap::new();
+        let mut ws_invalidated_a = Vec::new();
+        let mut ws_invalidated_b = Vec::new();
+        if let Some(lane) = ws_lane.as_mut() {
+            ws_drain_tick(
+                lane,
+                to_eff,
+                drain_budget,
+                &mut ws_priced_a,
+                &mut ws_priced_b,
+                &mut ws_invalidated_a,
+                &mut ws_invalidated_b,
+            );
+        }
         // When `--global` or `pool_cap==0` (unlimited) the full `~1M` universe is covered live
         // without address chunking; ring sweep remains for archival backfill.
-        let (priced_a, covered_a, sweep_a_invalidated, priced_b, covered_b, sweep_b_invalidated) =
-            if args.global {
-                // Window capped to 10 for public gateway `10-block`/`1-2 min` horizon.
-                let global_window = window.min(10).max(1);
-                let global_delay = delay.min(Duration::from_millis(100));
-                let from_a = water_a.first().copied().unwrap_or(start.saturating_sub(1)).saturating_add(1).max(start);
-                let from_b = water_b.first().copied().unwrap_or(start.saturating_sub(1)).saturating_add(1).max(start);
-                let outcome_a = match gaps::sweep_global_swaps(
-                    &reader,
-                    profile_bytes_a,
-                    pool_manager.unwrap_or(V4_POOL_MANAGER),
-                    &a_entries,
-                    from_a.min(to_eff),
-                    to_eff,
-                    global_window,
-                    global_delay,
-                ) {
-                    Ok(o) => o,
-                    Err(TransportError::Transient(msg)) => {
-                        eprintln!("run-pairs: transient error global sweep A; retrying: {msg}");
-                        std::thread::sleep(poll);
-                        continue;
+        let (
+            mut priced_a,
+            covered_a,
+            mut sweep_a_invalidated,
+            mut priced_b,
+            covered_b,
+            mut sweep_b_invalidated,
+        ) = if ws_mode && !supervisor_tick {
+            let lane = ws_lane.as_ref().expect("ws lane present in ws mode");
+            (
+                std::mem::take(&mut ws_priced_a),
+                lane.last_covered_a.clone(),
+                std::mem::take(&mut ws_invalidated_a),
+                std::mem::take(&mut ws_priced_b),
+                lane.last_covered_b.clone(),
+                std::mem::take(&mut ws_invalidated_b),
+            )
+        } else if args.global {
+            // Window capped to 10 for public gateway `10-block`/`1-2 min` horizon.
+            let global_window = window.min(10).max(1);
+            let global_delay = delay.min(Duration::from_millis(100));
+            let from_a = water_a
+                .first()
+                .copied()
+                .unwrap_or(start.saturating_sub(1))
+                .saturating_add(1)
+                .max(start);
+            let from_b = water_b
+                .first()
+                .copied()
+                .unwrap_or(start.saturating_sub(1))
+                .saturating_add(1)
+                .max(start);
+            // Catch-up cap: after an outage gap the water mark can sit
+            // thousands of blocks behind; sweeping the whole backlog in one
+            // poll bursts hundreds of requests and trips throttling into a
+            // retry storm that never advances (2026-09-07). Cover at most
+            // the cap behind the lagged tip per poll; older ranges are
+            // skipped and fail closed via the swap-age screen.
+            let catchup_floor = to_eff.saturating_sub(gaps::DEFAULT_GLOBAL_CATCHUP_BLOCKS);
+            let from_a = from_a.max(catchup_floor);
+            let from_b = from_b.max(catchup_floor);
+            let outcome_a = match gaps::sweep_global_swaps(
+                &reader,
+                profile_bytes_a,
+                pool_manager.unwrap_or(V4_POOL_MANAGER),
+                &a_entries,
+                from_a.min(to_eff),
+                to_eff,
+                global_window,
+                global_delay,
+            ) {
+                Ok(o) => o,
+                Err(error) if gaps::is_archive_walled(&error) => {
+                    eprintln!(
+                        "run-pairs: archive-walled sweep A (stale range); skipping to tip: {error}"
+                    );
+                    for w in water_a.iter_mut() {
+                        *w = to_eff;
                     }
-                    Err(e) => return Err(e.to_string()),
-                };
-                let outcome_b = match gaps::sweep_global_swaps(
-                    &reader,
-                    profile_bytes_b,
-                    pool_manager.unwrap_or(V4_POOL_MANAGER),
-                    &b_entries,
-                    from_b.min(to_eff),
-                    to_eff,
-                    global_window,
-                    global_delay,
-                ) {
-                    Ok(o) => o,
-                    Err(TransportError::Transient(msg)) => {
-                        eprintln!("run-pairs: transient error global sweep B; retrying: {msg}");
-                        std::thread::sleep(poll);
-                        continue;
-                    }
-                    Err(e) => return Err(e.to_string()),
-                };
-                // Advance single high-water (stored in water vec slot 0 for compat).
-                if !water_a.is_empty() { water_a[0] = to_eff; for w in water_a.iter_mut().skip(1) { *w = to_eff; } }
-                if !water_b.is_empty() { water_b[0] = to_eff; for w in water_b.iter_mut().skip(1) { *w = to_eff; } }
-                (outcome_a.prices, outcome_a.covered_keys, outcome_a.invalidated_keys, outcome_b.prices, outcome_b.covered_keys, outcome_b.invalidated_keys)
-            } else {
-                let sweep_a = match gaps::sweep_swap_prices_ring(
-                    &reader,
-                    profile_bytes_a,
-                    pool_manager.unwrap_or(V4_POOL_MANAGER),
-                    &a_entries,
-                    &mut water_a,
-                    start.saturating_sub(1),
-                    v3_chunks_per_poll_eff,
-                    to_eff,
-                    window,
-                    delay,
-                    gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(TransportError::Transient(message)) => {
-                        eprintln!("run-pairs: transient error sweeping venue A; retrying: {message}");
-                        std::thread::sleep(poll);
-                        continue;
-                    }
-                    Err(error) => return Err(error.to_string()),
-                };
-                let sweep_b = match gaps::sweep_swap_prices_ring(
-                    &reader,
-                    profile_bytes_b,
-                    pool_manager.unwrap_or(V4_POOL_MANAGER),
-                    &b_entries,
-                    &mut water_b,
-                    start.saturating_sub(1),
-                    v3_chunks_per_poll_eff,
-                    to_eff,
-                    window,
-                    delay,
-                    gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(TransportError::Transient(message)) => {
-                        eprintln!("run-pairs: transient error sweeping venue B; retrying: {message}");
-                        std::thread::sleep(poll);
-                        continue;
-                    }
-                    Err(error) => return Err(error.to_string()),
-                };
-                let pa = sweep_a.prices;
-                let ca = sweep_a.covered_keys;
-                let ia = sweep_a.invalidated_keys;
-                let pb = sweep_b.prices;
-                let cb = sweep_b.covered_keys;
-                let ib = sweep_b.invalidated_keys;
-                (pa, ca, ia, pb, cb, ib)
+                    gaps::RingSweepOutcome::default()
+                }
+                Err(TransportError::Transient(msg)) => {
+                    eprintln!("run-pairs: transient error global sweep A; retrying: {msg}");
+                    std::thread::sleep(poll);
+                    continue;
+                }
+                Err(e) => return Err(e.to_string()),
             };
-        let sweep_a = gaps::RingSweepOutcome { prices: priced_a.clone(), covered_keys: covered_a.clone(), invalidated_keys: sweep_a_invalidated.clone() };
-        let sweep_b = gaps::RingSweepOutcome { prices: priced_b.clone(), covered_keys: covered_b.clone(), invalidated_keys: sweep_b_invalidated.clone() };
+            let outcome_b = match gaps::sweep_global_swaps(
+                &reader,
+                profile_bytes_b,
+                pool_manager.unwrap_or(V4_POOL_MANAGER),
+                &b_entries,
+                from_b.min(to_eff),
+                to_eff,
+                global_window,
+                global_delay,
+            ) {
+                Ok(o) => o,
+                Err(error) if gaps::is_archive_walled(&error) => {
+                    eprintln!(
+                        "run-pairs: archive-walled sweep B (stale range); skipping to tip: {error}"
+                    );
+                    for w in water_b.iter_mut() {
+                        *w = to_eff;
+                    }
+                    gaps::RingSweepOutcome::default()
+                }
+                Err(TransportError::Transient(msg)) => {
+                    eprintln!("run-pairs: transient error global sweep B; retrying: {msg}");
+                    std::thread::sleep(poll);
+                    continue;
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            // Advance single high-water (stored in water vec slot 0 for compat).
+            if !water_a.is_empty() {
+                water_a[0] = to_eff;
+                for w in water_a.iter_mut().skip(1) {
+                    *w = to_eff;
+                }
+            }
+            if !water_b.is_empty() {
+                water_b[0] = to_eff;
+                for w in water_b.iter_mut().skip(1) {
+                    *w = to_eff;
+                }
+            }
+            (
+                outcome_a.prices,
+                outcome_a.covered_keys,
+                outcome_a.invalidated_keys,
+                outcome_b.prices,
+                outcome_b.covered_keys,
+                outcome_b.invalidated_keys,
+            )
+        } else {
+            let sweep_a = match gaps::sweep_swap_prices_ring(
+                &reader,
+                profile_bytes_a,
+                pool_manager.unwrap_or(V4_POOL_MANAGER),
+                &a_entries,
+                &mut water_a,
+                start.saturating_sub(1),
+                v3_chunks_per_poll_eff,
+                to_eff,
+                window,
+                delay,
+                gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
+            ) {
+                Ok(outcome) => outcome,
+                Err(TransportError::Transient(message)) => {
+                    eprintln!("run-pairs: transient error sweeping venue A; retrying: {message}");
+                    std::thread::sleep(poll);
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let sweep_b = match gaps::sweep_swap_prices_ring(
+                &reader,
+                profile_bytes_b,
+                pool_manager.unwrap_or(V4_POOL_MANAGER),
+                &b_entries,
+                &mut water_b,
+                start.saturating_sub(1),
+                v3_chunks_per_poll_eff,
+                to_eff,
+                window,
+                delay,
+                gaps::DEFAULT_MAX_CATCHUP_BLOCKS,
+            ) {
+                Ok(outcome) => outcome,
+                Err(TransportError::Transient(message)) => {
+                    eprintln!("run-pairs: transient error sweeping venue B; retrying: {message}");
+                    std::thread::sleep(poll);
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let pa = sweep_a.prices;
+            let ca = sweep_a.covered_keys;
+            let ia = sweep_a.invalidated_keys;
+            let pb = sweep_b.prices;
+            let cb = sweep_b.covered_keys;
+            let ib = sweep_b.invalidated_keys;
+            (pa, ca, ia, pb, cb, ib)
+        };
+        if ws_mode && supervisor_tick {
+            // Fresh coverage vouchers; WS-drained prices join the sweep
+            // results so nothing the stream saw this tick is lost.
+            if let Some(lane) = ws_lane.as_mut() {
+                lane.last_covered_a.clone_from(&covered_a);
+                lane.last_covered_b.clone_from(&covered_b);
+                lane.last_supervisor = Some(Instant::now());
+            }
+            priced_a.extend(std::mem::take(&mut ws_priced_a));
+            priced_b.extend(std::mem::take(&mut ws_priced_b));
+            sweep_a_invalidated.extend(std::mem::take(&mut ws_invalidated_a));
+            sweep_b_invalidated.extend(std::mem::take(&mut ws_invalidated_b));
+        }
+        if ws_mode
+            && !supervisor_tick
+            && priced_a.is_empty()
+            && priced_b.is_empty()
+            && sweep_a_invalidated.is_empty()
+            && sweep_b_invalidated.is_empty()
+        {
+            // Heartbeat for the cadence watchdog: quiet ticks print nothing,
+            // so emit a poll line at most every 60 s even with zero events.
+            if last_poll_line.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                println!(
+                    "run-pairs: poll tip={latest} swept_to={to_eff} priced a=0 b=0 evals=0 gated=0 sim_screened=0 triangles=0/0 stale_screened=0 dirty=0"
+                );
+                last_poll_line = Some(Instant::now());
+            }
+            std::thread::sleep(idle);
+            continue;
+        }
+        let sweep_a = gaps::RingSweepOutcome {
+            prices: priced_a.clone(),
+            covered_keys: covered_a.clone(),
+            invalidated_keys: sweep_a_invalidated.clone(),
+        };
+        let sweep_b = gaps::RingSweepOutcome {
+            prices: priced_b.clone(),
+            covered_keys: covered_b.clone(),
+            invalidated_keys: sweep_b_invalidated.clone(),
+        };
         let applied_this = priced_a.len() + priced_b.len();
         applied = applied.saturating_add(applied_this as u64);
         evaluator.invalidate_prices(profile_bytes_a, &sweep_a.invalidated_keys);
@@ -2561,12 +2895,14 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             &a_entries,
             &sweep_a.invalidated_keys,
             args.max_price_refreshes,
+            pool_manager.unwrap_or(V4_POOL_MANAGER),
         );
         let refreshed_b = gaps::refetch_invalidated_prices(
             &reader,
             &b_entries,
             &sweep_b.invalidated_keys,
             args.max_price_refreshes,
+            pool_manager.unwrap_or(V4_POOL_MANAGER),
         );
         evaluator.seed_prices(profile_bytes_a, &a_entries, &refreshed_a)?;
         evaluator.seed_prices(profile_bytes_b, &b_entries, &refreshed_b)?;
@@ -2804,6 +3140,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             }
         }
         last_window = to_eff;
+        last_poll_line = Some(Instant::now());
         println!(
             "run-pairs: poll tip={latest} swept_to={to_eff} priced a={} b={} evals={} gated={} sim_screened={} triangles={}/{} stale_screened={} dirty={}",
             priced_a.len(),
@@ -2816,7 +3153,40 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             outcome.stale_screened.len() + outcome.triangle_stale_screened.len(),
             outcome.not_evaluated.len(),
         );
-        std::thread::sleep(poll);
+        if let Some(lane) = ws_lane.as_ref() {
+            let reconnects: u64 = lane
+                .slots
+                .iter()
+                .map(|slot| slot.slot.stats.reconnects)
+                .sum();
+            let dupes: u64 = lane
+                .slots
+                .iter()
+                .map(|slot| slot.slot.stats.duplicates)
+                .sum();
+            let per_slot: Vec<String> = lane
+                .slots
+                .iter()
+                .map(|slot| {
+                    format!(
+                        "{}:e={}",
+                        if slot.for_a { "a" } else { "b" },
+                        slot.slot.stats.events
+                    )
+                })
+                .collect();
+            println!(
+                "run-pairs: ws events={} pending={} drops={} reconnects={} dupes={} supervisor={} slots=[{}]",
+                lane.ws_events,
+                lane.pending.len(),
+                lane.ws_drops,
+                reconnects,
+                dupes,
+                supervisor_tick,
+                per_slot.join(" "),
+            );
+        }
+        std::thread::sleep(if ws_mode { idle } else { poll });
     }
 
     let dirty_now = evaluator.queue_len();
@@ -2856,10 +3226,15 @@ fn code_and_detail(reason: &shadow::ClassificationReason) -> (String, String) {
     (code.to_owned(), quoted)
 }
 
-fn resolve_env_url(primary: &str, fallback: &str) -> Result<String, String> {
-    std::env::var(primary)
-        .or_else(|_| std::env::var(fallback))
-        .map_err(|_| format!("missing {primary} (or fallback {fallback})"))
+/// First-set-wins lookup over env var names (Chainstack-first ordering for
+/// the current provider lanes; never logs values, only names on failure).
+fn resolve_env_url_chain(names: &[&str]) -> Result<String, String> {
+    for name in names {
+        if let Ok(value) = std::env::var(name) {
+            return Ok(value);
+        }
+    }
+    Err(format!("missing {}", names.join(" (or ")))
 }
 
 /// One WebSocket subscription slot: the planned filter plus its live client,
@@ -2901,6 +3276,33 @@ impl WsProbeSlot {
     }
 
     /// Connects if needed, drains one bounded item, and returns the log
+    /// envelope when a new unique event arrived (deduplicated).
+    fn poll_envelope(
+        &mut self,
+        ws_url: &RedactedUrl,
+        stream: &LogStream,
+        timeout: Duration,
+    ) -> Option<RawLogEnvelope> {
+        self.ensure_connected(ws_url);
+        let client = self.client.as_ref()?;
+        match client.next(stream, timeout) {
+            Ok(Some(StreamItem::Log(envelope))) => {
+                if self.deduper.is_duplicate(&envelope) {
+                    self.stats.duplicates += 1;
+                    return None;
+                }
+                self.stats.events += 1;
+                Some(envelope)
+            }
+            Ok(Some(StreamItem::Disconnected(_))) | Err(_) => {
+                self.schedule_reconnect();
+                None
+            }
+            Ok(None) => None,
+        }
+    }
+
+    /// Connects if needed, drains one bounded item, and returns the log
     /// identity `(block, transaction_index, log_index)` when a new unique
     /// event was counted.
     fn poll(
@@ -2910,34 +3312,20 @@ impl WsProbeSlot {
         timeout: Duration,
         tip: u64,
     ) -> Option<(u64, u64, u64)> {
-        self.ensure_connected(ws_url);
-        let client = self.client.as_ref()?;
-        match client.next(stream, timeout) {
-            Ok(Some(StreamItem::Log(envelope))) => {
-                if self.deduper.is_duplicate(&envelope) {
-                    self.stats.duplicates += 1;
-                    return None;
-                }
-                // Signed: negative means WS delivery is ahead of our HTTP
-                // tip view (separate endpoints, separate views).
-                let lag = i64::try_from(tip)
-                    .ok()
-                    .map(|tip| tip - i64::try_from(envelope.block_number).unwrap_or(i64::MAX));
-                if let Some(lag) = lag {
-                    self.stats.observe_lag(lag);
-                }
-                Some((
-                    envelope.block_number,
-                    envelope.transaction_index,
-                    envelope.log_index,
-                ))
-            }
-            Ok(Some(StreamItem::Disconnected(_))) | Err(_) => {
-                self.schedule_reconnect();
-                None
-            }
-            Ok(None) => None,
+        let envelope = self.poll_envelope(ws_url, stream, timeout)?;
+        // Signed: negative means WS delivery is ahead of our HTTP
+        // tip view (separate endpoints, separate views).
+        let lag = i64::try_from(tip)
+            .ok()
+            .map(|tip| tip - i64::try_from(envelope.block_number).unwrap_or(i64::MAX));
+        if let Some(lag) = lag {
+            self.stats.observe_lag(lag);
         }
+        Some((
+            envelope.block_number,
+            envelope.transaction_index,
+            envelope.log_index,
+        ))
     }
 }
 
@@ -2949,11 +3337,194 @@ fn merged_probe_stats(slots: &[WsProbeSlot]) -> ws_probe::ProbeStats {
     window
 }
 
+/// One live subscription for the run-pairs `--events ws` lane.
+struct WsLaneSlot {
+    /// True when this slot feeds venue A prices (else venue B).
+    for_a: bool,
+    profile: [u8; 2],
+    keep_ids: Option<HashSet<[u8; 32]>>,
+    slot: WsProbeSlot,
+}
+
+/// Live state for the `--events ws` lane: push subscriptions plus the
+/// HTTP-supervisor bookkeeping (coverage vouchers, tip backstop).
+struct WsLane {
+    url: RedactedUrl,
+    stream: LogStream,
+    slots: Vec<WsLaneSlot>,
+    /// Envelopes newer than the confirmation-lagged tip, held with their
+    /// slot index until `to_eff` catches up (the stream never redelivers).
+    pending: Vec<(usize, RawLogEnvelope)>,
+    last_covered_a: Vec<([u8; 32], u64)>,
+    last_covered_b: Vec<([u8; 32], u64)>,
+    last_supervisor: Option<Instant>,
+    http_tip: u64,
+    http_tip_at: Option<Instant>,
+    ws_max_block: u64,
+    ws_events: u64,
+    ws_drops: u64,
+}
+
+/// Upper bound on held-back envelopes newer than the lagged tip; overflow
+/// drops oldest-first and counts `ws_drops` (should stay zero — at ~60/s
+/// flow and confirm lag 10 the buffer holds ~a second of events).
+const WS_MAX_PENDING: usize = 10_000;
+
+fn build_ws_lane_slots(
+    profile_a: [u8; 2],
+    entries_a: &[gaps::PoolEntry],
+    profile_b: [u8; 2],
+    entries_b: &[gaps::PoolEntry],
+    pool_manager: Address,
+) -> Result<Vec<WsLaneSlot>, String> {
+    let pairs = |entries: &[gaps::PoolEntry]| {
+        entries
+            .iter()
+            .map(|entry| (entry.venue, entry.id))
+            .collect::<Vec<_>>()
+    };
+    let plans = ws_probe::plan_lane_subscriptions(
+        profile_a,
+        &pairs(entries_a),
+        profile_b,
+        &pairs(entries_b),
+        pool_manager,
+    )?;
+    Ok(plans
+        .into_iter()
+        .map(|plan| {
+            let topic0 = if plan.profile == *b"v4" {
+                v4_swap_topic()
+            } else {
+                v3_swap_topic()
+            };
+            WsLaneSlot {
+                for_a: plan.for_a,
+                profile: plan.profile,
+                keep_ids: plan.keep_ids,
+                slot: WsProbeSlot {
+                    subscription: ws_probe::VenueSubscription {
+                        label: if plan.for_a {
+                            "ws-a".to_owned()
+                        } else {
+                            "ws-b".to_owned()
+                        },
+                        filter: SubscriptionFilter {
+                            addresses: plan.addresses,
+                            topic0,
+                        },
+                    },
+                    client: None,
+                    stats: ws_probe::ProbeStats::default(),
+                    deduper: ws_probe::LogDeduper::new(),
+                    attempts: 0,
+                    retry_at: None,
+                },
+            }
+        })
+        .collect())
+}
+
+fn ws_removed_key(profile: [u8; 2], envelope: &RawLogEnvelope) -> Option<[u8; 32]> {
+    if profile == *b"v4" {
+        envelope.topics.get(1).map(|topic| topic.0)
+    } else {
+        Some(envelope.address.into_word().into())
+    }
+}
+
+/// Drains every lane slot within `drain_budget`, buffering too-new
+/// envelopes and ingesting due ones into the per-side price maps.
+/// Reorg-removal envelopes become invalidations (the supervisor refetch
+/// restores the true price, matching sweep semantics).
+#[allow(clippy::too_many_arguments)]
+fn ws_drain_tick(
+    lane: &mut WsLane,
+    to_eff: u64,
+    drain_budget: Duration,
+    priced_a: &mut HashMap<[u8; 32], gaps::PoolPrice>,
+    priced_b: &mut HashMap<[u8; 32], gaps::PoolPrice>,
+    invalidated_a: &mut Vec<[u8; 32]>,
+    invalidated_b: &mut Vec<[u8; 32]>,
+) {
+    let deadline = Instant::now() + drain_budget;
+    let mut rounds = 0u32;
+    loop {
+        let mut progress = false;
+        for (index, lane_slot) in lane.slots.iter_mut().enumerate() {
+            if let Some(envelope) =
+                lane_slot
+                    .slot
+                    .poll_envelope(&lane.url, &lane.stream, Duration::from_millis(10))
+            {
+                progress = true;
+                lane.ws_events += 1;
+                lane.ws_max_block = lane.ws_max_block.max(envelope.block_number);
+                if envelope.removed {
+                    let key = ws_removed_key(lane_slot.profile, &envelope).filter(|key| {
+                        lane_slot
+                            .keep_ids
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(key))
+                    });
+                    if let Some(key) = key {
+                        if lane_slot.for_a {
+                            invalidated_a.push(key);
+                        } else {
+                            invalidated_b.push(key);
+                        }
+                    }
+                } else {
+                    lane.pending.push((index, envelope));
+                }
+            }
+        }
+        rounds += 1;
+        if !progress || Instant::now() >= deadline || rounds >= 50 {
+            break;
+        }
+    }
+    if lane.pending.len() > WS_MAX_PENDING {
+        let excess = lane.pending.len() - WS_MAX_PENDING;
+        lane.pending.drain(..excess);
+        lane.ws_drops += excess as u64;
+    }
+    let mut cursor = 0;
+    while cursor < lane.pending.len() {
+        if lane.pending[cursor].1.block_number <= to_eff {
+            let (index, envelope) = lane.pending.remove(cursor);
+            let lane_slot = &lane.slots[index];
+            let prices = if lane_slot.for_a {
+                &mut *priced_a
+            } else {
+                &mut *priced_b
+            };
+            gaps::ingest_envelope(
+                lane_slot.profile,
+                prices,
+                &envelope,
+                lane_slot.keep_ids.as_ref(),
+            );
+        } else {
+            cursor += 1;
+        }
+    }
+}
+
 fn resolve_probe_endpoints() -> Result<(RedactedUrl, RedactedUrl), String> {
     // Audit task 4.11 endpoint split: public RHC is the documented default;
     // Alchemy is the opt-in override for archive-heavy work.
-    let ws_endpoint = resolve_env_url("ROBINHOOD_WS_RPC_URL", "ALCHEMY_RHC_WS_URL")?;
-    let http_endpoint = resolve_env_url("ROBINHOOD_HTTP_RPC_URL", "ALCHEMY_RHC_HTTP_URL")?;
+    // Chainstack-first since the 2026-09-06 bake-off (17/17 vs public 5x429).
+    let ws_endpoint = resolve_env_url_chain(&[
+        "CHAINSTACK_RHC_WSS_URL",
+        "ROBINHOOD_WS_RPC_URL",
+        "ALCHEMY_RHC_WS_URL",
+    ])?;
+    let http_endpoint = resolve_env_url_chain(&[
+        "CHAINSTACK_RHC_HTTP_URL",
+        "ROBINHOOD_HTTP_RPC_URL",
+        "ALCHEMY_RHC_HTTP_URL",
+    ])?;
     let ws_url = ws_endpoint
         .parse::<RedactedUrl>()
         .map_err(|error| error.to_string())?;

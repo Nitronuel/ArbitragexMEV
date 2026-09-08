@@ -13,6 +13,14 @@ MAXGAP="${2:-90}"
 LOG="logs/live/run-pairs-hot.log"
 restart() {
   echo "$(date -u +%FT%TZ) watch-loop: $1, restarting hot loop" >> logs/live/watch-loop.log
+  if [[ -z "${CHAINSTACK_RHC_HTTP_URL:-}" ]]; then
+    # Non-interactive tmux panes skip the operator .bashrc exports (PS1
+    # guard), so restarts silently fell back to the public gateway and
+    # re-entered the throttle spiral (incident 2026-09-07). Load the
+    # exports so restarts stay on the Chainstack primary; values never
+    # leave this shell (label-only logging downstream).
+    PS1=x source ~/.bashrc 2>/dev/null || true
+  fi
   pkill -f "manifest-hot" 2>/dev/null || true
   sleep 3
   pkill -9 -f "manifest-hot" 2>/dev/null || true

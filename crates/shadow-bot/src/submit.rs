@@ -1,5 +1,6 @@
-//! Live submission: preflight, gas estimation, and broadcast of
-//! `ExecutorV2.execute(token, amount, routerData, minProfit)` on RHC (4663).
+//! Live submission: preflight, gas estimation, and broadcast of executor
+//! entries on RHC (4663) — `ExecutorV3` float (`executeFlash`/`executeHybrid`)
+//! and `ExecutorV4Morpho` flash (`executeMorphoFlash`/`executeMorphoHybrid`).
 //!
 //! Hard rules honored here:
 //! - The private key comes from the runtime environment only, never from a
@@ -17,7 +18,7 @@ use alloy_primitives::{Address, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{SolCall, sol};
+use alloy_sol_types::sol;
 
 use simulation::{RouteElement, encode_swap_calldata};
 
@@ -32,8 +33,13 @@ sol! {
         function executeFlash(address token, uint256 amount, bytes legsData, uint256 minProfit) external payable;
         function executeHybrid(address token, uint256 amount, bytes legsData, uint256 minProfit) external payable;
     }
-    /// Compact route leg for the router-based ExecutorV3 (mirrors
-    /// contracts/ExecutorV3.sol RouteLeg field-for-field).
+    #[sol(all_derives)]
+    interface IExecutorV4 {
+        function executeMorphoFlash(address token, uint256 amount, bytes legsData, uint256 minProfit) external;
+        function executeMorphoHybrid(address token, uint256 amount, bytes legsData, uint256 minProfit) external;
+    }
+    /// Compact route leg for the router-based `ExecutorV3` (mirrors
+    /// `contracts/ExecutorV3.sol` `RouteLeg` field-for-field).
     struct RouteLegSol {
         uint8 venue;
         address v3Pool;
@@ -50,6 +56,45 @@ sol! {
 
 /// The RHC chain id — hard gate (`domain::Chain::from_id` equivalent).
 pub const RHC_CHAIN_ID: u64 = 4663;
+
+/// Keyless ERC20 `balanceOf(holder)` (or native balance for `0x0`).
+///
+/// # Errors
+/// Fails on transport error or malformed return data.
+pub async fn erc20_balance_of(
+    provider: &RootProvider<Ethereum>,
+    token: Address,
+    holder: Address,
+) -> Result<U256, String> {
+    if token.is_zero() {
+        return provider
+            .get_balance(holder)
+            .await
+            .map_err(|e| format!("native balance read failed: {e}"));
+    }
+    // balanceOf(selector 0x70a08231)
+    let mut data = Vec::with_capacity(36);
+    data.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]);
+    data.extend_from_slice(&addr_word(holder));
+    let res = provider
+        .call(TransactionRequest::default().to(token).input(
+            alloy_rpc_types_eth::TransactionInput::new(Bytes::from(data)),
+        ))
+        .await
+        .map_err(|e| format!("balanceOf failed: {e}"))?;
+    Ok(U256::from_be_bytes::<32>(
+        res.as_ref()
+            .try_into()
+            .map_err(|_| "balanceOf returned odd data")?,
+    ))
+}
+
+/// Morpho Blue singleton on RHC — the flash lender (verified 2026-09-05:
+/// official Morpho addresses page + onchain `flashLoan` selector).
+pub const MORPHO_BLUE: Address = Address::new([
+    0x9D, 0x53, 0xd5, 0xE3, 0xbd, 0x5E, 0x8d, 0x4C, 0xbf, 0xa6, 0xDB, 0x1c, 0xa2, 0x38, 0xAE, 0xA0,
+    0x2E, 0x65, 0x10, 0x10,
+]);
 
 /// A parsed route submission request (from the `--route` JSON file or the
 /// `trade` bridge).
@@ -206,8 +251,16 @@ impl Submitter {
         Ok(gp)
     }
 
-    /// The executor must hold the input asset (`amount` plus gas headroom for
-    /// native input).
+    /// ERC20 `balanceOf(holder)` (or native balance for `0x0`) — one read,
+    /// never per quote.
+    ///
+    /// # Errors
+    /// Fails on transport error or malformed return data.
+    pub async fn token_balance_of(&self, token: Address, holder: Address) -> Result<U256, String> {
+        erc20_balance_of(&self.provider, token, holder).await
+    }
+
+    /// The executor must hold the input asset (float mode only).
     ///
     /// # Errors
     /// Fails on transport error or insufficient executor balance.
@@ -216,32 +269,10 @@ impl Submitter {
         token: Address,
         amount: U256,
     ) -> Result<U256, String> {
-        let bal = if token.is_zero() {
-            self.provider
-                .get_balance(self.executor)
-                .await
-                .map_err(|e| format!("executor balance read failed: {e}"))?
-        } else {
-            // balanceOf(selector 0x70a08231) — one read per submission, not per quote
-            let mut data = Vec::with_capacity(36);
-            data.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]);
-            data.extend_from_slice(&addr_word(self.executor));
-            let res = self
-                .provider
-                .call(TransactionRequest::default().to(token).input(
-                    alloy_rpc_types_eth::TransactionInput::new(Bytes::from(data)),
-                ))
-                .await
-                .map_err(|e| format!("balanceOf failed: {e}"))?;
-            U256::from_be_bytes::<32>(
-                res.as_ref()
-                    .try_into()
-                    .map_err(|_| "balanceOf returned odd data")?,
-            )
-        };
+        let bal = self.token_balance_of(token, self.executor).await?;
         if bal < amount {
             return Err(format!(
-                "executor {:#?} holds {bal} wei of {token:#?} < input {amount} — fund the executor first",
+                "executor {:#?} holds {bal} wei of {token:#?} < input {amount} (float mode) — seed the float or use --capital-source morpho",
                 self.executor
             ));
         }
@@ -333,124 +364,49 @@ impl Submitter {
         })
     }
 
-    /// Estimate `ExecutorV3.executeFlash`.
-    pub async fn estimate_flash(
+    /// Estimate any executor entry point (one estimate per submission).
+    ///
+    /// # Errors
+    /// Fails when the call would revert on-chain (minProfit, route, funding).
+    pub async fn estimate_entry(
         &self,
+        entry: trade::EntryPoint,
         token: Address,
         amount: U256,
         legs_data: &[u8],
         min_profit: U256,
     ) -> Result<u64, String> {
-        let call = IExecutorV3::executeFlashCall {
-            token,
-            amount,
-            legsData: Bytes::from(legs_data.to_vec()),
-            minProfit: min_profit,
-        };
         let tx = TransactionRequest::default()
             .from(self.wallet)
             .to(self.executor)
-            .input(alloy_rpc_types_eth::TransactionInput::new(Bytes::from(
-                call.abi_encode(),
-            )));
+            .input(alloy_rpc_types_eth::TransactionInput::new(
+                entry.encode(token, amount, legs_data, min_profit),
+            ));
         self.provider
             .estimate_gas(tx)
             .await
-            .map_err(|e| format!("flash execute would revert (estimate): {e}"))
+            .map_err(|e| format!("{} would revert (estimate): {e}", entry.describe()))
     }
 
-    /// Broadcast `ExecutorV3.executeFlash`.
-    pub async fn broadcast_flash(
+    /// Sign, broadcast, and wait for the receipt of any executor entry point.
+    ///
+    /// # Errors
+    /// Fails on signing, transport, or an on-chain revert.
+    pub async fn broadcast_entry(
         &self,
+        entry: trade::EntryPoint,
         token: Address,
         amount: U256,
         legs_data: &[u8],
         min_profit: U256,
         gas_estimate: u64,
     ) -> Result<BroadcastResult, String> {
-        let call = IExecutorV3::executeFlashCall {
-            token,
-            amount,
-            legsData: Bytes::from(legs_data.to_vec()),
-            minProfit: min_profit,
-        };
         let tx = TransactionRequest::default()
             .from(self.wallet)
             .to(self.executor)
-            .input(alloy_rpc_types_eth::TransactionInput::new(Bytes::from(
-                call.abi_encode(),
-            )))
-            .gas_limit(gas_estimate + gas_estimate / 4);
-        let wallet = EthereumWallet::new(self.signer.clone());
-        let provider = ProviderBuilder::new().wallet(wallet).connect_http(
-            self.rpc_url
-                .parse()
-                .map_err(|e| format!("bad rpc url: {e}"))?,
-        );
-        let pending = provider
-            .send_transaction(tx)
-            .await
-            .map_err(|e| format!("broadcast failed: {e}"))?;
-        let tx_hash = *pending.tx_hash();
-        let receipt = pending
-            .get_receipt()
-            .await
-            .map_err(|e| format!("receipt wait failed: {e}"))?;
-        Ok(BroadcastResult {
-            tx_hash,
-            status: u64::from(receipt.status()),
-            gas_used: receipt.gas_used,
-            effective_gas_price_gwei: receipt.effective_gas_price as f64 / 1e9,
-        })
-    }
-
-    /// Estimate `ExecutorV3.executeHybrid`.
-    pub async fn estimate_hybrid(
-        &self,
-        token: Address,
-        amount: U256,
-        legs_data: &[u8],
-        min_profit: U256,
-    ) -> Result<u64, String> {
-        let call = IExecutorV3::executeHybridCall {
-            token,
-            amount,
-            legsData: Bytes::from(legs_data.to_vec()),
-            minProfit: min_profit,
-        };
-        let tx = TransactionRequest::default()
-            .from(self.wallet)
-            .to(self.executor)
-            .input(alloy_rpc_types_eth::TransactionInput::new(Bytes::from(
-                call.abi_encode(),
-            )));
-        self.provider
-            .estimate_gas(tx)
-            .await
-            .map_err(|e| format!("hybrid execute would revert (estimate): {e}"))
-    }
-
-    /// Broadcast `ExecutorV3.executeHybrid`.
-    pub async fn broadcast_hybrid(
-        &self,
-        token: Address,
-        amount: U256,
-        legs_data: &[u8],
-        min_profit: U256,
-        gas_estimate: u64,
-    ) -> Result<BroadcastResult, String> {
-        let call = IExecutorV3::executeHybridCall {
-            token,
-            amount,
-            legsData: Bytes::from(legs_data.to_vec()),
-            minProfit: min_profit,
-        };
-        let tx = TransactionRequest::default()
-            .from(self.wallet)
-            .to(self.executor)
-            .input(alloy_rpc_types_eth::TransactionInput::new(Bytes::from(
-                call.abi_encode(),
-            )))
+            .input(alloy_rpc_types_eth::TransactionInput::new(
+                entry.encode(token, amount, legs_data, min_profit),
+            ))
             .gas_limit(gas_estimate + gas_estimate / 4);
         let wallet = EthereumWallet::new(self.signer.clone());
         let provider = ProviderBuilder::new().wallet(wallet).connect_http(
@@ -587,7 +543,9 @@ pub fn build_flash_legs_data(
     for leg in &row.legs {
         let (profile, _pool, pool_id, tin, tout, fee_raw) = trade::parse_leg(leg)?;
         if profile != "v4" {
-            return Err(format!("flash mode requires V4 legs; got {profile} pool {leg}"));
+            return Err(format!(
+                "flash mode requires V4 legs; got {profile} pool {leg}"
+            ));
         }
         let key = alloy_primitives::hex::encode(pool_id);
         let Some((tick, hooks)) = overrides.get(&key) else {
@@ -671,7 +629,9 @@ pub fn build_hybrid_legs_data(
 /// CLI glue for `submit-exec`.
 pub mod command {
     use super::{RouteRequest, Submitter};
-    use alloy_primitives::Address;
+    use alloy_network::Ethereum;
+    use alloy_primitives::{Address, U256};
+    use alloy_provider::{Provider, RootProvider};
     use std::path::Path;
 
     /// # Errors
@@ -752,9 +712,11 @@ pub mod command {
         poll_ms: u64,
         max_attempts: u64,
         broadcast: bool,
+        capital_source: &str,
     ) -> Result<(), String> {
         let key = std::env::var("ARBITRAGE_WALLET_PRIVATE_KEY")
             .map_err(|_| "ARBITRAGE_WALLET_PRIVATE_KEY not set in the environment".to_owned())?;
+        let capital_source = super::trade::parse_capital_source(capital_source)?;
         let executor: Address = executor
             .parse()
             .map_err(|e| format!("bad executor address: {e}"))?;
@@ -775,7 +737,7 @@ pub mod command {
             .len();
         tailer.skip_to(len);
         eprintln!(
-            "trade: wallet {:#?} executor {executor:#?} flash={flash} broadcast={broadcast} overrides={} tailing {}",
+            "trade: wallet {:#?} executor {executor:#?} flash={flash} capital={capital_source:?} broadcast={broadcast} overrides={} tailing {}",
             submitter.wallet,
             overrides.len(),
             csv.display()
@@ -824,6 +786,7 @@ pub mod command {
                     deadline_secs,
                     broadcast,
                     flash,
+                    capital_source,
                 )
                 .await
                 {
@@ -840,12 +803,84 @@ pub mod command {
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
         }
     }
+
+    /// `verify-blue` CLI glue: one-off read proving Morpho Blue holds every
+    /// `morpho`-labeled token in the support CSV (the per-trade flash
+    /// ceiling). Read-only; needs no key. Exits nonzero when zero tokens are
+    /// fundable — fail-closed, so a stale CSV can never look like coverage.
+    ///
+    /// # Errors
+    /// Transport/parse errors, a non-RHC chain, missing Blue code, or zero
+    /// fundable tokens.
+    pub async fn verify_blue_command(rpc: &str, support: &Path) -> Result<(), String> {
+        let provider = RootProvider::<Ethereum>::new_http(
+            rpc.parse().map_err(|e| format!("bad rpc url: {e}"))?,
+        );
+        let chain = provider
+            .get_chain_id()
+            .await
+            .map_err(|e| format!("chain-id read failed: {e}"))?;
+        if chain != super::RHC_CHAIN_ID {
+            return Err(format!(
+                "chain id {chain} != {} (RHC) — refusing",
+                super::RHC_CHAIN_ID
+            ));
+        }
+        let code = provider
+            .get_code_at(super::MORPHO_BLUE)
+            .await
+            .map_err(|e| format!("blue code read failed: {e}"))?;
+        if code.is_empty() {
+            return Err(format!(
+                "morpho blue {:#?} has no code on chain {chain} — flash lender absent",
+                super::MORPHO_BLUE
+            ));
+        }
+        eprintln!("verify-blue: blue code {} bytes", code.len());
+        let file =
+            std::fs::File::open(support).map_err(|e| format!("support file unreadable: {e}"))?;
+        let mut reader = csv::Reader::from_reader(file);
+        let mut total = 0u64;
+        let mut fundable = 0u64;
+        for record in reader.records() {
+            let record = record.map_err(|e| format!("support row unreadable: {e}"))?;
+            let raw_token: Address = record
+                .get(0)
+                .ok_or_else(|| "support row lacks token".to_owned())?
+                .parse()
+                .map_err(|_| "bad token in support row".to_owned())?;
+            // Same normalization as the gating path (audit A10).
+            let token = crate::gaps::normalize_currency(raw_token);
+            let label = record.get(1).unwrap_or("?");
+            // Blue cannot lend native: only the wrapped alias can be flashed.
+            let bal = if raw_token.is_zero() {
+                U256::ZERO
+            } else {
+                super::erc20_balance_of(&provider, token, super::MORPHO_BLUE).await?
+            };
+            total += 1;
+            if bal.is_zero() {
+                println!("verify-blue: {token:#?} label={label} blue_balance=0 EMPTY");
+            } else {
+                fundable += 1;
+                println!("verify-blue: {token:#?} label={label} blue_balance={bal} FUNDABLE");
+            }
+        }
+        if fundable == 0 {
+            return Err(format!(
+                "verify-blue: 0/{total} tokens fundable — no flash capital; refusing"
+            ));
+        }
+        println!("verify-blue: {fundable}/{total} tokens fundable");
+        Ok(())
+    }
 }
 
 /// The automated detect → gate → execute bridge.
 pub mod trade {
     use super::{RouteRequest, Submitter};
-    use alloy_primitives::{Address, U256};
+    use alloy_primitives::{Address, Bytes, U256};
+    use alloy_sol_types::SolCall;
     use simulation::RouteElement;
 
     use std::io::{Seek, SeekFrom};
@@ -1076,6 +1111,115 @@ pub mod trade {
         Ok(out)
     }
 
+    /// Where trade capital comes from.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CapitalSource {
+        /// Owner-seeded executor float (legacy). The executor must hold the
+        /// input before every attempt.
+        Float,
+        /// Morpho Blue flash loan (free, per-trade). No float needed — the
+        /// on-chain estimate remains the fail-closed guard.
+        Morpho,
+    }
+
+    /// Parses `--capital-source` (`float` | `morpho`).
+    ///
+    /// # Errors
+    /// Any other value (fail-closed at startup, never a silent default).
+    pub fn parse_capital_source(s: &str) -> Result<CapitalSource, String> {
+        match s {
+            "float" => Ok(CapitalSource::Float),
+            "morpho" => Ok(CapitalSource::Morpho),
+            other => Err(format!(
+                "unknown --capital-source {other:?} (expected float or morpho)"
+            )),
+        }
+    }
+
+    /// Executor entry point for one attempt. Float entries spend the
+    /// owner-seeded balance on `ExecutorV3`; Morpho entries borrow from Blue
+    /// on `ExecutorV4Morpho`. All four share `(token, amount, legsData,
+    /// minProfit)` and the identical `RouteLeg[]` encoding.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EntryPoint {
+        FloatFlash,
+        FloatHybrid,
+        MorphoFlash,
+        MorphoHybrid,
+    }
+
+    impl EntryPoint {
+        /// Picks the entry for a route: capital source × V3-leg presence.
+        #[must_use]
+        pub fn for_route(capital: CapitalSource, hybrid: bool) -> Self {
+            match (capital, hybrid) {
+                (CapitalSource::Float, false) => Self::FloatFlash,
+                (CapitalSource::Float, true) => Self::FloatHybrid,
+                (CapitalSource::Morpho, false) => Self::MorphoFlash,
+                (CapitalSource::Morpho, true) => Self::MorphoHybrid,
+            }
+        }
+
+        /// Short label for logs and estimate errors.
+        #[must_use]
+        pub fn describe(self) -> &'static str {
+            match self {
+                Self::FloatFlash => "float executeFlash",
+                Self::FloatHybrid => "float executeHybrid",
+                Self::MorphoFlash => "morpho executeMorphoFlash",
+                Self::MorphoHybrid => "morpho executeMorphoHybrid",
+            }
+        }
+
+        /// ABI-encodes the full entry call. The Morpho selectors must match
+        /// `contracts/ExecutorV4Morpho.sol` (pinned by
+        /// `morpho_entry_selectors` below and the forge cross-pin test).
+        #[must_use]
+        pub fn encode(
+            self,
+            token: Address,
+            amount: U256,
+            legs_data: &[u8],
+            min_profit: U256,
+        ) -> Bytes {
+            let legs_data = Bytes::from(legs_data.to_vec());
+            match self {
+                Self::FloatFlash => super::IExecutorV3::executeFlashCall {
+                    token,
+                    amount,
+                    legsData: legs_data,
+                    minProfit: min_profit,
+                }
+                .abi_encode()
+                .into(),
+                Self::FloatHybrid => super::IExecutorV3::executeHybridCall {
+                    token,
+                    amount,
+                    legsData: legs_data,
+                    minProfit: min_profit,
+                }
+                .abi_encode()
+                .into(),
+                Self::MorphoFlash => super::IExecutorV4::executeMorphoFlashCall {
+                    token,
+                    amount,
+                    legsData: legs_data,
+                    minProfit: min_profit,
+                }
+                .abi_encode()
+                .into(),
+                Self::MorphoHybrid => super::IExecutorV4::executeMorphoHybridCall {
+                    token,
+                    amount,
+                    legsData: legs_data,
+                    minProfit: min_profit,
+                }
+                .abi_encode()
+                .into(),
+            }
+        }
+    }
+
     /// One trade attempt summary.
     #[derive(Debug)]
     pub struct TradeOutcome {
@@ -1107,6 +1251,7 @@ pub mod trade {
         deadline_secs: u64,
         broadcast: bool,
         flash: bool,
+        capital_source: CapitalSource,
     ) -> Result<TradeOutcome, String> {
         if flash {
             // Settlement + continuity guards use the router convention:
@@ -1130,46 +1275,45 @@ pub mod trade {
                 "preflight (flash): gas price {:.4} gwei under cap",
                 gas_price_wei as f64 / 1e9
             );
-            // Funded model: the executor spends its seeded float (no PM
-            // flash). Refuse when the float cannot cover the input.
-            submitter.check_executor_funded(token, row.input).await?;
-            // Estimate with quoted minProfit to learn gas, then enforce floor
-            let mut est = if is_hybrid {
-                submitter
-                    .estimate_hybrid(token, row.input, &legs_data, min_profit)
-                    .await?
+            // Capital: Morpho Blue flash-funds the input per trade (no float,
+            // no minimum — any gas-covered wallet can trade). The legacy
+            // float mode still requires the seeded balance up front.
+            if capital_source == CapitalSource::Float {
+                submitter.check_executor_funded(token, row.input).await?;
             } else {
-                submitter
-                    .estimate_flash(token, row.input, &legs_data, min_profit)
-                    .await?
-            };
+                eprintln!("preflight (flash): morpho capital — float check skipped");
+            }
+            // Estimate with quoted minProfit to learn gas, then enforce floor
+            let entry = EntryPoint::for_route(capital_source, is_hybrid);
+            eprintln!("preflight (flash): entry {}", entry.describe());
+            let mut est = submitter
+                .estimate_entry(entry, token, row.input, &legs_data, min_profit)
+                .await?;
             eprintln!("preflight (flash): estimate {est} gas");
             // Gas floor (price table is keyed by matching-convention
             // addresses — look up the raw anchor, not the denormalized one).
+            // No price → refuse (fail-closed): an unpriced input must never
+            // bypass the gas_cost / win_rate floor.
             let token_usd = prices.get(&row.token_lo).copied();
-            if let Some(usd) = token_usd.filter(|u| !u.is_zero()) {
-                let native_usd_wei =
-                    U256::from(native_usd) * U256::from(1_000_000_000_000_000_000_u64);
-                let gas_cost_usd_wei = U256::from(est) * U256::from(gas_price_wei) * native_usd_wei
-                    / U256::from(1_000_000_000_000_000_000_u64);
-                let floor = gas_cost_usd_wei * U256::from(100_u64)
-                    / U256::from(win_rate_pct.max(1))
-                    * U256::from(1_000_000_000_000_000_000_u64)
-                    / usd;
-                if floor > min_profit {
-                    eprintln!("trade (flash): gas floor binds {min_profit} -> {floor}");
-                    min_profit = floor;
-                    est = if is_hybrid {
-                        submitter
-                            .estimate_hybrid(token, row.input, &legs_data, min_profit)
-                            .await?
-                    } else {
-                        submitter
-                            .estimate_flash(token, row.input, &legs_data, min_profit)
-                            .await?
-                    };
-                    eprintln!("preflight (flash): re-estimate {est} gas with floor");
-                }
+            let Some(usd) = token_usd.filter(|u| !u.is_zero()) else {
+                return Err(format!(
+                    "refusing: input token {:#?} has no USD price — cannot size the gas floor",
+                    row.token_lo
+                ));
+            };
+            let native_usd_wei = U256::from(native_usd) * U256::from(1_000_000_000_000_000_000_u64);
+            let gas_cost_usd_wei = U256::from(est) * U256::from(gas_price_wei) * native_usd_wei
+                / U256::from(1_000_000_000_000_000_000_u64);
+            let floor = gas_cost_usd_wei * U256::from(100_u64) / U256::from(win_rate_pct.max(1))
+                * U256::from(1_000_000_000_000_000_000_u64)
+                / usd;
+            if floor > min_profit {
+                eprintln!("trade (flash): gas floor binds {min_profit} -> {floor}");
+                min_profit = floor;
+                est = submitter
+                    .estimate_entry(entry, token, row.input, &legs_data, min_profit)
+                    .await?;
+                eprintln!("preflight (flash): re-estimate {est} gas with floor");
             }
             let need = U256::from(est.saturating_mul(2)) * U256::from(gas_price_wei);
             submitter.check_wallet_gas(need).await?;
@@ -1179,18 +1323,15 @@ pub mod trade {
                     detail: format!("gates passed (flash), estimate {est} gas (dry run)"),
                 });
             }
-            let result = if is_hybrid {
-                submitter
-                    .broadcast_hybrid(token, row.input, &legs_data, min_profit, est)
-                    .await?
-            } else {
-                submitter
-                    .broadcast_flash(token, row.input, &legs_data, min_profit, est)
-                    .await?
-            };
+            let result = submitter
+                .broadcast_entry(entry, token, row.input, &legs_data, min_profit, est)
+                .await?;
             return Ok(TradeOutcome {
                 dry_run: false,
-                detail: format!("TX {} status {} gas {}", result.tx_hash, result.status, result.gas_used),
+                detail: format!(
+                    "TX {} status {} gas {}",
+                    result.tx_hash, result.status, result.gas_used
+                ),
             });
         }
         let elements = build_elements(submitter.provider_ref(), row, overrides).await?;
@@ -1304,6 +1445,102 @@ mod override_key_tests {
     use super::trade::load_overrides;
 
     #[test]
+    fn parse_capital_source_accepts_float_and_morpho_only() {
+        use super::trade::{CapitalSource, parse_capital_source};
+        assert_eq!(parse_capital_source("morpho"), Ok(CapitalSource::Morpho));
+        assert_eq!(parse_capital_source("float"), Ok(CapitalSource::Float));
+        assert!(parse_capital_source("balancer-v2").is_err());
+        assert!(parse_capital_source("").is_err());
+        assert!(parse_capital_source("MORPHO").is_err());
+    }
+
+    #[test]
+    fn entry_point_routes_capital_times_venue() {
+        use super::trade::{CapitalSource, EntryPoint};
+        assert_eq!(
+            EntryPoint::for_route(CapitalSource::Float, false),
+            EntryPoint::FloatFlash
+        );
+        assert_eq!(
+            EntryPoint::for_route(CapitalSource::Float, true),
+            EntryPoint::FloatHybrid
+        );
+        assert_eq!(
+            EntryPoint::for_route(CapitalSource::Morpho, false),
+            EntryPoint::MorphoFlash
+        );
+        assert_eq!(
+            EntryPoint::for_route(CapitalSource::Morpho, true),
+            EntryPoint::MorphoHybrid
+        );
+    }
+
+    /// Full `executeMorphoHybrid` calldata for fixed addresses, for the forge
+    /// cross-pin test (`test_rust_morpho_calldata_executes`): prints
+    /// `MORPHOCALLDATA_HEX`. Regenerate via
+    /// `cargo test -p shadow-bot --bin shadow-bot morpho_cross_pin -- --nocapture`.
+    #[test]
+    fn morpho_cross_pin_emit_calldata() {
+        use super::RouteLegSol;
+        use super::trade::{CapitalSource, EntryPoint};
+        use alloy_primitives::{Address, U256};
+        use alloy_sol_types::SolValue;
+        let a: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let b: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let leg = |i: Address, o: Address| RouteLegSol {
+            venue: 1,
+            v3Pool: Address::ZERO,
+            inTok: i,
+            outTok: o,
+            zeroForOne: false,
+            sqrtPriceLimitX96: alloy_primitives::U160::ZERO,
+            fee: alloy_primitives::Uint::<24, 1>::from(0u32),
+            tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(200).unwrap(),
+            hooks: Address::ZERO,
+            hookData: alloy_primitives::Bytes::new(),
+        };
+        let legs = vec![leg(a, b), leg(b, a)];
+        let data = EntryPoint::for_route(CapitalSource::Morpho, true).encode(
+            a,
+            U256::from(1_000_000_000_000_000_000_u64),
+            &legs.abi_encode(),
+            U256::from(1_u64),
+        );
+        println!(
+            "MORPHOCALLDATA_HEX {}",
+            alloy_primitives::hex::encode(&data)
+        );
+        assert_eq!(&data[..4], &[0x68, 0xb9, 0xf9, 0x38]);
+    }
+    /// Values derived via `cast sig` from the canonical signatures; the forge
+    /// `test_entry_selectors_match_rust_submitter` test pins the other side.
+    #[test]
+    fn morpho_entry_selectors() {
+        use super::trade::{CapitalSource, EntryPoint};
+        use alloy_primitives::{Address, U256};
+        let token = Address::from([0x11u8; 20]);
+        let amount = U256::from(1_000_000_000_000_000_000_u64);
+        let min_profit = U256::from(2000_u64);
+        let legs = vec![0u8; 64];
+        let flash = EntryPoint::for_route(CapitalSource::Morpho, false)
+            .encode(token, amount, &legs, min_profit);
+        let hybrid = EntryPoint::for_route(CapitalSource::Morpho, true)
+            .encode(token, amount, &legs, min_profit);
+        assert_eq!(&flash[..4], &[0x5f, 0xea, 0x06, 0xfd]); // executeMorphoFlash
+        assert_eq!(&hybrid[..4], &[0x68, 0xb9, 0xf9, 0x38]); // executeMorphoHybrid
+        let float_flash = EntryPoint::for_route(CapitalSource::Float, false)
+            .encode(token, amount, &legs, min_profit);
+        let float_hybrid = EntryPoint::for_route(CapitalSource::Float, true)
+            .encode(token, amount, &legs, min_profit);
+        assert_eq!(&float_flash[..4], &[0xba, 0x93, 0x20, 0x9c]); // executeFlash
+        assert_eq!(&float_hybrid[..4], &[0x88, 0x89, 0x9c, 0x59]); // executeHybrid
+    }
+
+    #[test]
     fn load_overrides_normalizes_prefix_and_case() {
         let dir = std::env::temp_dir();
         let path = dir.join("test_v4_overrides_norm.csv");
@@ -1317,9 +1554,15 @@ mod override_key_tests {
         let map = load_overrides(&path).unwrap();
         // Keys normalize to bare-lowercase so hex::encode lookups
         // (which carry no 0x prefix) must hit.
-        assert!(map.contains_key("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"));
-        assert!(map.contains_key("1111111111111111111111111111111111111111111111111111111111111111"));
-        assert!(!map.contains_key("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"));
+        assert!(
+            map.contains_key("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+        );
+        assert!(
+            map.contains_key("1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert!(
+            !map.contains_key("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1328,12 +1571,18 @@ mod override_key_tests {
     #[test]
     fn route_legs_encode_router_convention() {
         use super::{build_flash_legs_data, trade::GatedRow};
-        use alloy_primitives::{Address, Signed, Uint, U256};
+        use alloy_primitives::{Address, Signed, U256, Uint};
         use alloy_sol_types::SolValue;
 
-        let wrapped: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73".parse().unwrap();
-        let token: Address = "0x020bfc650a365f8BB26819deAAbF3E21291018b4".parse().unwrap();
-        let hooks: Address = "0x37e194B1982f84e565387d28f4a7402b76b53acc".parse().unwrap();
+        let wrapped: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+            .parse()
+            .unwrap();
+        let token: Address = "0x020bfc650a365f8BB26819deAAbF3E21291018b4"
+            .parse()
+            .unwrap();
+        let hooks: Address = "0x37e194B1982f84e565387d28f4a7402b76b53acc"
+            .parse()
+            .unwrap();
         let pid = "084cee4d5edcd028175abb3a04bce5ce95b1ec2b432e6365a924c98deb78d886";
         let pm = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
         let row = GatedRow {
@@ -1350,8 +1599,7 @@ mod override_key_tests {
         let mut overrides = std::collections::HashMap::new();
         overrides.insert(pid.to_owned(), (60_i32, hooks));
         let bytes = build_flash_legs_data(&row, &overrides).unwrap();
-        let legs =
-            <Vec<super::RouteLegSol>>::abi_decode(&bytes).expect("round-trip RouteLeg[]");
+        let legs = <Vec<super::RouteLegSol>>::abi_decode(&bytes).expect("round-trip RouteLeg[]");
         assert_eq!(legs.len(), 2);
         // Directional, denormalized: the wrapped alias never appears on the wire.
         assert_eq!(legs[0].venue, 1);

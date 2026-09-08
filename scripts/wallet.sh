@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Wallet management for the RHC arbitrage bot.
 #
-# Flow model (ExecutorV2, funded-caller):
-#   OWNER WALLET (0x3219E15A...)  — holds the key + all gas + input capital.
-#     It is the only account that can call execute() (owner is immutable), so
-#     it IS the trading account. Native-input routes send msg.value per
-#     attempt — no idle capital sits in the executor.
-#   EXECUTOR (0x5d1Aa3f6...)     — routes trades, accumulates profit (native
-#     or ERC20 depending on the route's final asset).
+# Flow model (Morpho flash, gas-only — float retired 2026-09-05):
+#   OWNER WALLET (0x3219E15A...)  — holds the key + ALL funds as gas money.
+#     It is the only account that can call the executor (owner is immutable).
+#     Trade capital comes from Morpho Blue flash loans (free, per-trade), so
+#     the wallet needs only gas: any balance can trade, no float, no cap.
+#   EXECUTOR (0x727f41B647e9F0958dd539b0dFff4fc46A90A950, UUPS proxy live
+#     since 2026-09-06) — routes trades, accumulates profit (native or
+#     ERC20 per route's final asset). Retired V3 0xaAeBdb1001974506bfDB24Bc70D7A9b88f2ad09c.
 #
 # Money flow:
-#   owner --per-attempt msg.value--> router/PM --> profit lands in executor
-#   executor --rescue()--> owner          (sweep profits back)
+#   Morpho Blue --flash--> executor --legs--> profit lands in executor
+#   executor --rescue()--> owner          (sweep profits / retired float back)
 #   owner --sweep <addr>--> cold storage  (manual, explicit)
 #
 # Key handling: ARBITRAGE_WALLET_PRIVATE_KEY from the environment only; if
@@ -21,7 +22,7 @@ set -euo pipefail
 
 RPC_URL="https://rpc.mainnet.chain.robinhood.com"
 OWNER="0x3219E15A8d1e82368340dfB6697fE6a6B41d686D"
-EXECUTOR="0x5d1Aa3f67AC0Ee82FB46497deE85105C070AE93B"
+EXECUTOR="0x727f41B647e9F0958dd539b0dFff4fc46A90A950"
 NATIVE="0x0000000000000000000000000000000000000000"
 # Gas reserve (wei) the wallet will never spend below when sweeping:
 # ~3 rescue/fund ops at ~0.14 gwei * 100k gas each, rounded up.
@@ -58,19 +59,9 @@ case "$cmd" in
     fi
     ;;
 
-  fund-executor)
-    # Move native working capital owner -> executor (only needed for
-    # ERC20-input routes or if you want a buffer in the executor).
-    AMOUNT_WEI="$(cast to-wei "$2" 2>/dev/null || echo "$2")"
-    [[ -n "${ARBITRAGE_WALLET_PRIVATE_KEY:-}" ]] || { echo "FATAL: key not set" >&2; exit 1; }
-    echo "sending $AMOUNT_WEI wei owner -> executor..."
-    cast send "$EXECUTOR" --value "$AMOUNT_WEI" \
-      --rpc-url "$RPC_URL" --private-key "$ARBITRAGE_WALLET_PRIVATE_KEY" \
-      --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print("tx:", d.get("transactionHash"), "status:", d.get("status"))'
-    ;;
-
   rescue)
-    # Sweep profit from the executor back to the owner. Usage:
+    # Sweep profit (or retired float) from the executor back to the owner.
+    # Usage:
     #   wallet.sh rescue <token|native> [amount_wei]  (default: full balance)
     TOKEN="${2:-$NATIVE}"
     if [[ "$TOKEN" == "$NATIVE" ]]; then
@@ -111,7 +102,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "usage: wallet.sh {balance|fund-executor <amount_eth>|rescue [token] [amount_wei]|sweep <to> <amount_eth> <owner>}" >&2
+    echo "usage: wallet.sh {balance|rescue [token] [amount_wei]|sweep <to> <amount_eth> <owner>}" >&2
     exit 1
     ;;
 esac

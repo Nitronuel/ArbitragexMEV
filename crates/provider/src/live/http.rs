@@ -42,11 +42,18 @@ impl HttpBackend for LiveHttp {
             .send_bytes(body.as_bytes())
         {
             Ok(response) => response,
-            Err(UreqError::Status(code, _)) if code == 429 || code >= 500 => {
-                return Err(TransportError::Transient(format!("HTTP status {code}")));
-            }
-            Err(UreqError::Status(code, _)) => {
-                return Err(TransportError::Permanent(format!("HTTP status {code}")));
+            Err(UreqError::Status(code, response)) => {
+                // Capture the body: gateways explain 403s here (-32002
+                // archive-gating vs real throttling), and the code alone
+                // cannot tell them apart (incident 2026-09-07).
+                let detail: String = response
+                    .into_string()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                return Err(classify_http_status(code, &detail));
             }
             Err(UreqError::Transport(error)) => {
                 return Err(TransportError::Transient(error.to_string()));
@@ -80,6 +87,20 @@ impl HttpBackend for LiveHttp {
             result,
             response_bytes,
         })
+    }
+}
+
+/// Classifies an HTTP status from the transport: throttle-shaped codes
+/// (403/429/5xx) are transient — gateways shed load with all three (a 403
+/// killed the live loop and a parity soak 2026-09-07, then the same key
+/// served normally ~20 min later) — while other 4xx client errors stay
+/// permanent. The truncated response body rides along so callers can tell
+/// archive-gating (-32002) apart from throttling.
+fn classify_http_status(code: u16, detail: &str) -> TransportError {
+    if code == 403 || code == 429 || code >= 500 {
+        TransportError::Transient(format!("HTTP status {code}: {detail}"))
+    } else {
+        TransportError::Permanent(format!("HTTP status {code}: {detail}"))
     }
 }
 
@@ -126,8 +147,31 @@ fn is_transient_json_rpc_error(error: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_transient_json_rpc_error;
+    use super::{classify_http_status, is_transient_json_rpc_error};
+    use crate::TransportError;
     use serde_json::json;
+
+    #[test]
+    fn throttle_shaped_http_status_is_transient() {
+        // 2026-09-07: a 403 killed the live loop and a parity soak, then
+        // the same key served normally ~20 min later — gateways shed load
+        // with 403 as well as 429/5xx, so all three must retry.
+        for code in [403, 429, 500, 502, 503] {
+            assert!(
+                matches!(
+                    classify_http_status(code, "overloaded"),
+                    TransportError::Transient(_)
+                ),
+                "HTTP {code} must be transient"
+            );
+        }
+        for code in [400, 401, 404] {
+            assert!(
+                matches!(classify_http_status(code, ""), TransportError::Permanent(_)),
+                "HTTP {code} must stay permanent"
+            );
+        }
+    }
 
     #[test]
     fn provider_throttle_codes_and_messages_are_transient() {

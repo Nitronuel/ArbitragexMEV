@@ -76,13 +76,12 @@ pub enum CatalogError {
 /// The expected chain is derived from the candidates' own `chain_id`; the live
 /// RPC must report the same chain or the bootstrap aborts. Candidate-local
 /// failures are quarantined.
-///
+const VERIFY_MAX_POOLS: usize = 0; // 0 = unlimited (public global sweep covers ~1M)
+
 /// # Errors
 ///
 /// Returns a fatal error when the RPC reports a chain other than the catalog's
 /// chain or cannot serve the pinned block.
-const VERIFY_MAX_POOLS: usize = 0; // 0 = unlimited (public global sweep covers ~1M)
-
 pub fn verify_catalog<R: CatalogRpc>(
     candidates: Vec<CandidatePool>,
     factories: &[FactorySpec],

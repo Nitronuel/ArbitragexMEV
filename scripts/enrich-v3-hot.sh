@@ -13,10 +13,13 @@ tail -n +2 "$UNKNOWN" | while IFS=, read -r venue id swaps; do
   [[ $n -lt $MAXP ]] || break
   n=$((n + 1))
   # NOTE: cast annotates uint output ("10000 [1e4]") — keep the bare number.
-  t0="$(cast call "$id" "token0()(address)" --rpc-url "$RPC_URL")"
-  t1="$(cast call "$id" "token1()(address)" --rpc-url "$RPC_URL")"
+  # cast returns lowercase addresses; manifest requires EIP-55 checksum
+  # (strict parse_manifest rejects miscased rows — 234-row incident 2026-09-07).
+  id_ck="$(cast --to-checksum-address "$id")"
+  t0="$(cast --to-checksum-address "$(cast call "$id" "token0()(address)" --rpc-url "$RPC_URL")")"
+  t1="$(cast --to-checksum-address "$(cast call "$id" "token1()(address)" --rpc-url "$RPC_URL")")"
   fee="$(cast call "$id" "fee()(uint24)" --rpc-url "$RPC_URL" | cut -d' ' -f1)"
-  echo "4663,$id,$FACTORY,$t0,$t1,$fee,1000000,v3,,hot-enriched"
+  echo "4663,$id_ck,$FACTORY,$t0,$t1,$fee,1000000,v3,,hot-enriched"
   sleep 0.2
 done
 echo "enriched $n v3 pools" >&2

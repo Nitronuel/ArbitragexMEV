@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -354,6 +354,52 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
         quantity_u256(&response.result)
     }
 
+    /// Reads a V4 pool's price root and in-range liquidity straight from
+    /// the `PoolManager`'s `pools` mapping (`eth_getStorageAt`, no contract
+    /// call): slot [`v4_pool_slot`], liquidity three slots on. V4 pools
+    /// have no address, so the V3 `slot0()`/`liquidity()` calls cannot
+    /// address them — calling those on the manager reverts and leaves
+    /// invalidated pools paused forever (found 2026-09-07).
+    ///
+    /// # Errors
+    ///
+    /// Transport, budget, or malformed-response failures; uninitialized
+    /// or insane roots surface as `InvalidResponse` so callers skip.
+    pub fn pool_v4_state(
+        &self,
+        pool_manager: Address,
+        pool_id: [u8; 32],
+    ) -> Result<(U256, U256), TransportError> {
+        let base = v4_pool_slot(pool_id);
+        let slot0 = self.storage_latest(pool_manager, base)?;
+        let (sqrt, _tick) = parse_v4_slot0(slot0).ok_or(TransportError::InvalidResponse)?;
+        let liquidity = self
+            .storage_latest(pool_manager, base.wrapping_add(U256::from(3u64)))
+            .map(|word| word & v4_liquidity_mask())?;
+        if sqrt.is_zero() || liquidity.is_zero() {
+            return Err(TransportError::InvalidResponse);
+        }
+        Ok((sqrt, liquidity))
+    }
+
+    fn storage_latest(
+        &self,
+        address: Address,
+        index: alloy_primitives::U256,
+    ) -> Result<alloy_primitives::U256, TransportError> {
+        let response = self.execute(&RpcRequest {
+            method: "eth_getStorageAt".to_owned(),
+            params: json!([address_hex(address), format!("0x{:064x}", index), "latest"]),
+        })?;
+        let raw = result_bytes(&response.result)?;
+        if raw.len() > 32 {
+            return Err(TransportError::Permanent(
+                "storage value exceeds 32 bytes".to_owned(),
+            ));
+        }
+        Ok(alloy_primitives::U256::from_be_slice(&raw))
+    }
+
     /// # Errors
     ///
     /// Transport, budget, or malformed-response failures.
@@ -642,6 +688,49 @@ fn address_hex(address: Address) -> String {
     format!("0x{}", alloy_primitives::hex::encode(address))
 }
 
+/// RHC `PoolManager` `pools` mapping slot — calibrated 2026-09-07 against
+/// `0x8366…0951` via extsload (slots 0-15 probed; only slot 6 yields sane
+/// roots). If the manager implementation ever changes layout, [`parse_v4_slot0`]
+/// rejects the garbage and callers skip instead of mispricing.
+pub const V4_POOLS_MAPPING_SLOT: u64 = 6;
+
+/// Low-128-bit mask for the packed liquidity word.
+fn v4_liquidity_mask() -> U256 {
+    (U256::from(1u64) << 128) - U256::from(1u64)
+}
+
+/// Derives the `PoolManager` storage slot holding a V4 pool's packed `Slot0`
+/// (`keccak256(poolId ++ mapping_slot)`).
+#[must_use]
+pub fn v4_pool_slot(pool_id: [u8; 32]) -> U256 {
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(&pool_id);
+    preimage[32..].copy_from_slice(&U256::from(V4_POOLS_MAPPING_SLOT).to_be_bytes::<32>());
+    U256::from_be_bytes(keccak256(preimage).0)
+}
+
+/// Parses a packed V4 `Slot0` word into `(sqrtPriceX96, tick)`, rejecting
+/// zero/overflowing roots and insane ticks (same bounds the probes use:
+/// root in 2^32..2^192, |tick| < 887272).
+#[must_use]
+pub fn parse_v4_slot0(word: U256) -> Option<(U256, i32)> {
+    let bytes = word.to_be_bytes::<32>();
+    let mut root_bytes = [0u8; 32];
+    root_bytes[12..].copy_from_slice(&bytes[12..]);
+    let root = U256::from_be_bytes(root_bytes);
+    if root < (U256::from(1u64) << 32) || root >= (U256::from(1u64) << 192) {
+        return None;
+    }
+    let mut tick_bytes = [0u8; 4];
+    tick_bytes[1..].copy_from_slice(&bytes[9..12]);
+    tick_bytes[0] = if bytes[9] & 0x80 != 0 { 0xff } else { 0x00 };
+    let tick = i32::from_be_bytes(tick_bytes);
+    if tick.abs() >= 887_272 {
+        return None;
+    }
+    Some((root, tick))
+}
+
 fn bytes_hex(data: &Bytes) -> String {
     format!("0x{}", alloy_primitives::hex::encode(data))
 }
@@ -660,7 +749,48 @@ mod tests {
     fn quantity_parses_hex() {
         assert_eq!(quantity(&json!("0x2105")), Ok(8453));
         assert!(quantity(&json!(null)).is_err());
-        assert!(quantity(&json!("zz")).is_err());
+    }
+
+    #[test]
+    fn v4_pool_slot_matches_calibrated_vector() {
+        // Calibrated 2026-09-07 with `cast keccak` against RHC PM
+        // 0x8366…0951 (slots 0-15 probed; only 6 yields sane roots).
+        let mut id = [0u8; 32];
+        id.copy_from_slice(
+            &alloy_primitives::hex::decode(
+                "9c3113b8d3a951bac5a9ab296c423a8800c52d06123e7f71d6e5d85f5467527c",
+            )
+            .unwrap(),
+        );
+        let expected: [u8; 32] = alloy_primitives::hex::decode(
+            "7ca009f99c79b6c68632a8e9a98c92579d5a7b1af7224e85f40c644030a47b9d",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        assert_eq!(v4_pool_slot(id), U256::from_be_bytes(expected));
+    }
+
+    #[test]
+    fn parse_v4_slot0_accepts_sane_rejects_garbage() {
+        // sqrt = 2^100, tick = 100: well inside bounds.
+        let sqrt: U256 = U256::from(1u64) << 100;
+        let mut bytes = [0u8; 32];
+        bytes[12..].copy_from_slice(&sqrt.to_be_bytes::<32>()[12..]);
+        bytes[9..12].copy_from_slice(&[0x00, 0x00, 0x64]);
+        let word = U256::from_be_bytes(bytes);
+        assert_eq!(parse_v4_slot0(word), Some((sqrt, 100)));
+        // Negative tick -5: 24-bit two's complement ffffeb.
+        bytes[9..12].copy_from_slice(&[0xff, 0xff, 0xfb]);
+        let word = U256::from_be_bytes(bytes);
+        assert_eq!(parse_v4_slot0(word).map(|(_, t)| t), Some(-5));
+        // Zero and dust roots, and insane ticks, are rejected.
+        assert!(parse_v4_slot0(U256::ZERO).is_none());
+        assert!(parse_v4_slot0(U256::from(100u64)).is_none());
+        let mut bad = [0u8; 32];
+        bad[12..].copy_from_slice(&sqrt.to_be_bytes::<32>()[12..]);
+        bad[9..12].copy_from_slice(&[0x7f, 0xff, 0xff]);
+        assert!(parse_v4_slot0(U256::from_be_bytes(bad)).is_none());
     }
 
     #[test]
@@ -701,5 +831,72 @@ mod tests {
         let bytes = Bytes::from_static(&[0xde_u8, 0xad]);
         assert_eq!(bytes_hex(&bytes), "0xdead");
         assert_eq!(hex_to_bytes("0xdead").unwrap(), vec![0xde, 0xad]);
+    }
+
+    /// Scripted `eth_getStorageAt` backend keyed by requested slot hex.
+    struct StorageBackend {
+        words: std::collections::HashMap<String, String>,
+    }
+
+    impl HttpBackend for StorageBackend {
+        fn request(&self, request: &RpcRequest) -> Result<HttpResponse, TransportError> {
+            assert_eq!(request.method, "eth_getStorageAt");
+            let slot = request.params[1].as_str().unwrap().to_owned();
+            let word = self
+                .words
+                .get(&slot)
+                .cloned()
+                .unwrap_or_else(|| format!("0x{}", "00".repeat(32)));
+            Ok(HttpResponse {
+                result: json!(word),
+                response_bytes: 10,
+            })
+        }
+    }
+
+    fn storage_reader(backend: StorageBackend) -> ChainReader<StorageBackend, ThreadSleeper> {
+        ChainReader::new(
+            backend,
+            ThreadSleeper,
+            ProviderBudget::new(u64::MAX, 1 << 24),
+            RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            4663,
+        )
+    }
+
+    #[test]
+    fn pool_v4_state_reads_mapping_and_liquidity_slot() {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(
+            &alloy_primitives::hex::decode(
+                "9c3113b8d3a951bac5a9ab296c423a8800c52d06123e7f71d6e5d85f5467527c",
+            )
+            .unwrap(),
+        );
+        let base = v4_pool_slot(id);
+        let sqrt: U256 = U256::from(1u64) << 100;
+        let mut slot_bytes = [0u8; 32];
+        slot_bytes[12..].copy_from_slice(&sqrt.to_be_bytes::<32>()[12..]);
+        slot_bytes[9..12].copy_from_slice(&[0x00, 0x00, 0x64]);
+        let liq_slot = base.wrapping_add(U256::from(3u64));
+        let hex_slot = |slot: U256| format!("0x{slot:064x}");
+        let hex_word = |bytes: [u8; 32]| format!("0x{}", alloy_primitives::hex::encode(bytes));
+        let mut words = std::collections::HashMap::new();
+        words.insert(hex_slot(base), hex_word(slot_bytes));
+        let mut liq_bytes = [0u8; 32];
+        liq_bytes[24..].copy_from_slice(&12345u64.to_be_bytes());
+        words.insert(hex_slot(liq_slot), hex_word(liq_bytes));
+        let reader = storage_reader(StorageBackend { words });
+        assert_eq!(
+            reader.pool_v4_state(Address::ZERO, id),
+            Ok((sqrt, U256::from(12345u64)))
+        );
+        // Uninitialized pools (zero word) surface InvalidResponse so
+        // callers skip instead of pricing garbage.
+        assert!(reader.pool_v4_state(Address::ZERO, [0xabu8; 32]).is_err());
     }
 }

@@ -42,11 +42,22 @@ pub struct LiveWsClient {
 impl LiveWsClient {
     /// Connects and subscribes the given filter over WebSocket.
     ///
+    /// Installs the `ring` rustls crypto provider as the process default
+    /// before spawning the reader thread: the dependency tree carries both
+    /// `ring` and `aws-lc-rs`, so rustls cannot auto-determine a provider
+    /// and the handshake thread would panic (silent zero-event stream —
+    /// found 2026-09-07 when `ws-probe` delivered 0 events in 300 s).
+    /// First installation wins process-wide; a previously installed
+    /// provider is kept.
+    ///
     /// # Errors
     ///
     /// Returns an error when the reader thread cannot be started or the
     /// subscription is rejected by the endpoint.
     pub fn connect(endpoint: RedactedUrl, filter: SubscriptionFilter) -> Result<Self, StreamError> {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
         let (sender, receiver) = channel();
         thread::Builder::new()
             .name("base-ws".to_owned())

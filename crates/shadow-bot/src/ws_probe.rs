@@ -19,6 +19,59 @@ pub struct VenueSubscription {
     pub filter: SubscriptionFilter,
 }
 
+/// One planned subscription for the run-pairs `--events ws` lane: which
+/// side's prices it feeds, the venue profile, the subscribe address set,
+/// and (V4 only) the hot `PoolId` whitelist — the `PoolManager` stream is
+/// chain-wide, so unlisted ids must be dropped at ingest.
+#[derive(Debug, Clone)]
+pub struct LanePlan {
+    pub for_a: bool,
+    pub profile: [u8; 2],
+    pub addresses: Vec<Address>,
+    pub keep_ids: Option<std::collections::HashSet<[u8; 32]>>,
+}
+
+/// Plans lane subscriptions from run-pairs venue entries as
+/// `(pool venue, pool id)` pairs. Non-V4 profiles subscribe by pool
+/// address (the subscription itself is the whitelist); V4 subscribes the
+/// singleton `PoolManager` with a hot-id whitelist.
+///
+/// # Errors
+///
+/// Returns an error when a side has no subscribable address.
+pub fn plan_lane_subscriptions(
+    profile_a: [u8; 2],
+    venues_a: &[(Address, [u8; 32])],
+    profile_b: [u8; 2],
+    venues_b: &[(Address, [u8; 32])],
+    pool_manager: Address,
+) -> Result<Vec<LanePlan>, String> {
+    let mut plans = Vec::with_capacity(2);
+    for (for_a, profile, venues) in [(true, profile_a, venues_a), (false, profile_b, venues_b)] {
+        if profile == *b"v4" {
+            let keep_ids = venues.iter().map(|(_, id)| *id).collect();
+            plans.push(LanePlan {
+                for_a,
+                profile,
+                addresses: vec![pool_manager],
+                keep_ids: Some(keep_ids),
+            });
+        } else {
+            let addresses: Vec<Address> = venues.iter().map(|(venue, _)| *venue).collect();
+            if addresses.is_empty() {
+                return Err("lane needs at least one pool address".to_owned());
+            }
+            plans.push(LanePlan {
+                for_a,
+                profile,
+                addresses,
+                keep_ids: None,
+            });
+        }
+    }
+    Ok(plans)
+}
+
 /// Splits a pool manifest into one Swap-log subscription per venue profile.
 ///
 /// V3 pools subscribe by their own addresses; V4 pools share the singleton
@@ -353,6 +406,37 @@ mod tests {
         assert_eq!(subs[1].label, "v4-swap");
         assert_eq!(subs[1].filter.addresses.len(), 1);
         assert_eq!(subs[1].filter.topic0, v4_swap_topic());
+    }
+
+    #[test]
+    fn lane_plans_pair_address_sub_with_v4_whitelist() {
+        let v3a = V3_POOL_A.parse::<Address>().unwrap();
+        let pm = V4_SINGLETON.parse::<Address>().unwrap();
+        let plans = plan_lane_subscriptions(
+            *b"v3",
+            &[(v3a, [0u8; 32])],
+            *b"v4",
+            &[(pm, [7u8; 32]), (pm, [8u8; 32])],
+            pm,
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 2);
+        assert!(plans[0].for_a);
+        assert_eq!(plans[0].addresses, vec![v3a]);
+        assert!(plans[0].keep_ids.is_none());
+        assert!(!plans[1].for_a);
+        assert_eq!(plans[1].addresses, vec![pm]);
+        let keep = plans[1].keep_ids.as_ref().unwrap();
+        assert!(keep.contains(&[7u8; 32]) && keep.contains(&[8u8; 32]));
+    }
+
+    #[test]
+    fn lane_plan_rejects_empty_address_side() {
+        let pm = V4_SINGLETON.parse::<Address>().unwrap();
+        assert!(
+            plan_lane_subscriptions(*b"v3", &[], *b"v4", &[(pm, [7u8; 32])], pm).is_err(),
+            "empty v3 side must fail fast, not subscribe chain-wide"
+        );
     }
 
     #[test]
