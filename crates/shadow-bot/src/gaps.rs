@@ -19,6 +19,14 @@ pub const V4_DYNAMIC_FEE_FLAG: u32 = 0x0080_0000;
 /// (honeypots, "rejected" high-fee pools, or catalog noise), never viable round
 /// trips. `leg_toll` yields `None` for them so selection, ranking, and quoting
 /// all exclude the dead tail instead of paying its toll inside `margin`.
+/// V4 fee gate for the quoter and the manifest hooks screen: the maximum
+/// static toll a leg may carry and still be quoted (90%). Dynamic-fee
+/// sentinels (`0` / `0x800000`) bypass this screen and resolve through
+/// observed Swap fees instead; anything above the bound is refused, never
+/// averaged in. Rationale (Phase 3 of
+/// docs/plans/2026-09-09-v4-quoter-hook-hardening.md): an 89% toll still
+/// screens at economics (dust output → `BelowThreshold`), while 90%+ is
+/// predatory-by-construction and refused up front.
 pub const MAX_QUOTABLE_FEE: f64 = 0.9; // was 0.5 (50%) — lifted for full range (was filtering >50% fee honeypots, now 90%)
 
 /// The sqrtPriceX96 convention factor in [`price_out`]: raw wei price × K.
@@ -563,6 +571,59 @@ pub fn restrict_to_manifest(
         }
     }
     Ok((a, b))
+}
+
+/// Normalizes a pool-id hex string the way the overrides loader does:
+/// trims whitespace, strips one `0x`/`0X` prefix, lowercases.
+#[must_use]
+pub fn normalize_pool_id_hex(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_lowercase()
+}
+
+/// Loads a hook allow-list file (one pool_id per line, `0x` optional,
+/// `#` comments and `pool_id` headers skipped) into normalized ids.
+pub fn load_hook_allowlist(path: &Path) -> Result<std::collections::HashSet<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("allowlist unreadable: {e}"))?;
+    let mut out = std::collections::HashSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("pool_id") {
+            continue;
+        }
+        out.insert(normalize_pool_id_hex(line));
+    }
+    Ok(out)
+}
+
+/// Scans manifest V4 rows against overrides hooks (Phase 3 of
+/// docs/plans/2026-09-09-v4-quoter-hook-hardening.md): returns the pool
+/// ids (hex, `0x`-prefixed) whose hooks address is nonzero and which are
+/// NOT on the allow-list. Hook pricing needs hook logic — vanilla math on
+/// hook pools produces ghosts — so callers must refuse or loudly exempt
+/// these pools, never quote them silently.
+pub fn find_nonzero_hook_pools(
+    entries: &[PoolEntry],
+    overrides: &std::collections::HashMap<String, (i32, Address)>,
+    allowlist: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut flagged = Vec::new();
+    for entry in entries {
+        if entry.profile != *b"v4" {
+            continue;
+        }
+        let id_hex = alloy_primitives::hex::encode(entry.id);
+        let nonzero = overrides
+            .get(&id_hex)
+            .is_some_and(|(_, hooks)| *hooks != Address::ZERO);
+        if nonzero && !allowlist.contains(&id_hex) {
+            flagged.push(format!("0x{id_hex}"));
+        }
+    }
+    flagged.sort();
+    flagged
 }
 
 /// The canonical ordered pair for cross-venue matching: `(token0, token1)`
@@ -2755,6 +2816,76 @@ mod tests {
         assert_eq!(leg_toll(0, 1_000_000, *b"v4"), None);
         assert_eq!(leg_toll(V4_DYNAMIC_FEE_FLAG, 1_000_000, *b"v4"), None);
         assert_eq!(leg_toll(10_000, 1_000_000, *b"v4"), Some(0.01));
+    }
+
+    #[test]
+    fn fee_policy_boundaries_predatory_refused_sub_predatory_gated() {
+        // Phase 3 codification: 89% passes the screen (economics kills it:
+        // dust output → BelowThreshold) while 90%+ is refused up front.
+        assert_eq!(leg_toll(890_000, 1_000_000, *b"v4"), Some(0.89));
+        assert_eq!(leg_toll(900_000, 1_000_000, *b"v4"), Some(0.9));
+        assert_eq!(leg_toll(900_001, 1_000_000, *b"v4"), None);
+        assert_eq!(leg_toll(1_000_000, 1_000_000, *b"v4"), None);
+        assert_eq!(leg_toll(1_000_000, 1_000_000, *b"v3"), None);
+        // Standard tiers always quotable on both venues.
+        for fee in [100, 500, 3_000, 10_000] {
+            assert_eq!(leg_toll(fee, 1_000_000, *b"v4"), Some(f64::from(fee) / 1e6));
+            assert_eq!(leg_toll(fee, 1_000_000, *b"v3"), Some(f64::from(fee) / 1e6));
+        }
+    }
+
+    #[test]
+    fn hook_scan_flags_only_nonzero_non_allowlisted() {
+        use std::collections::{HashMap, HashSet};
+        let mut overrides = HashMap::new();
+        let hooked = [0xabu8; 32];
+        let clean = [0xcdu8; 32];
+        overrides.insert(
+            alloy_primitives::hex::encode(hooked),
+            (60, Address::repeat_byte(0x42)),
+        );
+        overrides.insert(alloy_primitives::hex::encode(clean), (60, Address::ZERO));
+        let entry =
+            |profile: [u8; 2], id: [u8; 32]| catalog_entry(profile, Address::repeat_byte(1), id);
+        let entries = vec![
+            entry(*b"v4", hooked),
+            entry(*b"v4", clean),
+            entry(*b"v4", [0xefu8; 32]),
+            entry(*b"v3", hooked),
+        ];
+        // Empty allow-list: only the hooked V4 pool flags.
+        let flagged = find_nonzero_hook_pools(&entries, &overrides, &HashSet::new());
+        assert_eq!(
+            flagged,
+            vec![format!("0x{}", alloy_primitives::hex::encode(hooked))]
+        );
+        // Allow-listed: nothing flags (missing overrides never flag).
+        let mut allowed = HashSet::new();
+        allowed.insert(alloy_primitives::hex::encode(hooked));
+        assert!(find_nonzero_hook_pools(&entries, &overrides, &allowed).is_empty());
+    }
+
+    #[test]
+    fn hook_allowlist_parsing_skips_noise() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("allow.csv");
+        let mut file = std::fs::File::create(&path).expect("create");
+        writeln!(file, "pool_id").expect("header");
+        writeln!(file, "# comment").expect("comment");
+        writeln!(file).expect("blank");
+        writeln!(file, "0xABCDEF").expect("prefixed");
+        writeln!(file, "123456").expect("bare");
+        drop(file);
+        let allowlist = load_hook_allowlist(&path).expect("parses");
+        assert!(allowlist.contains("abcdef"));
+        assert!(allowlist.contains("123456"));
+        assert_eq!(allowlist.len(), 2);
+        assert_eq!(
+            normalize_pool_id_hex("  0XAbC  "),
+            "abc",
+            "trims, strips, lowercases"
+        );
     }
 
     #[test]

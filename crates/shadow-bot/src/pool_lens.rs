@@ -68,6 +68,16 @@ pub struct PoolLensArgs {
     /// note (read-only; for the Phase-1 cross-check, no pricing change).
     #[arg(long, default_value_t = false)]
     pub cross_check_reads: bool,
+    /// Verify each priced V4 leg against the on-chain `V4Quoter`
+    /// (read-only `eth_call`s): prints `quoter:` comparison lines of
+    /// math-model output vs executable output at capacity fractions.
+    /// Needs `--overrides` for exact PoolKey fields. Default off.
+    #[arg(long, default_value_t = false)]
+    pub quoter: bool,
+    /// V4 overrides CSV (`pool_id,tick_spacing,hooks`) for exact quoter
+    /// PoolKeys. Required with `--quoter`.
+    #[arg(long)]
+    pub overrides: Option<PathBuf>,
 }
 
 /// One inspected pool row on the live board.
@@ -178,6 +188,9 @@ struct Candidate {
     venue: Address,
     id: Option<[u8; 32]>,
     fee: Option<u64>,
+    /// Raw catalog fee (V4 u24 incl. sentinels): the exact PoolKey fee for
+    /// quoter calls. Normalized `fee` above cannot reconstruct it.
+    fee_raw: Option<u32>,
     token0: Option<Address>,
     token1: Option<Address>,
 }
@@ -190,6 +203,10 @@ struct LensCtx {
     state_view: Address,
     v4_reads: gaps::V4Reads,
     cross_check_reads: bool,
+    /// Quoter verification (Phase 2): exact PoolKey components per pool.
+    quoter: bool,
+    quoter_addr: Address,
+    overrides: HashMap<String, (i32, Address)>,
     token: Address,
     token_decimals: u32,
     native_usd: f64,
@@ -269,6 +286,17 @@ fn resolve_lens(args: &PoolLensArgs) -> Result<LensCtx, String> {
         state_view: super::RHC_STATE_VIEW,
         v4_reads,
         cross_check_reads: args.cross_check_reads,
+        quoter: args.quoter,
+        quoter_addr: super::RHC_V4_QUOTER,
+        overrides: if args.quoter {
+            let path = args
+                .overrides
+                .as_ref()
+                .ok_or("--quoter needs --overrides (exact PoolKey tickSpacing/hooks)")?;
+            crate::submit::trade::load_overrides(path)?
+        } else {
+            HashMap::new()
+        },
         token,
         token_decimals: 18,
         native_usd: args
@@ -309,7 +337,159 @@ pub fn run_pool_lens(args: &PoolLensArgs) -> Result<(), String> {
     let rows = build_rows(&mut ctx, &pools, &v4_activity, &v3_activity);
     print_board(&rows, args.activity_window);
     print_spreads(&rows, args);
+    if ctx.quoter {
+        verify_quoter(&ctx, &pools, &rows);
+    }
     Ok(())
+}
+
+/// Constant-product leg output for an input on virtual reserves, net of the
+/// static toll: the independent model the quoter comparison checks.
+/// `r_in`/`r_out` are the directional virtual reserves.
+fn cp_output(r_in: f64, r_out: f64, dx: f64, toll: f64) -> Option<f64> {
+    if !r_in.is_finite() || !r_out.is_finite() || !dx.is_finite() {
+        return None;
+    }
+    if r_in <= 0.0 || r_out <= 0.0 || dx <= 0.0 {
+        return None;
+    }
+    if !(0.0..1.0).contains(&toll) {
+        return None;
+    }
+    Some(r_out * dx / (r_in + dx) * (1.0 - toll))
+}
+
+/// Phase-2 quoter verification (read-only): for every priced zero-hook V4
+/// row with an exact static fee, quotes both directions at 10/50/100% of
+/// single-tick capacity through the on-chain `V4Quoter` and prints
+/// `quoter:` comparison lines (math vs executable). Skips dynamic-fee,
+/// unknown-fee, hook, and over-u128 rows with counted reasons — never
+/// guesses a PoolKey.
+#[allow(clippy::too_many_lines)]
+fn verify_quoter(ctx: &LensCtx, pools: &[Candidate], rows: &[LensRow]) {
+    // (label, numerator, denominator): exact integer sizing, no float input.
+    const FRACTIONS: [(&str, u64, u64); 3] = [("0.1", 1, 10), ("0.5", 1, 2), ("1.0", 1, 1)];
+    let mut quoted = 0u64;
+    let mut skipped_fee = 0u64;
+    let mut skipped_hooks = 0u64;
+    let mut skipped_size = 0u64;
+    let mut skipped_state = 0u64;
+    let mut errored = 0u64;
+    // Chainstack free archive-gates `eth_call` at stale block numbers, so
+    // re-pin the tip every 20 pools; a minutes-old pinned tip 403s (-32002)
+    // and would masquerade as quoter failure. (Prod quoter calls in Phase 4
+    // must likewise use the latest poll block, never a pinned tip.)
+    let mut tip = ctx.tip;
+    let mut since_repin = 0u64;
+    for (candidate, row) in pools.iter().zip(rows.iter()) {
+        if candidate.profile != *b"v4" || !row.pair_known {
+            continue;
+        }
+        let Some(pool_id) = candidate.id else {
+            continue;
+        };
+        let (Some(sqrt), Some(liquidity)) = (row.sqrt, row.liquidity) else {
+            skipped_state += 1;
+            continue;
+        };
+        // Exact PoolKey only: static raw fee + overrides tickSpacing/hooks.
+        let fee_raw = match candidate.fee_raw {
+            Some(f) if f != 0 && f & gaps::V4_DYNAMIC_FEE_FLAG == 0 => f,
+            _ => {
+                skipped_fee += 1;
+                continue;
+            }
+        };
+        let id_hex = alloy_primitives::hex::encode(pool_id);
+        if since_repin >= 20 {
+            tip = ctx.reader.current_block().unwrap_or(tip);
+            since_repin = 0;
+        }
+        since_repin += 1;
+        let Some((tick_spacing, hooks)) = ctx.overrides.get(&id_hex) else {
+            skipped_fee += 1;
+            continue;
+        };
+        if *hooks != Address::ZERO {
+            skipped_hooks += 1;
+            continue;
+        }
+        let (c0, c1) = if row.token0.as_slice() < row.token1.as_slice() {
+            (row.token0, row.token1)
+        } else {
+            (row.token1, row.token0)
+        };
+        let (r0, r1) = gaps::virtual_reserves(sqrt, liquidity);
+        let (r0f, r1f) = (gaps::f64_of(r0), gaps::f64_of(r1));
+        let toll = f64::from(fee_raw) / 1_000_000.0;
+        for zero_for_one in [true, false] {
+            let cap = gaps::single_tick_capacity(sqrt, liquidity, *tick_spacing, zero_for_one);
+            if cap.is_zero() {
+                skipped_size += 1;
+                continue;
+            }
+            let (rin_f, rout_f) = if zero_for_one { (r0f, r1f) } else { (r1f, r0f) };
+            for (label, num, den) in FRACTIONS {
+                let dx = cap * U256::from(num) / U256::from(den.max(1));
+                if dx.is_zero() {
+                    skipped_size += 1;
+                    continue;
+                }
+                let Ok(dx_u128) = u128::try_from(dx) else {
+                    skipped_size += 1;
+                    continue;
+                };
+                let Some(math_out) = cp_output(rin_f, rout_f, gaps::f64_of(dx), toll) else {
+                    skipped_size += 1;
+                    continue;
+                };
+                match ctx.reader.quote_v4_exact_input(
+                    ctx.quoter_addr,
+                    c0,
+                    c1,
+                    fee_raw,
+                    *tick_spacing,
+                    *hooks,
+                    zero_for_one,
+                    dx_u128,
+                    tip,
+                ) {
+                    Ok((quoter_out, gas_est)) => {
+                        let qf = gaps::f64_of(quoter_out);
+                        let div = if math_out > 0.0 {
+                            1.0 - qf / math_out
+                        } else {
+                            f64::NAN
+                        };
+                        quoted += 1;
+                        println!(
+                            "quoter pool=0x{} dir={} frac={} cap_in={} math_out={:.0} quoter_out={} div={:.4} gas_est={}",
+                            &id_hex[..10],
+                            if zero_for_one { "zfo" } else { "ofz" },
+                            label,
+                            dx_u128,
+                            math_out,
+                            quoter_out,
+                            div,
+                            gas_est,
+                        );
+                    }
+                    Err(error) => {
+                        // Diagnostic surface: a revert here usually means the
+                        // manifest fee is stale (wrong PoolKey → uninitialized
+                        // pool) — one capped line per pool, not silence.
+                        let detail = format!("{error:?}");
+                        let short: String = detail.chars().take(120).collect();
+                        eprintln!("quoter pool=0x{} error: {short}", &id_hex[..10]);
+                        errored += 1;
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "quoter: quoted={quoted} skipped_fee={skipped_fee} skipped_hooks={skipped_hooks} skipped_size={skipped_size} skipped_state={skipped_state} errored={errored}"
+    );
 }
 
 /// Collects candidate pools from catalogs plus explicit `--v3`/`--v4`
@@ -366,6 +546,11 @@ fn collect_candidates(args: &PoolLensArgs, ctx: &LensCtx) -> Result<Vec<Candidat
                     None
                 },
                 fee,
+                fee_raw: if entry.profile == *b"v4" {
+                    Some(entry.fee)
+                } else {
+                    None
+                },
                 token0: Some(entry.token0),
                 token1: Some(entry.token1),
             });
@@ -404,6 +589,7 @@ fn collect_candidates(args: &PoolLensArgs, ctx: &LensCtx) -> Result<Vec<Candidat
             venue,
             id: None,
             fee: None,
+            fee_raw: None,
             token0,
             token1,
         });
@@ -417,6 +603,7 @@ fn collect_candidates(args: &PoolLensArgs, ctx: &LensCtx) -> Result<Vec<Candidat
             venue: pm,
             id: Some(id),
             fee: None,
+            fee_raw: None,
             token0: None,
             token1: None,
         });
@@ -772,6 +959,22 @@ mod tests {
         assert!((spread_fraction(1.0, 0.9) + 0.1).abs() < 1e-9);
         assert!(spread_fraction(0.0, 5.0).abs() < 1e-12);
         assert!(spread_fraction(-1.0, 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cp_output_matches_hand_computation() {
+        // r0=1000, r1=1000, dx=100, no toll: 1000*100/1100 = 90.909...
+        let out = cp_output(1000.0, 1000.0, 100.0, 0.0).expect("computes");
+        assert!((out - 90.909_090_909).abs() < 1e-6);
+        // 0.3% toll scales output down exactly.
+        let tolled = cp_output(1000.0, 1000.0, 100.0, 0.003).expect("computes");
+        assert!((tolled - out * 0.997).abs() < 1e-9);
+        // Degenerate inputs fail closed.
+        assert_eq!(cp_output(0.0, 1000.0, 100.0, 0.0), None);
+        assert_eq!(cp_output(1000.0, 0.0, 100.0, 0.0), None);
+        assert_eq!(cp_output(1000.0, 1000.0, 0.0, 0.0), None);
+        assert_eq!(cp_output(1000.0, 1000.0, 100.0, 1.0), None);
+        assert_eq!(cp_output(f64::INFINITY, 1000.0, 100.0, 0.0), None);
     }
 
     #[test]

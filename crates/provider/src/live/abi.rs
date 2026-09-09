@@ -88,6 +88,82 @@ pub fn decode_liquidity_view(result: &Bytes) -> Option<U256> {
     Some(liquidity)
 }
 
+/// Builds `V4Quoter.quoteExactInputSingle` calldata for one exact-input
+/// single-pool quote: `(PoolKey,bool,uint128,bytes)` as a single tuple
+/// (`PoolKey = (currency0,currency1,fee:uint24,tickSpacing:int24,hooks)`).
+/// `hookData` is always empty — hook pools must be refused by callers, not
+/// quoted with fabricated hook calldata. Returns `None` when `fee` exceeds
+/// `uint24` or `tick_spacing` exceeds `int24` (fail-closed encoding).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn quoter_exact_input_single(
+    currency0: Address,
+    currency1: Address,
+    fee: u32,
+    tick_spacing: i32,
+    hooks: Address,
+    zero_for_one: bool,
+    exact_amount: u128,
+) -> Option<Bytes> {
+    if fee > 0xFF_FFFF {
+        return None;
+    }
+    if tick_spacing < -8_388_608 || tick_spacing > 8_388_607 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(4 + 32 * 10);
+    out.extend_from_slice(&selector(
+        "quoteExactInputSingle(((address,address,uint24,int24,address),bool,uint128,bytes))",
+    ));
+    // Tuple offset word (params start right after it).
+    out.extend_from_slice(&[0u8; 31]);
+    out.push(0x20);
+    out.extend_from_slice(&[0u8; 12]);
+    out.extend_from_slice(&currency0[..]);
+    out.extend_from_slice(&[0u8; 12]);
+    out.extend_from_slice(&currency1[..]);
+    // uint24 fee, right-aligned.
+    let fee_bytes = fee.to_be_bytes();
+    out.extend_from_slice(&[0u8; 29]);
+    out.extend_from_slice(&fee_bytes[1..]);
+    // int24 tickSpacing, sign-extended.
+    let sign = if tick_spacing < 0 { 0xff_u8 } else { 0x00_u8 };
+    let ts_bytes = tick_spacing.to_be_bytes();
+    out.extend_from_slice(&[sign; 29]);
+    out.extend_from_slice(&ts_bytes[1..]);
+    // Hooks address.
+    out.extend_from_slice(&[0u8; 12]);
+    out.extend_from_slice(&hooks[..]);
+    // bool zeroForOne.
+    out.extend_from_slice(&[0u8; 31]);
+    out.push(u8::from(zero_for_one));
+    // uint128 exactAmount.
+    out.extend_from_slice(&[0u8; 16]);
+    out.extend_from_slice(&exact_amount.to_be_bytes());
+    // hookData offset word: points at its length word, 8 words into the
+    // tuple = 0x100. Length word follows, all zero (empty hookData).
+    let mut offset_word = [0u8; 32];
+    offset_word[30] = 0x01;
+    out.extend_from_slice(&offset_word);
+    out.extend_from_slice(&[0u8; 32]);
+    Some(Bytes::from(out))
+}
+
+/// Decodes `V4Quoter` quote results (`uint256` amount plus `uint256`
+/// gas estimate). A zero amount fails closed (nothing executable).
+#[must_use]
+pub fn decode_quoter_result(result: &Bytes) -> Option<(U256, U256)> {
+    if result.len() < 64 {
+        return None;
+    }
+    let amount = U256::try_from_be_slice(&result[..32])?;
+    let gas = U256::try_from_be_slice(&result[32..64])?;
+    if amount.is_zero() {
+        return None;
+    }
+    Some((amount, gas))
+}
+
 /// Decodes the trailing 20 bytes of a return payload as an address.
 #[must_use]
 pub fn decode_address(result: &Bytes) -> Option<Address> {
@@ -232,5 +308,61 @@ mod tests {
         );
         assert_eq!(decode_liquidity_view(&Bytes::from(vec![0u8; 32])), None);
         assert_eq!(decode_liquidity_view(&Bytes::from(vec![0u8; 31])), None);
+    }
+
+    #[test]
+    fn quoter_calldata_layout_is_canonical() {
+        let c0 = Address::with_last_byte(0x11);
+        let c1 = Address::with_last_byte(0x22);
+        let hooks = Address::ZERO;
+        let data =
+            quoter_exact_input_single(c0, c1, 3000, 60, hooks, true, 1_000_000).expect("encodes");
+        // 4-byte selector + 10 words (offset, 5 key, bool, uint128, offset, len).
+        assert_eq!(data.len(), 4 + 32 * 10);
+        let b = data.as_ref();
+        // Pinned against the live RHC V4Quoter (verified 2026-09-09 via
+        // `cast sig` + `eth_call`: 0xaa9d21cb returns (amountOut, gas)).
+        // Catches signature-string typos that stay internally consistent.
+        assert_eq!(&b[..4], &[0xaa, 0x9d, 0x21, 0xcb]);
+        // Word 0: tuple offset = 0x20.
+        assert_eq!(b[35], 0x20);
+        assert!(b[4..35].iter().all(|byte| *byte == 0));
+        // Words 1-2: currency0 / currency1, right-aligned.
+        assert_eq!(&b[48..68], c0.as_slice());
+        assert_eq!(&b[80..100], c1.as_slice());
+        // Word 3: uint24 fee = 3000, right-aligned.
+        assert_eq!(u32::from_be_bytes([b[128], b[129], b[130], b[131]]), 3000);
+        // Word 4: int24 tickSpacing = 60, right-aligned.
+        assert_eq!(i32::from_be_bytes([b[160], b[161], b[162], b[163]]), 60);
+        // Word 5: hooks, right-aligned.
+        assert_eq!(&b[176..196], hooks.as_slice());
+        // Word 6: bool zeroForOne = 1.
+        assert_eq!(b[227], 1);
+        // Word 7: uint128 exactAmount.
+        assert_eq!(
+            u128::from_be_bytes(b[244..260].try_into().expect("16 bytes")),
+            1_000_000
+        );
+        // Word 8: hookData offset = 0x100; word 9: empty length.
+        assert_eq!(u32::from_be_bytes([b[288], b[289], b[290], b[291]]), 0x100);
+        assert!(b[292..324].iter().all(|byte| *byte == 0));
+        // Out-of-range fee / tickSpacing refuse instead of misencoding.
+        assert!(quoter_exact_input_single(c0, c1, 0x100_0000, 60, hooks, true, 1).is_none());
+        assert!(quoter_exact_input_single(c0, c1, 3000, 8_388_608, hooks, true, 1).is_none());
+        assert!(quoter_exact_input_single(c0, c1, 3000, -8_388_609, hooks, true, 1).is_none());
+    }
+
+    #[test]
+    fn decodes_quoter_result_pair() {
+        let mut payload = vec![0u8; 64];
+        payload[24..32].copy_from_slice(&999u64.to_be_bytes());
+        payload[56..64].copy_from_slice(&21000u64.to_be_bytes());
+        assert_eq!(
+            decode_quoter_result(&Bytes::from(payload)),
+            Some((U256::from(999u64), U256::from(21000u64)))
+        );
+        // Zero amount or short payload fails closed.
+        assert_eq!(decode_quoter_result(&Bytes::from(vec![0u8; 64])), None);
+        assert_eq!(decode_quoter_result(&Bytes::from(vec![0u8; 63])), None);
     }
 }

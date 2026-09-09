@@ -101,6 +101,10 @@ def main():
     ap.add_argument("--top-v3", type=int, default=1000)
     ap.add_argument("--out", default="data/manifest-hot.csv")
     ap.add_argument("--unknown", default="data/hot-unknown.csv")
+    ap.add_argument("--overrides", default="data/v4-overrides.csv",
+                    help="tickSpacing/hooks per pool_id for the hooks gate")
+    ap.add_argument("--hook-allowlist", default="data/hook-allowlist.csv",
+                    help="pool_ids (one per line, 0x optional) exempt from the hooks gate")
     a = ap.parse_args()
 
     tip = int(rpc("eth_blockNumber", []), 16)
@@ -134,6 +138,42 @@ def main():
             unknown.append({"venue": "v3", "id": addr, "swaps": n})
     print(f"hot known: {len(known)}  hot unknown (need enrich): {len(unknown)}",
           flush=True)
+    # Phase-3 hooks gate: V4 rows with nonzero-hook overrides are refused
+    # unless explicitly allow-listed (hook pricing needs hook logic;
+    # vanilla math on hook pools produces ghosts).
+    allowed = set()
+    try:
+        with open(a.hook_allowlist, newline="") as f:
+            for line in f:
+                line = line.strip().lower()
+                if not line or line.startswith("pool_id") or line.startswith("#"):
+                    continue
+                allowed.add(line.removeprefix("0x"))
+    except FileNotFoundError:
+        pass
+    overrides = {}
+    try:
+        with open(a.overrides, newline="") as f:
+            for row in csv.DictReader(f):
+                pid = (row.get("pool_id") or "").strip().lower().removeprefix("0x")
+                hooks = (row.get("hooks") or "").strip().lower()
+                if pid:
+                    overrides[pid] = hooks
+    except FileNotFoundError:
+        print("hooks gate: no overrides file, gate skipped", flush=True)
+    kept, hook_skipped = [], 0
+    for r in known:
+        if (r.get("profile") or "").strip() == "v4":
+            pid = (r.get("pool_id") or "").strip().lower().removeprefix("0x")
+            hooks = overrides.get(pid, "")
+            nonzero = hooks not in ("", "0x" + "0" * 40, "0" * 40)
+            if nonzero and pid not in allowed:
+                hook_skipped += 1
+                continue
+        kept.append(r)
+    known = kept
+    print(f"hooks gate: kept={len(known)} skipped_nonzero_hook={hook_skipped} "
+          f"allowlisted={len(allowed)}", flush=True)
     unk_swaps = sum(u["swaps"] for u in unknown)
     tot_swaps = sum(v4.values()) + sum(v3c.values())
     print(f"unknown share of flow: {unk_swaps}/{tot_swaps} "

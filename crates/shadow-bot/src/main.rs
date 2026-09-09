@@ -54,6 +54,13 @@ const V4_POOL_MANAGER: Address =
 /// official deployments page); cross-checked against extsload before use.
 const RHC_STATE_VIEW: Address =
     alloy_primitives::address!("0xf3334192d15450cdd385c8b70e03f9a6bd9e673b");
+const RHC_V4_QUOTER: Address =
+    alloy_primitives::address!("0x8dc178efb8111bb0973dd9d722ebeff267c98f94");
+
+/// Uniswap V4 `V4Quoter` lens on RHC (Phase 2): executable exact-input
+/// single-pool quotes. Verified deployed (6,118 bytes live, official
+/// deployments page); calldata pinned against a live `eth_call`
+/// (`0xaa9d21cb` returns `(amountOut, gasEstimate)`).
 
 /// An `AtomicBool` stop flag raised by SIGINT/SIGTERM for graceful drain.
 struct StopOnSignal {
@@ -692,6 +699,15 @@ enum Command {
         /// `--flash-provider auto`.
         #[arg(long)]
         flash_support: Option<PathBuf>,
+        /// V4 overrides CSV (`pool_id,tick_spacing,hooks`) backing the
+        /// Phase-3 hooks preflight (and the quoter PoolKeys).
+        #[arg(long)]
+        overrides: Option<PathBuf>,
+        /// Hook allow-list CSV (one pool_id per line): V4 pools with
+        /// nonzero hooks that may stay in the manifest anyway. Empty =
+        /// refuse all hook pools from fresh manifests.
+        #[arg(long)]
+        hook_allowlist: Option<PathBuf>,
         /// Simulation gate (audit task 2.3): a candidate may gate only after
         /// a passing route simulation. The route simulator is currently
         /// unavailable for the RHC fork's V4 leg (non-standard swap ABI,
@@ -1037,6 +1053,8 @@ fn main() {
             max_skew,
             flash_provider,
             flash_support,
+            overrides,
+            hook_allowlist,
             simulate,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
@@ -1071,6 +1089,8 @@ fn main() {
             max_skew,
             flash_provider: &flash_provider,
             flash_support: flash_support.as_deref(),
+            overrides: overrides.as_deref(),
+            hook_allowlist: hook_allowlist.as_deref(),
             simulate,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
@@ -2374,6 +2394,10 @@ struct RunPairsArgs<'a> {
     flash_provider: &'a str,
     /// Support CSV backing `flash_provider = auto`.
     flash_support: Option<&'a std::path::Path>,
+    /// V4 overrides CSV for the hooks preflight (None = gate skipped).
+    overrides: Option<&'a std::path::Path>,
+    /// Hook allow-list CSV (None = empty: refuse all hook pools).
+    hook_allowlist: Option<&'a std::path::Path>,
     /// Backstop age bound for cached leg prices (blocks behind the tip).
     max_leg_age_blocks: u64,
     /// Maximum block spread across one quote's priced candidate pools.
@@ -2539,6 +2563,36 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             "no pools for profiles v{} on both venues",
             profile_bytes_a[1]
         ));
+    }
+    // Phase-3 hooks preflight: V4 rows with nonzero-hook overrides that are
+    // not allow-listed are LOUD (counted per startup) but do not abort —
+    // the live manifest still carries 2 such pools and aborting would brick
+    // the loop; execution stays sim-gated (estimate_entry + minProfit) and
+    // fresh manifests refuse them at build time (hot-pools.py gate).
+    match args.overrides {
+        Some(path) => {
+            let overrides = crate::submit::trade::load_overrides(path)?;
+            let allowlist = match args.hook_allowlist {
+                Some(list) => gaps::load_hook_allowlist(list)?,
+                None => std::collections::HashSet::new(),
+            };
+            let mut flagged = gaps::find_nonzero_hook_pools(&a_entries, &overrides, &allowlist);
+            flagged.extend(gaps::find_nonzero_hook_pools(
+                &b_entries, &overrides, &allowlist,
+            ));
+            flagged.sort();
+            flagged.dedup();
+            if !flagged.is_empty() {
+                eprintln!(
+                    "run-pairs: WARNING {} nonzero-hook V4 pool(s) in manifest without allow-list (vanilla math may ghost): {}",
+                    flagged.len(),
+                    flagged.join(","),
+                );
+            }
+        }
+        None => {
+            eprintln!("run-pairs: hooks preflight skipped (no --overrides)");
+        }
     }
     // WS lane timing (http mode ignores these): push drains are frequent
     // and cheap; the HTTP supervisor keeps coverage honest.

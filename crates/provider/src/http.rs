@@ -416,6 +416,47 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
         Ok((sqrt, liquidity))
     }
 
+    /// Quotes one exact-input single-pool V4 swap through the canonical
+    /// `V4Quoter` lens (`quoteExactInputSingle`, `eth_call`): multi-tick
+    /// traversal, current LP fee, and hook effects included — the executable
+    /// answer the constant-product model approximates. Returns
+    /// `(amount_out, gas_estimate)`.
+    ///
+    /// Fail-closed: unencodable keys (fee/tick out of range), short or
+    /// zero-amount responses, and reverts all surface as errors so callers
+    /// screen. Hook pools must be refused by callers (`hookData` is always
+    /// empty) — a hook's price impact cannot be quoted blind.
+    ///
+    /// # Errors
+    ///
+    /// Transport, budget, or malformed-response failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quote_v4_exact_input(
+        &self,
+        quoter: Address,
+        currency0: Address,
+        currency1: Address,
+        fee: u32,
+        tick_spacing: i32,
+        hooks: Address,
+        zero_for_one: bool,
+        exact_amount: u128,
+        block: u64,
+    ) -> Result<(U256, U256), TransportError> {
+        use crate::live::abi::{decode_quoter_result, quoter_exact_input_single};
+        let data = quoter_exact_input_single(
+            currency0,
+            currency1,
+            fee,
+            tick_spacing,
+            hooks,
+            zero_for_one,
+            exact_amount,
+        )
+        .ok_or_else(|| TransportError::Permanent("unencodable V4 pool key".to_owned()))?;
+        let raw = self.call(quoter, &data, block)?;
+        decode_quoter_result(&raw).ok_or(TransportError::InvalidResponse)
+    }
     fn storage_latest(
         &self,
         address: Address,
@@ -999,6 +1040,65 @@ mod tests {
         });
         assert!(
             dead.pool_v4_state_view(Address::ZERO, [0xabu8; 32], 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn quote_v4_exact_input_decodes_amount_and_gas() {
+        // Scripted quoter backend returning a fixed (amount, gas) pair.
+        struct QuoterBackend;
+        impl HttpBackend for QuoterBackend {
+            fn request(&self, request: &RpcRequest) -> Result<HttpResponse, TransportError> {
+                assert_eq!(request.method, "eth_call");
+                let mut payload = vec![0u8; 64];
+                payload[24..32].copy_from_slice(&999u64.to_be_bytes());
+                payload[56..64].copy_from_slice(&64_133u64.to_be_bytes());
+                Ok(HttpResponse {
+                    result: json!(format!("0x{}", alloy_primitives::hex::encode(&payload))),
+                    response_bytes: 10,
+                })
+            }
+        }
+        let reader = ChainReader::new(
+            QuoterBackend,
+            ThreadSleeper,
+            ProviderBudget::new(u64::MAX, 1 << 24),
+            RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            4663,
+        );
+        assert_eq!(
+            reader.quote_v4_exact_input(
+                Address::ZERO,
+                Address::with_last_byte(0x11),
+                Address::with_last_byte(0x22),
+                3000,
+                60,
+                Address::ZERO,
+                true,
+                1_000_000,
+                1,
+            ),
+            Ok((U256::from(999u64), U256::from(64_133u64)))
+        );
+        // Unencodable keys refuse instead of misquoting.
+        assert!(
+            reader
+                .quote_v4_exact_input(
+                    Address::ZERO,
+                    Address::with_last_byte(0x11),
+                    Address::with_last_byte(0x22),
+                    0x100_0000,
+                    60,
+                    Address::ZERO,
+                    true,
+                    1,
+                    1,
+                )
                 .is_err()
         );
     }
