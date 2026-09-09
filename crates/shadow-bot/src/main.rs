@@ -709,12 +709,30 @@ enum Command {
         #[arg(long)]
         hook_allowlist: Option<PathBuf>,
         /// Simulation gate (audit task 2.3): a candidate may gate only after
-        /// a passing route simulation. The route simulator is currently
-        /// unavailable for the RHC fork's V4 leg (non-standard swap ABI,
-        /// 2026-08-27 finding), so enabling this screens every gate-passing
-        /// candidate fail-closed and counts the screenings separately.
+        /// a passing route simulation. With `--quote-source math` (default)
+        /// the route simulator is unavailable for V4 legs, so enabling this
+        /// screens every gate-passing candidate fail-closed and counts the
+        /// screenings separately. With `--quote-source quoter|both` the
+        /// chained quoter verification below IS the V4-leg simulation, so
+        /// the stub stands down and the veto enforces instead (Phase 5).
         #[arg(long, default_value_t = false)]
         simulate: bool,
+        /// Quote source for the economics gate: `math` (constant-product
+        /// model, default), `quoter` (veto gate-passing candidates whose
+        /// chained on-chain `V4Quoter` output diverges), or `both` (veto +
+        /// divergence logging for soak analysis). Veto demotes to
+        /// `BelowThreshold`, counted separately; V3-only cycles and
+        /// inexact keys keep math with a counted skip reason.
+        #[arg(long, default_value = "math")]
+        quote_source: String,
+        /// Maximum `1 - exec/math` a quoter-verified candidate may carry
+        /// and still gate; wider divergence vetoes (Phase 4).
+        #[arg(long, default_value_t = 0.01)]
+        max_quote_divergence: f64,
+        /// Per-poll cap on quoter `eth_call`s; exhaustion skips the rest
+        /// (keeps math) instead of spending the provider budget.
+        #[arg(long, default_value_t = 8)]
+        max_quoter_calls_per_poll: u64,
         /// Backstop age bound: a cached price this many blocks behind the tip
         /// screens the quote even when sweep coverage claims continuity (0
         /// disables the age backstop; coverage screening always applies).
@@ -1056,6 +1074,9 @@ fn main() {
             overrides,
             hook_allowlist,
             simulate,
+            quote_source,
+            max_quote_divergence,
+            max_quoter_calls_per_poll,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
             max_swap_age_blocks,
@@ -1092,6 +1113,9 @@ fn main() {
             overrides: overrides.as_deref(),
             hook_allowlist: hook_allowlist.as_deref(),
             simulate,
+            quote_source: &quote_source,
+            max_quote_divergence,
+            max_quoter_calls_per_poll,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
             max_swap_age_blocks,
@@ -2242,7 +2266,7 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
     out.flush().map_err(|e| e.to_string())?;
 
     println!(
-        "derive-prices: legs a={} b={} priced a={} b={} prices={} seeds={} -> {}",
+        "derive-prices: legs a={} b={} priced a={} priced b={} prices={} seeds={} -> {}",
         legs_a.len(),
         legs_b.len(),
         priced_a.len(),
@@ -2251,6 +2275,31 @@ fn derive_prices_command(args: &DerivePricesArgs<'_>) -> Result<(), String> {
         seeds.len(),
         args.out.display(),
     );
+    // Phase 6: warn for leg tokens with no route to the canonical
+    // quote-token table — their USD values cannot anchor honestly.
+    // Missing table warns (never fails): derivation predates the table.
+    match gaps::load_quote_table(std::path::Path::new("data/quote-tokens.csv")) {
+        Ok(table) => {
+            let legs_all: Vec<gaps::PoolEntry> =
+                legs_a.iter().chain(legs_b.iter()).copied().collect();
+            let unrouted = gaps::tokens_without_quote_route(&legs_all, &table);
+            if !unrouted.is_empty() {
+                let shown: Vec<String> = unrouted
+                    .iter()
+                    .take(10)
+                    .map(|t| format!("{t:#x}"))
+                    .collect();
+                eprintln!(
+                    "derive-prices: WARNING {} token(s) with no route to quote table (first 10): {}",
+                    unrouted.len(),
+                    shown.join(","),
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("derive-prices: quote-table check skipped ({error})");
+        }
+    }
     Ok(())
 }
 
@@ -2288,6 +2337,23 @@ fn baseline_wanted(reason: &shadow::ClassificationReason, net: U256, threshold: 
         return true;
     }
     (0.5..1.0).contains(&floor_ratio(net, threshold))
+}
+
+/// Whether the simulation stub screens everything (Phase 5): only when
+/// `--simulate` is set WITHOUT quoter verification. With quoter veto
+/// active, the chained executable check is the simulation and the stub
+/// stands down.
+fn simulation_stub_applies(simulate: bool, quote_veto: bool) -> bool {
+    simulate && !quote_veto
+}
+
+/// Demotes a quoter-vetoed candidate to `BelowThreshold` with an honest
+/// shortfall, so the CSV tail (and `trade`) never sees it as gated.
+fn demote_quoter_vetoed(classification: &mut shadow::Classification) {
+    classification.reason = ClassificationReason::BelowThreshold;
+    classification.shortfall_usd = classification
+        .threshold_usd
+        .saturating_sub(classification.estimated_net_profit_usd);
 }
 
 /// Builds the flash-loan cost selection from CLI arguments.
@@ -2390,6 +2456,12 @@ struct RunPairsArgs<'a> {
     /// Simulation gate (task 2.3): screen every gate-passing candidate
     /// fail-closed until the route simulator is available.
     simulate: bool,
+    /// Quote source: `math`, `quoter`, or `both` (veto + logging).
+    quote_source: &'a str,
+    /// Veto bound on `1 - exec/math`.
+    max_quote_divergence: f64,
+    /// Per-poll quoter `eth_call` budget.
+    max_quoter_calls_per_poll: u64,
     /// Flash-loan cost mode for gating (`none`, a provider name, or `auto`).
     flash_provider: &'a str,
     /// Support CSV backing `flash_provider = auto`.
@@ -2455,6 +2527,25 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                 "unknown --v4-reads {other:?} (expected extsload or stateview)"
             ));
         }
+    };
+    // Phase 4: quoter veto needs exact PoolKeys — overrides are mandatory
+    // unless the gate runs on math alone (fail-closed at startup, not mid-poll).
+    let quote_veto = match args.quote_source {
+        "math" => false,
+        "quoter" | "both" => true,
+        other => {
+            return Err(format!(
+                "unknown --quote-source {other:?} (expected math, quoter or both)"
+            ));
+        }
+    };
+    let quoter_overrides = if quote_veto {
+        let path = args.overrides.ok_or(
+            "--quote-source quoter|both needs --overrides (exact PoolKey tickSpacing/hooks)",
+        )?;
+        Some(crate::submit::trade::load_overrides(path)?)
+    } else {
+        None
     };
     let a_path: &std::path::Path = args.a;
     let b_path: &std::path::Path = args.b;
@@ -3101,10 +3192,10 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         });
         let mut outcome = evaluator.run_once();
         // Audit task 2.3: nothing gates without a passing route simulation.
-        // The route simulator is currently unavailable for the fork's V4 leg
-        // (non-standard swap ABI, 2026-08-27 finding), so with `--simulate`
-        // every gate-passing candidate is screened fail-closed and counted.
-        let sim_screened = if args.simulate {
+        // Phase 5: with quoter veto active the chained executable check is
+        // the V4-leg simulation, so the screen-everything stub stands down
+        // and the veto below enforces instead.
+        let sim_screened = if simulation_stub_applies(args.simulate, quote_veto) {
             dirty::apply_simulation_gate(&mut outcome)
         } else {
             0
@@ -3113,6 +3204,83 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             eprintln!(
                 "run-pairs: sim-screened {sim_screened} gate-passing candidate(s) (fail-closed)"
             );
+        }
+        // Phase-4 quoter veto: chain AboveThreshold candidates through the
+        // on-chain V4Quoter (V4 legs) and exact math (V3 legs); demote
+        // divergences and errors to BelowThreshold so the CSV tail (and
+        // `trade`) never sees them. Skips keep math, counted by reason.
+        // Runs only when candidates exist, so quiet polls cost nothing.
+        let mut quoter_vetoed = 0u64;
+        if quote_veto
+            && (outcome
+                .pair_results
+                .iter()
+                .chain(outcome.triangle_results.iter())
+                .any(|(_, classification)| {
+                    matches!(classification.reason, ClassificationReason::AboveThreshold)
+                }))
+        {
+            let overrides = quoter_overrides
+                .as_ref()
+                .expect("quoter mode requires --overrides (startup-validated)");
+            let mut states = priced_a.clone();
+            states.extend(refreshed_a.clone());
+            states.extend(priced_b.clone());
+            states.extend(refreshed_b.clone());
+            let entries_all: Vec<gaps::PoolEntry> =
+                a_entries.iter().chain(b_entries.iter()).copied().collect();
+            let mut calls_left = args.max_quoter_calls_per_poll;
+            for (quote, classification) in outcome
+                .pair_results
+                .iter_mut()
+                .chain(outcome.triangle_results.iter_mut())
+            {
+                if !matches!(classification.reason, ClassificationReason::AboveThreshold) {
+                    continue;
+                }
+                match gaps::quoter_verify_cycle(
+                    &reader,
+                    RHC_V4_QUOTER,
+                    overrides,
+                    &entries_all,
+                    &quote.legs,
+                    &states,
+                    quote.input,
+                    quote.output,
+                    args.max_quote_divergence,
+                    latest,
+                    &mut calls_left,
+                ) {
+                    gaps::QuoterVerdict::Agree {
+                        divergence, gas, ..
+                    } => {
+                        eprintln!("run-pairs: quoter agree div={divergence:.4} gas={gas}");
+                    }
+                    gaps::QuoterVerdict::Diverge {
+                        divergence,
+                        exec_output,
+                        ..
+                    } => {
+                        eprintln!(
+                            "run-pairs: quoter VETO div={divergence:.4} exec={exec_output} math={} (demoted)",
+                            quote.output,
+                        );
+                        demote_quoter_vetoed(classification);
+                        quoter_vetoed += 1;
+                    }
+                    gaps::QuoterVerdict::Error { detail } => {
+                        eprintln!("run-pairs: quoter VETO error={detail} (demoted)");
+                        demote_quoter_vetoed(classification);
+                        quoter_vetoed += 1;
+                    }
+                    gaps::QuoterVerdict::Skipped { reason } => {
+                        eprintln!("run-pairs: quoter skip reason={reason} (math kept)");
+                    }
+                }
+            }
+        }
+        if quoter_vetoed > 0 {
+            eprintln!("run-pairs: quoter-vetoed {quoter_vetoed} candidate(s) this poll");
         }
         if !outcome.stale_screened.is_empty() || !outcome.triangle_stale_screened.is_empty() {
             eprintln!(
@@ -4590,5 +4758,34 @@ mod baseline_tests {
             U256::ZERO,
             t
         ));
+    }
+
+    #[test]
+    fn simulation_stub_stands_down_under_quoter_veto() {
+        assert!(simulation_stub_applies(true, false));
+        assert!(!simulation_stub_applies(true, true));
+        assert!(!simulation_stub_applies(false, false));
+        assert!(!simulation_stub_applies(false, true));
+    }
+
+    #[test]
+    fn quoter_veto_demotion_is_honest() {
+        use shadow::ClassificationReason;
+        let mut classification = shadow::Classification {
+            gross_profit: U256::from(11u64),
+            gross_profit_usd: U256::from(11u64),
+            flash_cost_usd: U256::ZERO,
+            gas_cost_usd: U256::from(1u64),
+            estimated_net_profit_usd: U256::from(10u64),
+            threshold_usd: U256::from(8u64),
+            shortfall_usd: U256::ZERO,
+            reason: ClassificationReason::AboveThreshold,
+        };
+        demote_quoter_vetoed(&mut classification);
+        assert_eq!(classification.reason, ClassificationReason::BelowThreshold);
+        // shortfall is threshold - net would underflow (net > threshold):
+        // saturates to zero instead of wrapping.
+        assert_eq!(classification.shortfall_usd, U256::ZERO);
+        assert_eq!(classification.estimated_net_profit_usd, U256::from(10u64));
     }
 }

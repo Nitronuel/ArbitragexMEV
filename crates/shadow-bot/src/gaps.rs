@@ -626,6 +626,65 @@ pub fn find_nonzero_hook_pools(
     flagged
 }
 
+/// Loads the canonical quote-token table (`token,symbol,decimals,...`;
+/// `#` comments and headers skipped) into a set of addresses.
+pub fn load_quote_table(path: &Path) -> Result<std::collections::HashSet<Address>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("quote table unreadable: {e}"))?;
+    let mut out = std::collections::HashSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("token") {
+            continue;
+        }
+        let addr = line
+            .split(',')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse::<Address>()
+            .map_err(|_| format!("bad quote-table address {line:?}"))?;
+        out.insert(addr);
+    }
+    Ok(out)
+}
+
+/// Tokens in `legs` with no route of ≤2 pools to a quote-table token
+/// (Phase 6): their USD values cannot anchor honestly, so callers warn.
+/// Table tokens themselves are never reported.
+pub fn tokens_without_quote_route(
+    legs: &[PoolEntry],
+    table: &std::collections::HashSet<Address>,
+) -> Vec<Address> {
+    use std::collections::HashSet;
+    let mut reached: HashSet<Address> = legs
+        .iter()
+        .flat_map(|e| [e.token0, e.token1])
+        .filter(|t| table.contains(t))
+        .collect();
+    // Two hops: tokens sharing a pool with a reached token, twice.
+    for _ in 0..2 {
+        let mut frontier = HashSet::new();
+        for e in legs {
+            if reached.contains(&e.token0) {
+                frontier.insert(e.token1);
+            }
+            if reached.contains(&e.token1) {
+                frontier.insert(e.token0);
+            }
+        }
+        reached.extend(frontier);
+    }
+    let mut unrouted: Vec<Address> = legs
+        .iter()
+        .flat_map(|e| [e.token0, e.token1])
+        .filter(|t| !table.contains(t) && !reached.contains(t))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    unrouted.sort_by_key(|a| a.as_slice().to_owned());
+    unrouted
+}
+
 /// The canonical ordered pair for cross-venue matching: `(token0, token1)`
 /// sorted by normalized address, so both venues quote the same orientation.
 #[must_use]
@@ -1873,6 +1932,246 @@ pub fn single_tick_capacity(
     }
 }
 
+/// Constant-product leg output for an input on virtual reserves, net of the
+/// static toll: the independent model the quoter comparison checks.
+/// `r_in`/`r_out` are the directional virtual reserves.
+#[must_use]
+pub fn cp_output(r_in: f64, r_out: f64, dx: f64, toll: f64) -> Option<f64> {
+    if !r_in.is_finite() || !r_out.is_finite() || !dx.is_finite() {
+        return None;
+    }
+    if r_in <= 0.0 || r_out <= 0.0 || dx <= 0.0 {
+        return None;
+    }
+    if !(0.0..1.0).contains(&toll) {
+        return None;
+    }
+    Some(r_out * dx / (r_in + dx) * (1.0 - toll))
+}
+
+/// Exact integer constant-product leg output, net of toll
+/// (`fee_num`/`fee_den`): `out = r1·dx/(r0+dx) · (den-num)/den`, 512-bit
+/// products saturating to [`U256::MAX`]. Used for V3 legs inside quoter
+/// chains, where concentrated ticks don't exist and the model is exact.
+#[must_use]
+pub fn cp_output_exact(
+    r_in: U256,
+    r_out: U256,
+    dx: U256,
+    fee_num: u64,
+    fee_den: u64,
+) -> Option<U256> {
+    use ruint::{Uint, UintTryFrom};
+    if r_in.is_zero() || r_out.is_zero() || dx.is_zero() || fee_den == 0 {
+        return None;
+    }
+    if fee_num >= fee_den {
+        return None;
+    }
+    let gross = Uint::<512, 8>::from(r_out) * Uint::<512, 8>::from(dx)
+        / (Uint::<512, 8>::from(r_in) + Uint::<512, 8>::from(dx));
+    let net = gross * Uint::<512, 8>::from(fee_den - fee_num) / Uint::<512, 8>::from(fee_den);
+    Some(U256::uint_try_from(net).unwrap_or(U256::MAX))
+}
+
+/// Verdict of chaining one candidate cycle through the on-chain `V4Quoter`
+/// (V4 legs) and exact constant-product math (V3 legs, full-range exact).
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuoterVerdict {
+    /// Every leg verified and executable output is within `max_divergence`
+    /// of the model. Carries the chained output, the divergence
+    /// (`1 - exec/math`, positive = model overstates), and summed quoter
+    /// gas estimates.
+    Agree {
+        exec_output: U256,
+        divergence: f64,
+        gas: U256,
+    },
+    /// Executable output trails the model beyond tolerance (tick crossing,
+    /// wrong key, ...) — caller screens. Carries the same numbers.
+    Diverge {
+        exec_output: U256,
+        divergence: f64,
+        gas: U256,
+    },
+    /// Nothing quotable (V3-only cycle, inexact keys, hooks, oversize
+    /// input): caller keeps math, with the counted reason.
+    Skipped { reason: &'static str },
+    /// A quoter call failed: fail-closed, caller screens.
+    Error { detail: String },
+}
+
+/// Chains one candidate cycle leg-by-leg in execution order: V4 legs
+/// through `quoteExactInputSingle` (multi-tick traversal, live LP fee),
+/// V3 legs through exact [`cp_output_exact`] math. Returns the executable
+/// output against the model's `math_output`.
+///
+/// Fail-closed throughout: inexact PoolKeys (dynamic/zero fees, nonzero
+/// hooks, missing overrides), over-`u128` inputs, token mismatches, and
+/// quoter errors all screen instead of guessing. `calls_left` bounds the
+/// per-poll `eth_call` spend; exhaustion skips the rest.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+pub fn quoter_verify_cycle<B, S>(
+    reader: &ChainReader<B, S>,
+    quoter: Address,
+    overrides: &std::collections::HashMap<String, (i32, Address)>,
+    entries: &[PoolEntry],
+    legs: &[LegRoute],
+    states: &std::collections::HashMap<[u8; 32], PoolPrice>,
+    input: U256,
+    math_output: U256,
+    max_divergence: f64,
+    tip: u64,
+    calls_left: &mut u64,
+) -> QuoterVerdict
+where
+    B: HttpBackend,
+    S: Sleeper,
+{
+    if legs.is_empty() {
+        return QuoterVerdict::Skipped { reason: "no-legs" };
+    }
+    if legs.iter().all(|leg| leg.profile != *b"v4") {
+        return QuoterVerdict::Skipped { reason: "v3-only" };
+    }
+    let Ok(mut amount) = u128::try_from(input) else {
+        return QuoterVerdict::Skipped { reason: "oversize" };
+    };
+    if amount == 0 {
+        return QuoterVerdict::Skipped {
+            reason: "zero-input",
+        };
+    }
+    let mut gas = U256::ZERO;
+    for leg in legs {
+        if leg.profile == *b"v4" {
+            let Some(entry) = entries
+                .iter()
+                .find(|e| e.profile == *b"v4" && e.id == leg.pool_id)
+            else {
+                return QuoterVerdict::Skipped { reason: "no-entry" };
+            };
+            // Exact static fee only: sentinels and zeros resolve through
+            // observed fees, which a pre-swap quoter call cannot know.
+            if entry.fee == 0 || entry.fee & V4_DYNAMIC_FEE_FLAG != 0 {
+                return QuoterVerdict::Skipped {
+                    reason: "inexact-fee",
+                };
+            }
+            let id_hex = alloy_primitives::hex::encode(leg.pool_id);
+            let Some((tick_spacing, hooks)) = overrides.get(&id_hex) else {
+                return QuoterVerdict::Skipped {
+                    reason: "no-overrides",
+                };
+            };
+            if *hooks != Address::ZERO {
+                return QuoterVerdict::Skipped { reason: "hooks" };
+            }
+            let (c0, c1) = if leg.token_in <= leg.token_out {
+                (leg.token_in, leg.token_out)
+            } else {
+                (leg.token_out, leg.token_in)
+            };
+            let zero_for_one = leg.token_in == c0;
+            if *calls_left == 0 {
+                return QuoterVerdict::Skipped { reason: "budget" };
+            }
+            *calls_left -= 1;
+            match reader.quote_v4_exact_input(
+                quoter,
+                c0,
+                c1,
+                entry.fee,
+                *tick_spacing,
+                *hooks,
+                zero_for_one,
+                amount,
+                tip,
+            ) {
+                Ok((out, est)) => {
+                    gas = gas.saturating_add(est);
+                    let Ok(next) = u128::try_from(out) else {
+                        return QuoterVerdict::Skipped { reason: "oversize" };
+                    };
+                    if next == 0 {
+                        return QuoterVerdict::Error {
+                            detail: "quoter dust".to_owned(),
+                        };
+                    }
+                    amount = next;
+                }
+                Err(error) => {
+                    return QuoterVerdict::Error {
+                        detail: format!("{error:?}").chars().take(120).collect(),
+                    };
+                }
+            }
+        } else {
+            // V3 leg: exact math on virtual reserves.
+            let key: [u8; 32] = leg.pool.into_word().into();
+            let Some(state) = states.get(&key) else {
+                return QuoterVerdict::Skipped { reason: "no-state" };
+            };
+            let Some(entry) = entries
+                .iter()
+                .find(|e| e.profile != *b"v4" && e.venue == leg.pool)
+            else {
+                return QuoterVerdict::Skipped { reason: "no-entry" };
+            };
+            let (r0, r1) = virtual_reserves(state.sqrt, state.liquidity);
+            let (rin, rout) = if leg.token_in == entry.token0 {
+                (r0, r1)
+            } else if leg.token_in == entry.token1 {
+                (r1, r0)
+            } else {
+                return QuoterVerdict::Skipped {
+                    reason: "token-mismatch",
+                };
+            };
+            let amount_u256 = U256::from(amount);
+            let Some(out) = cp_output_exact(
+                rin,
+                rout,
+                amount_u256,
+                entry.fee.into(),
+                entry.fee_denominator.into(),
+            ) else {
+                return QuoterVerdict::Skipped {
+                    reason: "math-failed",
+                };
+            };
+            let Ok(next) = u128::try_from(out) else {
+                return QuoterVerdict::Skipped { reason: "oversize" };
+            };
+            if next == 0 {
+                return QuoterVerdict::Skipped { reason: "dust" };
+            }
+            amount = next;
+        }
+    }
+    let exec_output = U256::from(amount);
+    let divergence = if math_output.is_zero() {
+        f64::NAN
+    } else {
+        1.0 - f64_of(exec_output) / f64_of(math_output)
+    };
+    // NaN (degenerate model output) vetoes: nothing to compare against.
+    if divergence.is_finite() && divergence <= max_divergence {
+        QuoterVerdict::Agree {
+            exec_output,
+            divergence,
+            gas,
+        }
+    } else {
+        QuoterVerdict::Diverge {
+            exec_output,
+            divergence,
+            gas,
+        }
+    }
+}
+
 /// Builds the 2-hop cycle for one cross-venue pair and solves the closed-form
 /// optimal input with the sampled virtual reserves. Picks the tighter
 /// (cheaper-fee) pool per venue for the legs.
@@ -2809,6 +3108,203 @@ mod tests {
         assert_eq!(effective_leg_toll(&entry, &price), Some(0.003));
     }
 
+    /// Scripted quoter backend: every `eth_call` returns the same fixed
+    /// (amount, gas) pair, or a short payload when `payload` is empty.
+    struct QuoterBackend {
+        amount: u64,
+        gas: u64,
+        empty: bool,
+    }
+
+    impl provider::HttpBackend for QuoterBackend {
+        fn request(
+            &self,
+            request: &provider::RpcRequest,
+        ) -> Result<provider::HttpResponse, TransportError> {
+            assert_eq!(request.method, "eth_call");
+            let payload = if self.empty {
+                "0x".to_owned()
+            } else {
+                let mut bytes = vec![0u8; 64];
+                bytes[24..32].copy_from_slice(&self.amount.to_be_bytes());
+                bytes[56..64].copy_from_slice(&self.gas.to_be_bytes());
+                format!("0x{}", alloy_primitives::hex::encode(&bytes))
+            };
+            Ok(provider::HttpResponse {
+                result: serde_json::Value::String(payload),
+                response_bytes: 10,
+            })
+        }
+    }
+
+    fn quoter_reader(backend: QuoterBackend) -> ChainReader<QuoterBackend, NoSleeper> {
+        ChainReader::new(
+            backend,
+            NoSleeper,
+            provider::ProviderBudget::new(u64::MAX, 1 << 24),
+            provider::RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            4663,
+        )
+    }
+
+    fn quoter_leg(
+        pool_id: [u8; 32],
+        token_in: Address,
+        token_out: Address,
+        fee_raw: u32,
+    ) -> LegRoute {
+        LegRoute {
+            profile: *b"v4",
+            pool: Address::repeat_byte(0x83),
+            pool_id,
+            token_in,
+            token_out,
+            fee_raw,
+        }
+    }
+
+    #[test]
+    fn quoter_chain_agrees_diverges_and_skips() {
+        let tok_a = Address::repeat_byte(0x11);
+        let tok_b = Address::repeat_byte(0x22);
+        let id0 = [0x90u8; 32];
+        let id1 = [0x91u8; 32];
+        let mut e0 = catalog_entry(*b"v4", Address::repeat_byte(0x83), id0);
+        e0.token0 = tok_a;
+        e0.token1 = tok_b;
+        let mut e1 = catalog_entry(*b"v4", Address::repeat_byte(0x83), id1);
+        e1.token0 = tok_a;
+        e1.token1 = tok_b;
+        let legs = vec![
+            quoter_leg(id0, tok_a, tok_b, 3000),
+            quoter_leg(id1, tok_b, tok_a, 3000),
+        ];
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(alloy_primitives::hex::encode(id0), (60, Address::ZERO));
+        overrides.insert(alloy_primitives::hex::encode(id1), (60, Address::ZERO));
+        let states = std::collections::HashMap::new();
+        let reader = quoter_reader(QuoterBackend {
+            amount: 900,
+            gas: 50_000,
+            empty: false,
+        });
+        let mut calls = 10u64;
+        // Chained 1000 -> 900 -> 900 against math 905: div ≈ 0.0055.
+        match quoter_verify_cycle(
+            &reader,
+            Address::ZERO,
+            &overrides,
+            &[e0.clone(), e1.clone()],
+            &legs,
+            &states,
+            U256::from(1000u64),
+            U256::from(905u64),
+            0.01,
+            1,
+            &mut calls,
+        ) {
+            QuoterVerdict::Agree {
+                exec_output,
+                divergence,
+                gas,
+            } => {
+                assert_eq!(exec_output, U256::from(900u64));
+                assert!((divergence - (1.0 - 900.0 / 905.0)).abs() < 1e-9);
+                assert_eq!(gas, U256::from(100_000u64));
+            }
+            other => panic!("expected Agree, got {other:?}"),
+        }
+        assert_eq!(calls, 8, "two quoter calls consumed");
+        // Same chain against math 2000: div 0.55 > 0.01 → Diverge.
+        let mut calls = 10u64;
+        match quoter_verify_cycle(
+            &reader,
+            Address::ZERO,
+            &overrides,
+            &[e0.clone(), e1.clone()],
+            &legs,
+            &states,
+            U256::from(1000u64),
+            U256::from(2000u64),
+            0.01,
+            1,
+            &mut calls,
+        ) {
+            QuoterVerdict::Diverge { exec_output, .. } => {
+                assert_eq!(exec_output, U256::from(900u64));
+            }
+            other => panic!("expected Diverge, got {other:?}"),
+        }
+        // Dynamic-fee leg: unquotable, math kept.
+        let mut e_dyn = e0.clone();
+        e_dyn.fee = V4_DYNAMIC_FEE_FLAG;
+        assert_eq!(
+            quoter_verify_cycle(
+                &reader,
+                Address::ZERO,
+                &overrides,
+                &[e_dyn, e1.clone()],
+                &legs,
+                &states,
+                U256::from(1000u64),
+                U256::from(905u64),
+                0.01,
+                1,
+                &mut 10u64,
+            ),
+            QuoterVerdict::Skipped {
+                reason: "inexact-fee"
+            }
+        );
+        // V3-only cycle: model is exact, nothing to verify.
+        let v3_leg = LegRoute {
+            profile: *b"v3",
+            ..legs[0].clone()
+        };
+        assert_eq!(
+            quoter_verify_cycle(
+                &reader,
+                Address::ZERO,
+                &overrides,
+                &[e0, e1],
+                &[v3_leg.clone(), v3_leg],
+                &states,
+                U256::from(1000u64),
+                U256::from(905u64),
+                0.01,
+                1,
+                &mut 10u64,
+            ),
+            QuoterVerdict::Skipped { reason: "v3-only" }
+        );
+        // Reverting quoter fails closed.
+        let dead = quoter_reader(QuoterBackend {
+            amount: 0,
+            gas: 0,
+            empty: true,
+        });
+        assert!(matches!(
+            quoter_verify_cycle(
+                &dead,
+                Address::ZERO,
+                &overrides,
+                &[catalog_entry(*b"v4", Address::repeat_byte(0x83), id0)],
+                &legs[..1],
+                &states,
+                U256::from(1000u64),
+                U256::from(905u64),
+                0.01,
+                1,
+                &mut 10u64,
+            ),
+            QuoterVerdict::Error { .. }
+        ));
+    }
+
     #[test]
     fn leg_toll_handles_dynamic_sentinels() {
         assert_eq!(leg_toll(10_000, 1_000_000, *b"v3"), Some(0.01));
@@ -2863,6 +3359,40 @@ mod tests {
         let mut allowed = HashSet::new();
         allowed.insert(alloy_primitives::hex::encode(hooked));
         assert!(find_nonzero_hook_pools(&entries, &overrides, &allowed).is_empty());
+    }
+
+    #[test]
+    fn quote_route_finds_two_hop_tokens_only() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("quotes.csv");
+        let mut file = std::fs::File::create(&path).expect("create");
+        writeln!(file, "token,symbol,decimals,usd_source").expect("header");
+        writeln!(file, "# anchored stable").expect("comment");
+        writeln!(
+            file,
+            "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168,USDG,6,anchor"
+        )
+        .expect("row");
+        drop(file);
+        let table = load_quote_table(&path).expect("parses");
+        assert_eq!(table.len(), 1);
+        let usdg: Address = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+            .parse()
+            .unwrap();
+        let mid = Address::repeat_byte(0xab);
+        let far = Address::repeat_byte(0xcd);
+        let lone = Address::repeat_byte(0xef);
+        let leg = |t0: Address, t1: Address| {
+            let mut e = catalog_entry(*b"v4", Address::repeat_byte(1), [9u8; 32]);
+            e.token0 = t0;
+            e.token1 = t1;
+            e
+        };
+        // USDG--mid direct, mid--far two-hop, lone isolated.
+        let legs = vec![leg(usdg, mid), leg(mid, far), leg(lone, lone)];
+        let unrouted = tokens_without_quote_route(&legs, &table);
+        assert_eq!(unrouted, vec![lone]);
     }
 
     #[test]

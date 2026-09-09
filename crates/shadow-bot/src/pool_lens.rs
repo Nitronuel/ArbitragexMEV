@@ -343,22 +343,6 @@ pub fn run_pool_lens(args: &PoolLensArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Constant-product leg output for an input on virtual reserves, net of the
-/// static toll: the independent model the quoter comparison checks.
-/// `r_in`/`r_out` are the directional virtual reserves.
-fn cp_output(r_in: f64, r_out: f64, dx: f64, toll: f64) -> Option<f64> {
-    if !r_in.is_finite() || !r_out.is_finite() || !dx.is_finite() {
-        return None;
-    }
-    if r_in <= 0.0 || r_out <= 0.0 || dx <= 0.0 {
-        return None;
-    }
-    if !(0.0..1.0).contains(&toll) {
-        return None;
-    }
-    Some(r_out * dx / (r_in + dx) * (1.0 - toll))
-}
-
 /// Phase-2 quoter verification (read-only): for every priced zero-hook V4
 /// row with an exact static fee, quotes both directions at 10/50/100% of
 /// single-tick capacity through the on-chain `V4Quoter` and prints
@@ -439,7 +423,7 @@ fn verify_quoter(ctx: &LensCtx, pools: &[Candidate], rows: &[LensRow]) {
                     skipped_size += 1;
                     continue;
                 };
-                let Some(math_out) = cp_output(rin_f, rout_f, gaps::f64_of(dx), toll) else {
+                let Some(math_out) = gaps::cp_output(rin_f, rout_f, gaps::f64_of(dx), toll) else {
                     skipped_size += 1;
                     continue;
                 };
@@ -964,17 +948,17 @@ mod tests {
     #[test]
     fn cp_output_matches_hand_computation() {
         // r0=1000, r1=1000, dx=100, no toll: 1000*100/1100 = 90.909...
-        let out = cp_output(1000.0, 1000.0, 100.0, 0.0).expect("computes");
+        let out = gaps::cp_output(1000.0, 1000.0, 100.0, 0.0).expect("computes");
         assert!((out - 90.909_090_909).abs() < 1e-6);
         // 0.3% toll scales output down exactly.
-        let tolled = cp_output(1000.0, 1000.0, 100.0, 0.003).expect("computes");
+        let tolled = gaps::cp_output(1000.0, 1000.0, 100.0, 0.003).expect("computes");
         assert!((tolled - out * 0.997).abs() < 1e-9);
         // Degenerate inputs fail closed.
-        assert_eq!(cp_output(0.0, 1000.0, 100.0, 0.0), None);
-        assert_eq!(cp_output(1000.0, 0.0, 100.0, 0.0), None);
-        assert_eq!(cp_output(1000.0, 1000.0, 0.0, 0.0), None);
-        assert_eq!(cp_output(1000.0, 1000.0, 100.0, 1.0), None);
-        assert_eq!(cp_output(f64::INFINITY, 1000.0, 100.0, 0.0), None);
+        assert_eq!(gaps::cp_output(0.0, 1000.0, 100.0, 0.0), None);
+        assert_eq!(gaps::cp_output(1000.0, 0.0, 100.0, 0.0), None);
+        assert_eq!(gaps::cp_output(1000.0, 1000.0, 0.0, 0.0), None);
+        assert_eq!(gaps::cp_output(1000.0, 1000.0, 100.0, 1.0), None);
+        assert_eq!(gaps::cp_output(f64::INFINITY, 1000.0, 100.0, 0.0), None);
     }
 
     #[test]
