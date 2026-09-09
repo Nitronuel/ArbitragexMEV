@@ -28,6 +28,66 @@ pub fn calldata_with_addresses(signature: &str, a: Address, b: Address) -> Bytes
     Bytes::from(out)
 }
 
+/// Builds calldata for a single-`bytes32` call (`StateView` `getSlot0`,
+/// `getLiquidity`: `fn(bytes32)`).
+#[must_use]
+pub fn calldata_with_bytes32(signature: &str, id: &[u8; 32]) -> Bytes {
+    let mut out = Vec::with_capacity(4 + 32);
+    out.extend_from_slice(&selector(signature));
+    out.extend_from_slice(id);
+    Bytes::from(out)
+}
+
+/// Decodes `StateView` `getSlot0` (4 words: `uint160 sqrtPriceX96`, `int24`
+/// tick, `uint24` protocolFee, `uint24` lpFee) into
+/// `(sqrt, tick, protocol_fee, lp_fee)`. Rejects short payloads, zero roots,
+/// and non-canonical high bits (fail-closed on provider-controlled input).
+#[must_use]
+pub fn decode_slot0_view(result: &Bytes) -> Option<(U256, i32, u32, u32)> {
+    if result.len() < 128 {
+        return None;
+    }
+    let sqrt = U256::try_from_be_slice(&result[..32])?;
+    if sqrt.is_zero() {
+        return None;
+    }
+    // int24: low 3 bytes of word 1, sign-extended. ABI sign-extends
+    // negative values (high bytes 0xFF), so accept all-0x00 or all-0xFF.
+    let negative = result[61] & 0x80 != 0;
+    let pad_ok = result[32..61]
+        .iter()
+        .all(|b| *b == if negative { 0xff } else { 0x00 });
+    if !pad_ok {
+        return None;
+    }
+    let sign = if negative { 0xff_u8 } else { 0x00_u8 };
+    let tick = i32::from_be_bytes([sign, result[61], result[62], result[63]]);
+    // uint24: low 3 bytes of words 2 and 3.
+    if result[64..93].iter().any(|b| *b != 0) || result[96..125].iter().any(|b| *b != 0) {
+        return None;
+    }
+    let protocol_fee = u32::from_be_bytes([0, result[93], result[94], result[95]]);
+    let lp_fee = u32::from_be_bytes([0, result[125], result[126], result[127]]);
+    Some((sqrt, tick, protocol_fee, lp_fee))
+}
+
+/// Decodes `StateView` `getLiquidity` (one `uint128` word). Rejects short
+/// payloads, zero liquidity, and values wider than 128 bits.
+#[must_use]
+pub fn decode_liquidity_view(result: &Bytes) -> Option<U256> {
+    if result.len() < 32 {
+        return None;
+    }
+    if result[..16].iter().any(|b| *b != 0) {
+        return None;
+    }
+    let liquidity = U256::try_from_be_slice(&result[result.len() - 32..])?;
+    if liquidity.is_zero() {
+        return None;
+    }
+    Some(liquidity)
+}
+
 /// Decodes the trailing 20 bytes of a return payload as an address.
 #[must_use]
 pub fn decode_address(result: &Bytes) -> Option<Address> {
@@ -110,5 +170,67 @@ mod tests {
         assert_eq!(decode_address(&Bytes::from(vec![0u8; 19])), None);
         assert_eq!(decode_u8(&Bytes::from(vec![0u8; 31])), None);
         assert_eq!(decode_reserves(&Bytes::from(vec![0u8; 63])), None);
+    }
+
+    #[test]
+    fn stateview_calldata_is_selector_plus_pool_id() {
+        let id = [0xabu8; 32];
+        let data = calldata_with_bytes32("getSlot0(bytes32)", &id);
+        assert_eq!(data.len(), 4 + 32);
+        assert_eq!(&data.as_ref()[4..], &id);
+        // Selectors derive from signatures, never memory.
+        assert_eq!(
+            &data.as_ref()[..4],
+            &selector("getSlot0(bytes32)"),
+            "selector must equal keccak256(signature)[..4]"
+        );
+    }
+
+    #[test]
+    fn decodes_stateview_slot0_and_liquidity() {
+        // getSlot0: sqrt=2^96 (price 1.0), tick=60, protocolFee=0, lpFee=3000.
+        let mut payload = vec![0u8; 128];
+        let sqrt: U256 = U256::from(1u64) << 96;
+        payload[..32].copy_from_slice(&sqrt.to_be_bytes::<32>());
+        payload[61] = 0x00;
+        payload[62] = 0x00;
+        payload[63] = 60;
+        payload[95] = 0x00;
+        payload[126] = 0x0b;
+        payload[127] = 0xb8; // 3000
+        assert_eq!(
+            decode_slot0_view(&Bytes::from(payload)),
+            Some((sqrt, 60, 0, 3000))
+        );
+        // Negative tick (-60): ABI sign-extends int24, so the word's
+        // high bytes are 0xFF, not 0x00 (live RHC pools hit this).
+        let mut neg = vec![0xffu8; 128];
+        neg[..32].copy_from_slice(&sqrt.to_be_bytes::<32>());
+        neg[61] = 0xff;
+        neg[62] = 0xff;
+        neg[63] = 0xc4; // -60 low byte
+        // uint24 words stay zero-padded even for negative ticks.
+        neg[64..96].copy_from_slice(&[0u8; 32]);
+        neg[96..128].copy_from_slice(&[0u8; 32]);
+        assert_eq!(
+            decode_slot0_view(&Bytes::from(neg)).map(|(_, t, _, _)| t),
+            Some(-60)
+        );
+        // Zero root, short payload, garbage high bits all fail closed.
+        assert_eq!(decode_slot0_view(&Bytes::from(vec![0u8; 128])), None);
+        assert_eq!(decode_slot0_view(&Bytes::from(vec![0u8; 127])), None);
+        let mut bad = vec![0u8; 128];
+        bad[..32].copy_from_slice(&sqrt.to_be_bytes::<32>());
+        bad[40] = 0x01; // non-canonical tick high bit
+        assert_eq!(decode_slot0_view(&Bytes::from(bad)), None);
+        // getLiquidity: uint128 word.
+        let mut liq = vec![0u8; 32];
+        liq[24..].copy_from_slice(&12345u64.to_be_bytes());
+        assert_eq!(
+            decode_liquidity_view(&Bytes::from(liq)),
+            Some(U256::from(12345u64))
+        );
+        assert_eq!(decode_liquidity_view(&Bytes::from(vec![0u8; 32])), None);
+        assert_eq!(decode_liquidity_view(&Bytes::from(vec![0u8; 31])), None);
     }
 }

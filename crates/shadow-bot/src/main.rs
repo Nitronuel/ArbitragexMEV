@@ -43,10 +43,17 @@ use shadow::gate_defaults::{
     STANDARD_EXPECTED_WIN_RATE as EXPECTED_WIN_RATE, STANDARD_GAS_COST_USD as GAS_COST_USD,
 };
 
-/// Uniswap V4 `PoolManager` singleton on Base; emits all Swap logs with the
+/// Uniswap V4 `PoolManager` singleton on RHC; emits all Swap logs with the
 /// pool id as topic1 (confirmed from the enumerated catalog).
 const V4_POOL_MANAGER: Address =
     alloy_primitives::address!("0x8366a39CC670B4001A1121B8F6A443A643e40951");
+
+/// Uniswap V4 `StateView` lens on RHC (Phase 1 of
+/// docs/plans/2026-09-09-v4-quoter-hook-hardening.md): canonical
+/// `getSlot0`/`getLiquidity` reads. Verified deployed (3,531 bytes live,
+/// official deployments page); cross-checked against extsload before use.
+const RHC_STATE_VIEW: Address =
+    alloy_primitives::address!("0xf3334192d15450cdd385c8b70e03f9a6bd9e673b");
 
 /// An `AtomicBool` stop flag raised by SIGINT/SIGTERM for graceful drain.
 struct StopOnSignal {
@@ -662,6 +669,11 @@ enum Command {
         /// by Mint/Burn (audit task 1.3 completion); overflow stays paused.
         #[arg(long, default_value_t = 50)]
         max_price_refreshes: usize,
+        /// V4 state source for invalidated-price refreshes: `extsload`
+        /// (raw mapping reads, default) or `stateview` (canonical lens,
+        /// falls back to the mapping per pool on error, counted).
+        #[arg(long, default_value = "extsload")]
+        v4_reads: String,
         /// Maximum `|log2 skew|` a quote may carry and still be gated.
         /// Larger gaps come from degenerate near-empty pools that are not
         /// captureable; they are screened out instead of surfacing as
@@ -1021,6 +1033,7 @@ fn main() {
             gas_price_max_age_secs,
             request_cu_ceiling,
             max_price_refreshes,
+            v4_reads,
             max_skew,
             flash_provider,
             flash_support,
@@ -1054,6 +1067,7 @@ fn main() {
             gas_price_max_age_secs,
             request_cu_ceiling,
             max_price_refreshes,
+            v4_reads: &v4_reads,
             max_skew,
             flash_provider: &flash_provider,
             flash_support: flash_support.as_deref(),
@@ -2376,6 +2390,8 @@ struct RunPairsArgs<'a> {
     request_cu_ceiling: u64,
     /// Per-poll cap on invalidated-price refreshes.
     max_price_refreshes: usize,
+    /// V4 read mode: `extsload` or `stateview` (falls back per pool).
+    v4_reads: &'a str,
     /// Event source: `http` (sweeps) or `ws` (push subscriptions +
     /// HTTP supervisor).
     events: &'a str,
@@ -2406,6 +2422,16 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             args.events
         ));
     }
+    // Phase 1: V4 read mode for invalidated-price refreshes.
+    let v4_reads = match args.v4_reads {
+        "extsload" => gaps::V4Reads::Extsload,
+        "stateview" => gaps::V4Reads::StateView,
+        other => {
+            return Err(format!(
+                "unknown --v4-reads {other:?} (expected extsload or stateview)"
+            ));
+        }
+    };
     let a_path: &std::path::Path = args.a;
     let b_path: &std::path::Path = args.b;
     let manifest_path = args.manifest;
@@ -2951,12 +2977,19 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         // Task 1.3 completion: immediately restore invalidated pools from a
         // fresh slot0/liquidity eth_call pair instead of pausing them until
         // their next Swap. Capped per poll; overflow stays paused.
+        // Phase 1: `--v4-reads stateview` reads through the canonical lens,
+        // falling back to the mapping per pool (counted below).
+        let mut v4_fallbacks = 0u64;
         let refreshed_a = gaps::refetch_invalidated_prices(
             &reader,
             &a_entries,
             &sweep_a.invalidated_keys,
             args.max_price_refreshes,
             pool_manager.unwrap_or(V4_POOL_MANAGER),
+            v4_reads,
+            RHC_STATE_VIEW,
+            latest,
+            &mut v4_fallbacks,
         );
         let refreshed_b = gaps::refetch_invalidated_prices(
             &reader,
@@ -2964,7 +2997,14 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             &sweep_b.invalidated_keys,
             args.max_price_refreshes,
             pool_manager.unwrap_or(V4_POOL_MANAGER),
+            v4_reads,
+            RHC_STATE_VIEW,
+            latest,
+            &mut v4_fallbacks,
         );
+        if v4_fallbacks > 0 {
+            eprintln!("run-pairs: v4 StateView fallbacks={v4_fallbacks} this poll");
+        }
         evaluator.seed_prices(profile_bytes_a, &a_entries, &refreshed_a)?;
         evaluator.seed_prices(profile_bytes_b, &b_entries, &refreshed_b)?;
         evaluator.seed_prices(profile_bytes_a, &a_entries, &priced_a)?;

@@ -1157,6 +1157,20 @@ where
 /// quotes until the pool's next Swap, immediate reads restore the cache.
 /// V3 pools use `slot0()`/`liquidity()` on the pool address; V4 pools have
 /// no address, so their price root and liquidity come from the PoolManager
+/// V4 state source for [`refetch_invalidated_prices`]: raw
+/// `eth_getStorageAt` against the `PoolManager` mapping, or the canonical
+/// `StateView` lens contract (Phase 1 of
+/// docs/plans/2026-09-09-v4-quoter-hook-hardening.md). `StateView` falls
+/// back to the mapping per pool on any error, counted in `fallbacks`.
+#[allow(clippy::doc_markdown)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V4Reads {
+    Extsload,
+    StateView,
+}
+
+/// Re-reads slot0/liquidity for pools invalidated by Mint/Burn-type events
+/// through the canonical V4 path — the `PoolManager` `pools`
 /// mapping (`pool_v4_state`) — calling the V3 selectors on the manager
 /// reverts and used to leave V4 pools paused forever (fixed 2026-09-07).
 /// Returns only pools that refreshed successfully; failures simply stay
@@ -1166,12 +1180,17 @@ where
 /// poll CU spend. `block` is stamped as [`u64::MAX`] — the freshest possible
 /// observation, immune to age screens.
 #[allow(clippy::doc_markdown)]
+#[allow(clippy::too_many_arguments)]
 pub fn refetch_invalidated_prices<B, S>(
     reader: &ChainReader<B, S>,
     entries: &[PoolEntry],
     keys: &[[u8; 32]],
     max_refetch: usize,
     pool_manager: Address,
+    v4_reads: V4Reads,
+    state_view: Address,
+    read_block: u64,
+    fallbacks: &mut u64,
 ) -> HashMap<[u8; 32], PoolPrice>
 where
     B: HttpBackend,
@@ -1183,8 +1202,23 @@ where
             continue;
         };
         let refreshed_price = if entry.profile == *b"v4" {
-            match reader.pool_v4_state(pool_manager, entry.id) {
-                Ok((sqrt, liquidity)) if !sqrt.is_zero() && !liquidity.is_zero() => {
+            let state = match v4_reads {
+                V4Reads::StateView
+                    if let Ok(state) =
+                        reader.pool_v4_state_view(state_view, entry.id, read_block) =>
+                {
+                    Some(state)
+                }
+                V4Reads::StateView => {
+                    // Canonical lens failed (rate limit, revert, decode):
+                    // fall back to the mapping, counted.
+                    *fallbacks += 1;
+                    reader.pool_v4_state(pool_manager, entry.id).ok()
+                }
+                V4Reads::Extsload => reader.pool_v4_state(pool_manager, entry.id).ok(),
+            };
+            match state {
+                Some((sqrt, liquidity)) if !sqrt.is_zero() && !liquidity.is_zero() => {
                     Some(PoolPrice {
                         sqrt,
                         liquidity,
@@ -4790,6 +4824,10 @@ mod tests {
             &[v4_id, v3_key, [0xabu8; 32]],
             10,
             pm,
+            V4Reads::Extsload,
+            Address::ZERO,
+            1,
+            &mut 0,
         );
         // V4 key refreshes through the manager mapping (block MAX).
         let v4_price = out.get(&v4_id).expect("v4 pool refetches");

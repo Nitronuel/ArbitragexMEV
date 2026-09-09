@@ -60,6 +60,14 @@ pub struct PoolLensArgs {
     /// Recent-swap activity window in blocks.
     #[arg(long, default_value_t = 40)]
     pub activity_window: u64,
+    /// V4 state source: `extsload` (raw mapping reads, default) or
+    /// `stateview` (canonical lens).
+    #[arg(long, default_value = "extsload")]
+    pub reads: String,
+    /// Read both sources per V4 pool and annotate agreement in the row
+    /// note (read-only; for the Phase-1 cross-check, no pricing change).
+    #[arg(long, default_value_t = false)]
+    pub cross_check_reads: bool,
 }
 
 /// One inspected pool row on the live board.
@@ -179,6 +187,9 @@ struct LensCtx {
     reader: Reader,
     tip: u64,
     pm: Address,
+    state_view: Address,
+    v4_reads: gaps::V4Reads,
+    cross_check_reads: bool,
     token: Address,
     token_decimals: u32,
     native_usd: f64,
@@ -209,6 +220,15 @@ fn resolve_lens(args: &PoolLensArgs) -> Result<LensCtx, String> {
             Address::from_str(value).map_err(|_| format!("invalid --pool-manager {value:?}"))?
         }
         None => super::V4_POOL_MANAGER,
+    };
+    let v4_reads = match args.reads.as_str() {
+        "extsload" => gaps::V4Reads::Extsload,
+        "stateview" => gaps::V4Reads::StateView,
+        other => {
+            return Err(format!(
+                "unknown --reads {other:?} (expected extsload or stateview)"
+            ));
+        }
     };
     let endpoint = match &args.rpc {
         Some(value) => value.strip_prefix("env:").map_or_else(
@@ -246,6 +266,9 @@ fn resolve_lens(args: &PoolLensArgs) -> Result<LensCtx, String> {
         reader,
         tip,
         pm,
+        state_view: super::RHC_STATE_VIEW,
+        v4_reads,
+        cross_check_reads: args.cross_check_reads,
         token,
         token_decimals: 18,
         native_usd: args
@@ -484,6 +507,19 @@ fn build_rows(
     rows
 }
 
+/// One-line error kind for cross-check notes (first 200 chars while
+/// diagnosing Phase-1 agreement; the redacted transport layer never
+/// carries credentials).
+fn short_err<T: std::fmt::Debug>(result: &Result<T, provider::TransportError>) -> String {
+    match result {
+        Ok(_) => "ok".to_owned(),
+        Err(error) => {
+            let full = format!("{error:?}");
+            full.chars().take(200).collect()
+        }
+    }
+}
+
 /// Reads live slot/liquidity state for one candidate into its row.
 fn read_row_state(
     ctx: &LensCtx,
@@ -497,7 +533,60 @@ fn read_row_state(
             row.note = Some("v4 entry without pool id".to_owned());
             return;
         };
-        match ctx.reader.pool_v4_state(ctx.pm, pool_id) {
+        // Phase 1: selectable read source; cross-check mode reads both and
+        // annotates agreement (the acceptance evidence for the cutover).
+        let tip = ctx.tip;
+        let primary = match ctx.v4_reads {
+            gaps::V4Reads::StateView => ctx.reader.pool_v4_state_view(ctx.state_view, pool_id, tip),
+            gaps::V4Reads::Extsload => ctx.reader.pool_v4_state(ctx.pm, pool_id),
+        };
+        let mut source = match ctx.v4_reads {
+            gaps::V4Reads::StateView => "stateview",
+            gaps::V4Reads::Extsload => "extsload",
+        };
+        let mut state = primary;
+        if state.is_err() {
+            // Fail over to the other source before giving up on the row.
+            state = match ctx.v4_reads {
+                gaps::V4Reads::StateView => ctx.reader.pool_v4_state(ctx.pm, pool_id),
+                gaps::V4Reads::Extsload => {
+                    ctx.reader.pool_v4_state_view(ctx.state_view, pool_id, tip)
+                }
+            };
+            source = "fallback";
+        }
+        if ctx.cross_check_reads {
+            let other = match ctx.v4_reads {
+                gaps::V4Reads::StateView => ctx.reader.pool_v4_state(ctx.pm, pool_id),
+                gaps::V4Reads::Extsload => {
+                    ctx.reader.pool_v4_state_view(ctx.state_view, pool_id, tip)
+                }
+            };
+            let agree = match (&state, &other) {
+                (Ok((s1, l1)), Ok((s2, l2))) => {
+                    if s1 == s2 && l1 == l2 {
+                        "reads-agree".to_owned()
+                    } else {
+                        "READS-DIVERGE".to_owned()
+                    }
+                }
+                // Cross-check diagnostics: the failing side's error kind is
+                // evidence (rate limit vs decode vs revert), never a secret
+                // (provider URL types redact credentials).
+                _ => format!(
+                    "reads-incomplete primary_err={} other_err={}",
+                    short_err(&state),
+                    short_err(&other)
+                ),
+            };
+            row.note = Some(format!(
+                "{agree} primary={source}{}",
+                row.note
+                    .as_deref()
+                    .map_or(String::new(), |n| format!("; {n}"))
+            ));
+        }
+        match state {
             Ok((sqrt, liquidity)) => {
                 row.sqrt = Some(sqrt);
                 row.liquidity = Some(liquidity);
@@ -506,7 +595,16 @@ fn read_row_state(
                 row.price_ratio = Some(f * f);
             }
             Err(error) => {
-                row.note = Some(format!("uninitialized ({error})"));
+                // Cross-check mode: both sources failed identically (dead
+                // pool) — keep the agreement tag, don't overwrite it.
+                let tag = row.note.as_deref().map_or(String::new(), |n| {
+                    if n.starts_with("reads-") {
+                        format!("{n}; ")
+                    } else {
+                        String::new()
+                    }
+                });
+                row.note = Some(format!("{tag}uninitialized ({error})"));
             }
         }
         return;

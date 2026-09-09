@@ -1,4 +1,4 @@
-mod abi;
+pub(crate) mod abi;
 mod http;
 mod http_probe;
 mod rpc;

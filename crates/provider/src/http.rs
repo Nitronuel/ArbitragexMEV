@@ -382,6 +382,40 @@ impl<B: HttpBackend, S: Sleeper> ChainReader<B, S> {
         Ok((sqrt, liquidity))
     }
 
+    /// Reads a V4 pool's price root and in-range liquidity through the
+    /// canonical `StateView` lens contract (`getSlot0` + `getLiquidity`,
+    /// `eth_call`s) instead of raw `eth_getStorageAt`. Same fail-closed
+    /// contract as [`ChainReader::pool_v4_state`]: zero roots, zero
+    /// liquidity, short payloads, and non-canonical words all surface as
+    /// `InvalidResponse` so callers skip. Selectors derive from signatures
+    /// at runtime (repo rule), never from memory.
+    ///
+    /// # Errors
+    ///
+    /// Transport, budget, or malformed-response failures.
+    pub fn pool_v4_state_view(
+        &self,
+        state_view: Address,
+        pool_id: [u8; 32],
+        block: u64,
+    ) -> Result<(U256, U256), TransportError> {
+        use crate::live::abi::{calldata_with_bytes32, decode_liquidity_view, decode_slot0_view};
+        let slot = self.call(
+            state_view,
+            &calldata_with_bytes32("getSlot0(bytes32)", &pool_id),
+            block,
+        )?;
+        let liq = self.call(
+            state_view,
+            &calldata_with_bytes32("getLiquidity(bytes32)", &pool_id),
+            block,
+        )?;
+        let (sqrt, _tick, _protocol_fee, _lp_fee) =
+            decode_slot0_view(&slot).ok_or(TransportError::InvalidResponse)?;
+        let liquidity = decode_liquidity_view(&liq).ok_or(TransportError::InvalidResponse)?;
+        Ok((sqrt, liquidity))
+    }
+
     fn storage_latest(
         &self,
         address: Address,
@@ -868,6 +902,20 @@ mod tests {
         )
     }
 
+    fn call_reader(backend: CallBackend) -> ChainReader<CallBackend, ThreadSleeper> {
+        ChainReader::new(
+            backend,
+            ThreadSleeper,
+            ProviderBudget::new(u64::MAX, 1 << 24),
+            RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            4663,
+        )
+    }
+
     #[test]
     fn pool_v4_state_reads_mapping_and_liquidity_slot() {
         let mut id = [0u8; 32];
@@ -898,5 +946,60 @@ mod tests {
         // Uninitialized pools (zero word) surface InvalidResponse so
         // callers skip instead of pricing garbage.
         assert!(reader.pool_v4_state(Address::ZERO, [0xabu8; 32]).is_err());
+    }
+
+    /// Scripted `eth_call` backend keyed by calldata selector hex.
+    struct CallBackend {
+        slot0: String,
+        liquidity: String,
+    }
+
+    impl HttpBackend for CallBackend {
+        fn request(&self, request: &RpcRequest) -> Result<HttpResponse, TransportError> {
+            assert_eq!(request.method, "eth_call");
+            let data = request.params[0]["data"].as_str().unwrap_or_default();
+            let payload = if data.len() >= 10
+                && data[2..10].eq_ignore_ascii_case(&{
+                    use crate::live::abi::selector;
+                    alloy_primitives::hex::encode(selector("getSlot0(bytes32)"))
+                }) {
+                self.slot0.clone()
+            } else {
+                self.liquidity.clone()
+            };
+            Ok(HttpResponse {
+                result: json!(payload),
+                response_bytes: 10,
+            })
+        }
+    }
+
+    #[test]
+    fn pool_v4_state_view_reads_slot0_and_liquidity() {
+        let sqrt: U256 = U256::from(1u64) << 96;
+        let mut slot = vec![0u8; 128];
+        slot[..32].copy_from_slice(&sqrt.to_be_bytes::<32>());
+        slot[63] = 60; // tick
+        slot[126] = 0x0b;
+        slot[127] = 0xb8; // lpFee 3000
+        let mut liq = vec![0u8; 32];
+        liq[24..].copy_from_slice(&777u64.to_be_bytes());
+        let reader = call_reader(CallBackend {
+            slot0: format!("0x{}", alloy_primitives::hex::encode(&slot)),
+            liquidity: format!("0x{}", alloy_primitives::hex::encode(&liq)),
+        });
+        assert_eq!(
+            reader.pool_v4_state_view(Address::ZERO, [0xabu8; 32], 1),
+            Ok((sqrt, U256::from(777u64)))
+        );
+        // Zero liquidity fails closed.
+        let dead = call_reader(CallBackend {
+            slot0: format!("0x{}", alloy_primitives::hex::encode(&slot)),
+            liquidity: format!("0x{}", "00".repeat(32)),
+        });
+        assert!(
+            dead.pool_v4_state_view(Address::ZERO, [0xabu8; 32], 1)
+                .is_err()
+        );
     }
 }
