@@ -20,4 +20,5 @@ exec ./target/release/shadow-bot run-pairs \
   --native-usd 2490000000000000000000 \
   --window 10 --poll-ms 3000 --delay-ms 500 --max-skew 10 --global \
   --flash-provider auto --flash-support data/flash-support.csv \
-  --csv logs/live/trades-hot.csv >> logs/live/run-pairs-hot.log 2>&1
+  --csv logs/live/trades-hot.csv \
+  --log-quote-detail logs/quoter-baseline.csv >> logs/live/run-pairs-hot.log 2>&1

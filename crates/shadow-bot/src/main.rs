@@ -177,6 +177,10 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         max_attempts: u64,
         /// Broadcast when every gate passes; without it, dry-run only.
+        /// Production runs with `cast send=allow` (no per-tx prompt), so any
+        /// new gate must stay log-only through its soak before it may promote
+        /// a row to broadcastable (Phase 0+ policy in
+        /// docs/plans/2026-09-09-v4-quoter-hook-hardening.md).
         #[arg(long, default_value_t = false)]
         broadcast: bool,
     },
@@ -604,6 +608,15 @@ enum Command {
         /// classified `Provisional`, never counted as an honest candidate.
         #[arg(long)]
         csv: Option<PathBuf>,
+        /// Append-only quoter-baseline log (Phase 0 of
+        /// docs/plans/2026-09-09-v4-quoter-hook-hardening.md): one row per
+        /// gate-passing or near-miss quote (floor_ratio in [0.5, 1.0)) with
+        /// the math quote's input, predicted output, capacity ratio and
+        /// legs, for offline comparison against V4Quoter executable quotes.
+        /// Default off — zero behavior change; the `trade` tail file is
+        /// untouched by this flag.
+        #[arg(long)]
+        log_quote_detail: Option<PathBuf>,
         /// Token-price CSV (`token,usd_per_token`, fixed-point) for honest
         /// USD gating instead of the `$1` fixture.
         #[arg(long)]
@@ -999,6 +1012,7 @@ fn main() {
             delay_ms,
             csv,
             prices,
+            log_quote_detail,
             v3_chunks_per_poll,
             global,
             confirm_lag_blocks,
@@ -1031,6 +1045,7 @@ fn main() {
             delay_ms,
             csv: csv.as_deref(),
             prices: prices.as_deref(),
+            log_quote_detail: log_quote_detail.as_deref(),
             v3_chunks_per_poll,
             global,
             confirm_lag_blocks,
@@ -2220,6 +2235,27 @@ fn floor_ratio(net: alloy_primitives::U256, threshold: alloy_primitives::U256) -
     n / t
 }
 
+/// `input / input_capacity` for the Phase-0 quoter baseline: how much of
+/// the single-tick cell the math quote wants. `inf` = zero recorded
+/// capacity (unmeasurable, still worth logging for quoter comparison).
+fn baseline_capacity_ratio(input: U256, capacity: U256) -> f64 {
+    if capacity.is_zero() {
+        f64::INFINITY
+    } else {
+        gaps::f64_of(input) / gaps::f64_of(capacity)
+    }
+}
+
+/// Whether a quote belongs in the Phase-0 baseline: gate passes plus
+/// near-misses (floor_ratio in [0.5, 1.0)) — the rows whose executable
+/// output the quoter comparison must reproduce or refute.
+fn baseline_wanted(reason: &shadow::ClassificationReason, net: U256, threshold: U256) -> bool {
+    if matches!(reason, shadow::ClassificationReason::AboveThreshold) {
+        return true;
+    }
+    (0.5..1.0).contains(&floor_ratio(net, threshold))
+}
+
 /// Builds the flash-loan cost selection from CLI arguments.
 ///
 /// `auto` reads the support CSV (`token,provider` rows) and fails closed at
@@ -2307,6 +2343,8 @@ struct RunPairsArgs<'a> {
     delay_ms: u64,
     csv: Option<&'a std::path::Path>,
     prices: Option<&'a std::path::Path>,
+    /// Append-only quoter-baseline path (Phase 0, default off).
+    log_quote_detail: Option<&'a std::path::Path>,
     /// V3 address chunks swept per poll in the ring sweep (0 = all chunks).
     v3_chunks_per_poll: u64,
     global: bool,
@@ -2383,7 +2421,30 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let delay_ms = args.delay_ms;
     let csv_path = args.csv;
     let prices_path = args.prices;
+    let baseline_path = args.log_quote_detail;
     let mut csv_out: Option<std::io::BufWriter<std::fs::File>> = None;
+    // Phase 0 quoter baseline (docs/plans/2026-09-09-v4-quoter-hook-hardening.md):
+    // append-only, default off, written only for gate-passing + near-miss
+    // quotes. Same A14 discipline as the trade tail file.
+    let mut baseline_out: Option<std::io::BufWriter<std::fs::File>> = None;
+    if let Some(path) = baseline_path {
+        let existed = matches!(path.metadata(), Ok(meta) if meta.len() > 0);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        let mut out = std::io::BufWriter::new(file);
+        if !existed {
+            writeln!(
+                out,
+                "poll_block,kind,token_lo,token_hi,input,predicted_output,profit,optimal_unclamped,input_capacity,capacity_ratio,net_usd,threshold_usd,floor_ratio,reason_code,legs"
+            )
+            .map_err(|e| e.to_string())?;
+            out.flush().map_err(|e| e.to_string())?;
+        }
+        baseline_out = Some(out);
+    }
     if let Some(path) = csv_path {
         // Audit A14: append, never truncate — every restart previously
         // destroyed all prior evidence despite the docs claiming append.
@@ -3137,6 +3198,100 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     eprintln!("run-pairs: CSV flush failed; output disabled: {error}");
                     csv_out = None;
                 }
+            }
+        }
+        // Phase-0 quoter baseline: gate-passing + near-miss quotes only, so
+        // a quiet market costs nothing and a hot one stays bounded. A write
+        // failure disables the baseline, never the poller or the trade tail.
+        if let Some(base) = baseline_out.as_mut() {
+            let mut write_baseline = || -> std::io::Result<()> {
+                for (_pair, (quote, classification)) in
+                    outcome.evaluated.iter().zip(&outcome.pair_results)
+                {
+                    let ratio = floor_ratio(
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                    );
+                    if !baseline_wanted(
+                        &classification.reason,
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                    ) {
+                        continue;
+                    }
+                    writeln!(
+                        base,
+                        "{latest},pair,{},{},{},{},{},{},{},{:.4},{},{},{:.4},{},{}",
+                        quote.token_lo,
+                        quote.token_hi,
+                        quote.input,
+                        quote.output,
+                        quote.profit,
+                        quote.optimal_unclamped,
+                        quote.input_capacity,
+                        baseline_capacity_ratio(quote.input, quote.input_capacity),
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                        ratio,
+                        code_and_detail(&classification.reason).0,
+                        quote
+                            .legs
+                            .iter()
+                            .map(crate::gaps::LegRoute::encode_csv)
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    )?;
+                }
+                for (tri, (quote, classification)) in outcome
+                    .triangle_evaluated
+                    .iter()
+                    .zip(&outcome.triangle_results)
+                {
+                    let ratio = floor_ratio(
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                    );
+                    if !baseline_wanted(
+                        &classification.reason,
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                    ) {
+                        continue;
+                    }
+                    // Triangle third token (t.2) is recoverable from the legs
+                    // column (every leg carries token_in/token_out).
+                    let t = evaluator.triangle(*tri);
+                    writeln!(
+                        base,
+                        "{latest},triangle,{},{},{},{},{},{},{},{:.4},{},{},{:.4},{},{}",
+                        alloy_primitives::Address::from_slice(&t.0),
+                        alloy_primitives::Address::from_slice(&t.1),
+                        quote.input,
+                        quote.output,
+                        quote.profit,
+                        quote.optimal_unclamped,
+                        quote.input_capacity,
+                        baseline_capacity_ratio(quote.input, quote.input_capacity),
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd,
+                        ratio,
+                        code_and_detail(&classification.reason).0,
+                        quote
+                            .legs
+                            .iter()
+                            .map(crate::gaps::LegRoute::encode_csv)
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    )?;
+                }
+                Ok(())
+            };
+            if let Err(error) = write_baseline() {
+                eprintln!("run-pairs: baseline output disabled after write error: {error}");
+                baseline_out = None;
+            } else if let Err(error) = base.flush() {
+                eprintln!("run-pairs: baseline flush failed; output disabled: {error}");
+                baseline_out = None;
             }
         }
         last_window = to_eff;
@@ -4298,4 +4453,48 @@ fn unix_millis() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_ratio_is_one_when_unclamped() {
+        let v = U256::from(1_000_000u64);
+        assert!((baseline_capacity_ratio(v, v) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn capacity_ratio_is_inf_on_zero_capacity() {
+        assert!(baseline_capacity_ratio(U256::from(7u64), U256::ZERO).is_infinite());
+    }
+
+    #[test]
+    fn baseline_wanted_covers_gates_and_near_misses_only() {
+        use shadow::ClassificationReason;
+        let t = U256::from(10u64);
+        // Gate pass always wanted, even far above the floor.
+        assert!(baseline_wanted(
+            &ClassificationReason::AboveThreshold,
+            U256::from(100u64),
+            t
+        ));
+        // Near-miss (0.7) wanted; cold (0.2) and empty (0.0) skipped.
+        assert!(baseline_wanted(
+            &ClassificationReason::BelowThreshold,
+            U256::from(7u64),
+            t
+        ));
+        assert!(!baseline_wanted(
+            &ClassificationReason::BelowThreshold,
+            U256::from(2u64),
+            t
+        ));
+        assert!(!baseline_wanted(
+            &ClassificationReason::NotProfitable,
+            U256::ZERO,
+            t
+        ));
+    }
 }
