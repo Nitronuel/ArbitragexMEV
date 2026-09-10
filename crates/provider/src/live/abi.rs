@@ -108,7 +108,7 @@ pub fn quoter_exact_input_single(
     if fee > 0xFF_FFFF {
         return None;
     }
-    if tick_spacing < -8_388_608 || tick_spacing > 8_388_607 {
+    if !(-8_388_608..=8_388_607).contains(&tick_spacing) {
         return None;
     }
     let mut out = Vec::with_capacity(4 + 32 * 10);

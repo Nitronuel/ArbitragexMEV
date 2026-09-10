@@ -701,6 +701,7 @@ pub mod command {
         executor: &str,
         csv: &Path,
         overrides: Option<&Path>,
+        hook_allowlist: Option<&Path>,
         flash: bool,
         prices: &Path,
         win_rate_pct: u64,
@@ -730,6 +731,12 @@ pub mod command {
             Some(path) => super::trade::load_overrides(path)?,
             None => std::collections::HashMap::new(),
         };
+        // Manifest hook policy, execution side: empty when no list is
+        // given (refuse all nonzero-hook V4 pools at pre-estimate).
+        let hook_allowlist = match hook_allowlist {
+            Some(path) => crate::gaps::load_hook_allowlist(path)?,
+            None => std::collections::HashSet::new(),
+        };
         let mut tailer = CsvTailer::default();
         // Start from the current end of file: only NEW gated rows are traded.
         let len = std::fs::metadata(csv)
@@ -737,9 +744,10 @@ pub mod command {
             .len();
         tailer.skip_to(len);
         eprintln!(
-            "trade: wallet {:#?} executor {executor:#?} flash={flash} capital={capital_source:?} broadcast={broadcast} overrides={} tailing {}",
+            "trade: wallet {:#?} executor {executor:#?} flash={flash} capital={capital_source:?} broadcast={broadcast} overrides={} hook_allowlist={} tailing {}",
             submitter.wallet,
             overrides.len(),
+            hook_allowlist.len(),
             csv.display()
         );
         let mut attempts: u64 = 0;
@@ -777,6 +785,7 @@ pub mod command {
                     &submitter,
                     &row,
                     &overrides,
+                    &hook_allowlist,
                     &prices,
                     win_rate_pct,
                     native_usd,
@@ -1073,6 +1082,39 @@ pub mod trade {
         Ok(map)
     }
 
+    /// Pre-estimate hook screen: the manifest hook policy, applied at
+    /// execution time. V4 legs resolving to nonzero-hooks overrides are
+    /// refused unless their pool_id is allow-listed — hook logic cannot be
+    /// priced by vanilla math, and estimating such routes only burns an RPC
+    /// round-trip to learn what the policy already knows (live miss: pool
+    /// `85aa9a…` via hooks `0x44455203…` reverted `WrappedError` at estimate).
+    ///
+    /// # Errors
+    /// Fails when a V4 leg is malformed or hits a non-allow-listed hook pool.
+    /// Legs without overrides pass the screen (the builders fail those
+    /// closed separately).
+    pub fn check_v4_hook_policy(
+        row: &GatedRow,
+        overrides: &std::collections::HashMap<String, (i32, Address)>,
+        allowlist: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        for leg in &row.legs {
+            let (profile, _pool, pool_id, _tin, _tout, _fee) = parse_leg(leg)?;
+            if profile != "v4" {
+                continue;
+            }
+            let key = alloy_primitives::hex::encode(pool_id);
+            if let Some((_, hooks)) = overrides.get(&key) {
+                if *hooks != Address::ZERO && !allowlist.contains(&key) {
+                    return Err(format!(
+                        "refusing: V4 hook pool 0x{key} without allow-list (hooks {hooks:#?}; estimate would revert)"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Convert CSV legs into router `RouteElement`s, resolving V3 fees on-chain
     /// and requiring V4 overrides.
     ///
@@ -1242,6 +1284,7 @@ pub mod trade {
         submitter: &Submitter,
         row: &GatedRow,
         overrides: &Overrides,
+        hook_allowlist: &std::collections::HashSet<String>,
         prices: &std::collections::HashMap<Address, U256>,
         win_rate_pct: u64,
         native_usd: u64,
@@ -1253,6 +1296,9 @@ pub mod trade {
         flash: bool,
         capital_source: CapitalSource,
     ) -> Result<TradeOutcome, String> {
+        // Manifest hook policy at execution time: refuse non-allow-listed
+        // hook pools before any estimate (fail-closed skip, not a revert).
+        check_v4_hook_policy(row, overrides, hook_allowlist)?;
         if flash {
             // Settlement + continuity guards use the router convention:
             // native is the 0x0 sentinel, never the wrapped alias.
@@ -1612,5 +1658,53 @@ mod override_key_tests {
             assert_eq!(leg.tickSpacing, Signed::<24, 1>::try_from(60).unwrap());
             assert_eq!(leg.hooks, hooks);
         }
+    }
+
+    /// Hook screen: non-allow-listed nonzero-hook V4 legs are refused
+    /// before any estimate (live miss: pool `85aa9a…` via hooks
+    /// `0x44455203…` reverted `WrappedError` at estimate).
+    #[test]
+    fn hook_policy_refuses_non_allowlisted_hook_pool() {
+        use super::trade::{GatedRow, check_v4_hook_policy};
+        use alloy_primitives::{Address, U256};
+
+        let pm = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
+        let hooked = "85aa9a7c2ef9deec7bcbc5e78c6b26d2598c2aaf3f810b267fa4f8f9b0854142";
+        let plain = "7159c43bcc3961cf25e85875cbfca5eb4294fb54ce7dd88047bc3559794d832f";
+        let hook_addr: Address = "0x4445520306c9c70952bdfec28f3989f53d9f80c4"
+            .parse()
+            .unwrap();
+        let usdg: Address = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+            .parse()
+            .unwrap();
+        let weth: Address = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+            .parse()
+            .unwrap();
+        let row = GatedRow {
+            kind: "pair".to_owned(),
+            token_lo: usdg,
+            input: U256::from(1u64),
+            output: U256::from(2u64),
+            profit: U256::from(1u64),
+            legs: vec![format!("v4:{pm}:{hooked}:{usdg}:{weth}:25")],
+        };
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(hooked.to_owned(), (1_i32, hook_addr));
+        overrides.insert(plain.to_owned(), (380_i32, Address::ZERO));
+
+        // Empty allow-list refuses the hook pool before any estimate.
+        let empty = std::collections::HashSet::new();
+        let err = check_v4_hook_policy(&row, &overrides, &empty).unwrap_err();
+        assert!(err.contains("without allow-list"), "unexpected: {err}");
+        // Listing it permits the screen (the estimate still guards execution).
+        let mut listed = std::collections::HashSet::new();
+        listed.insert(hooked.to_owned());
+        assert!(check_v4_hook_policy(&row, &overrides, &listed).is_ok());
+        // Zero-hook legs always pass the screen.
+        let clean = GatedRow {
+            legs: vec![format!("v4:{pm}:{plain}:{usdg}:{weth}:38000")],
+            ..row
+        };
+        assert!(check_v4_hook_policy(&clean, &overrides, &empty).is_ok());
     }
 }

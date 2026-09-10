@@ -155,6 +155,11 @@ enum Command {
         /// V4 overrides file (`pool_id,tick_spacing,hooks` per line).
         #[arg(long)]
         overrides: Option<PathBuf>,
+        /// V4 hook allow-list (one `pool_id` per line; `None` = refuse all
+        /// nonzero-hook V4 pools at pre-estimate, mirroring the manifest
+        /// hook policy in `data/hook-allowlist.csv`).
+        #[arg(long)]
+        hook_allowlist: Option<PathBuf>,
         /// Use PM flash (borrow input via ExecutorV3) instead of funded-caller.
         #[arg(long, default_value_t = false)]
         flash: bool,
@@ -781,6 +786,7 @@ fn main() {
             executor,
             csv,
             overrides,
+            hook_allowlist,
             flash,
             capital_source,
             prices,
@@ -800,6 +806,7 @@ fn main() {
                 &executor,
                 &csv,
                 overrides.as_deref(),
+                hook_allowlist.as_deref(),
                 flash,
                 &prices,
                 win_rate_pct,
