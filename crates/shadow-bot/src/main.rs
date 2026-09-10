@@ -172,7 +172,10 @@ enum Command {
         #[arg(long, default_value = "data/prices-seed.csv")]
         prices: PathBuf,
         /// Expected win rate in percent — divides the gas cost for the floor.
-        #[arg(long, default_value_t = 33)]
+        /// Default 34 keeps the trade floor (≈2.94x gas) just under the
+        /// detection floor (≈2.9994x at 33.34%), so any gated row clears
+        /// preflight: profit of at least 3x gas executes.
+        #[arg(long, default_value_t = 34)]
         win_rate_pct: u64,
         /// Native token USD price (gas-cost conversion).
         #[arg(long, default_value_t = 2488)]

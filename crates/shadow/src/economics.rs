@@ -12,14 +12,17 @@ pub mod gate_defaults {
     /// Conservative gas cost of one cross-venue attempt, USD fixed-point
     /// (~$1.00 at current RHC gas ~0.41 gwei for 3-hop).
     pub const STANDARD_GAS_COST_USD: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
-    /// Expected win rate for the submission-gate floor (33%).
+    /// Expected win rate for the submission-gate floor (33.34%).
     ///
-    /// Operator decision 2026-09-08: set to ~33% so the gate floor
-    /// (gas_cost / win_rate) is ~$3 at current ~$1 gas cost.
+    /// Operator decision 2026-09-08/09: set just above one-third so the gate
+    /// floor (gas_cost / win_rate ≈ 2.9994x gas) sits just UNDER 3x gas —
+    /// profit of at least 3x gas gates and executes. A rate of exactly 1/3
+    /// is not representable, and 33% flat floors at 3.03x (rejecting exactly
+    /// 3x); 33.34% is the smallest two-decimal rate clearing the bar.
     /// Trade-off: if true win rate is lower, EV is negative — acceptable
     /// per operator for live measurement; revisit if loss rate exceeds expectation.
     pub const STANDARD_EXPECTED_WIN_RATE: U256 =
-        U256::from_limbs([333_333_333_333_333_333, 0, 0, 0]);
+        U256::from_limbs([333_400_000_000_000_000, 0, 0, 0]);
 
     /// Measurement-mode overrides used by the dormant `run` pipeline
     /// (audit A15): its `interesting=` counts are meant to observe every
@@ -382,5 +385,78 @@ fn not_evaluated(quote: &OptimalQuote, detail: &str) -> Classification {
         reason: ClassificationReason::NotEvaluated {
             detail: detail.to_owned(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gate_fixture() -> (Economics, CostSnapshot) {
+        let scale = U256::from(FIXED_POINT_SCALE);
+        let economics = Economics {
+            flash_fee_rate: U256::ZERO,
+            gas_cost_usd: scale, // $1 gas
+            expected_win_rate: gate_defaults::STANDARD_EXPECTED_WIN_RATE,
+            native_token_usd: scale,
+            da_fee_usd: U256::ZERO,
+        };
+        let snapshot = CostSnapshot {
+            usd_per_token: scale, // $1/token: token profit == USD profit
+            gas_price_age_valid: true,
+            reference_price_valid: true,
+            gas_price_wei: U256::from(1u64),
+        };
+        (economics, snapshot)
+    }
+
+    #[test]
+    fn standard_floor_sits_just_under_3x_gas() {
+        let scale = U256::from(FIXED_POINT_SCALE);
+        let gas = scale; // $1
+        let threshold = gas
+            .checked_mul(scale)
+            .and_then(|value| value.checked_div(gate_defaults::STANDARD_EXPECTED_WIN_RATE))
+            .expect("floor computes");
+        let three_x = gas.checked_mul(U256::from(3u64)).expect("3x computes");
+        assert!(
+            threshold < three_x,
+            "floor {threshold} must sit under 3x gas {three_x}"
+        );
+        // ...but not far under: the rate stays within (33.3%, 33.5%].
+        assert!(gate_defaults::STANDARD_EXPECTED_WIN_RATE > U256::from(333_000_000_000_000_000u64));
+        assert!(gate_defaults::STANDARD_EXPECTED_WIN_RATE <= U256::from(335_000_000_000_000_000u64));
+    }
+
+    #[test]
+    fn three_x_gas_net_profit_gates_above_threshold() {
+        let (economics, snapshot) = gate_fixture();
+        let scale = U256::from(FIXED_POINT_SCALE);
+        // Net $3 on $1 gas (flash fee zero, gross $4).
+        let quote = OptimalQuote {
+            input: U256::ZERO,
+            output: U256::ZERO,
+            profit: scale.checked_mul(U256::from(4u64)).expect("gross"),
+        };
+        let classification = economics.classify(&quote, &snapshot);
+        assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+        assert_eq!(classification.shortfall_usd, U256::ZERO);
+    }
+
+    #[test]
+    fn sub_3x_gas_net_profit_stays_below_threshold() {
+        let (economics, snapshot) = gate_fixture();
+        let scale = U256::from(FIXED_POINT_SCALE);
+        // Net $2.99 on $1 gas stays below the ~$2.9994 floor.
+        let quote = OptimalQuote {
+            input: U256::ZERO,
+            output: U256::ZERO,
+            profit: scale
+                .checked_mul(U256::from(399u64))
+                .and_then(|value| value.checked_div(U256::from(100u64)))
+                .expect("gross"),
+        };
+        let classification = economics.classify(&quote, &snapshot);
+        assert_eq!(classification.reason, ClassificationReason::BelowThreshold);
     }
 }
