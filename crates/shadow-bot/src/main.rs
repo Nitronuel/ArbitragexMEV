@@ -172,10 +172,11 @@ enum Command {
         #[arg(long, default_value = "data/prices-seed.csv")]
         prices: PathBuf,
         /// Expected win rate in percent — divides the gas cost for the floor.
-        /// Default 34 keeps the trade floor (≈2.94x gas) just under the
-        /// detection floor (≈2.9994x at 33.34%), so any gated row clears
-        /// preflight: profit of at least 3x gas executes.
-        #[arg(long, default_value_t = 34)]
+        /// Default (see `submit::command::TRADE_WIN_RATE_PCT_DEFAULT`) keeps
+        /// the trade floor (≈2.94x gas) just under the detection floor
+        /// (≈2.9994x at 33.34%), so any gated row clears preflight: profit
+        /// of at least 3x gas executes.
+        #[arg(long, default_value_t = submit::command::TRADE_WIN_RATE_PCT_DEFAULT)]
         win_rate_pct: u64,
         /// Native token USD price (gas-cost conversion).
         #[arg(long, default_value_t = 2488)]
@@ -2516,6 +2517,20 @@ struct RunPairsArgs<'a> {
 /// evaluator and the conservative economics gate. Read-only: prices are cached
 /// locally from Swap logs, never `eth_call`ed per quote; nothing is submitted.
 #[allow(clippy::too_many_lines)]
+/// Rejects `--native-usd` values that are clearly the wrong scale (e.g. whole
+/// dollars like `2488` instead of 1e18 fixed-point). Native below $1e-6 or
+/// above $1M is not a real price — fail closed at startup, since a mis-scaled
+/// native silently re-prices every gas floor (the trade-side `u64` dollars
+/// and pool-lens float conventions must never be copied here).
+fn check_native_usd_scale(v: U256) -> Result<(), String> {
+    if v < U256::from(1_000_000_000_000_u64) || v > U256::from(10u128.pow(24)) {
+        return Err(format!(
+            "refusing: --native-usd {v} outside [$1e-6, $1M] fixed-point range — pass 1e18-scaled USD (e.g. 2490000000000000000000), not whole dollars"
+        ));
+    }
+    Ok(())
+}
+
 fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     use std::io::Write;
 
@@ -2759,7 +2774,10 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         expected_win_rate: EXPECTED_WIN_RATE,
         // Live native price from --native-usd (1e18 fixed-point USD).
         // A $1 default keeps the placeholder warning below honest.
-        native_token_usd: args.native_usd,
+        native_token_usd: {
+            check_native_usd_scale(args.native_usd)?;
+            args.native_usd
+        },
         da_fee_usd: U256::ZERO,
     };
     let reference = CostSnapshot {
@@ -4732,8 +4750,18 @@ mod baseline_tests {
     use super::*;
 
     #[test]
-    fn capacity_ratio_is_one_when_unclamped() {
-        let v = U256::from(1_000_000u64);
+    fn native_usd_scale_guard_rejects_wrong_units() {
+        // Whole dollars (trade convention), zero, and absurd values refuse.
+        assert!(check_native_usd_scale(U256::from(2488u64)).is_err());
+        assert!(check_native_usd_scale(U256::ZERO).is_err());
+        assert!(check_native_usd_scale(U256::from(10u128.pow(25))).is_err());
+        // Realistic fixed-point native prices pass ($1 .. $1M).
+        assert!(check_native_usd_scale(U256::from(10u128.pow(18))).is_ok());
+        assert!(check_native_usd_scale(U256::from(2490u64) * U256::from(10u128.pow(18))).is_ok());
+    }
+
+    #[test]
+    fn capacity_ratio_is_one_when_unclamped() {        let v = U256::from(1_000_000u64);
         assert!((baseline_capacity_ratio(v, v) - 1.0).abs() < 1e-9);
     }
 

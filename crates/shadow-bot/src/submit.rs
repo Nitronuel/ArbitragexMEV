@@ -692,6 +692,13 @@ pub mod command {
     use super::trade::{CsvTailer, attempt};
     use std::time::Duration;
 
+    /// Default `--win-rate-pct` for `trade`, kept as a named constant (not a
+    /// magic literal) so the nesting test below can pin it against the
+    /// detection-side `STANDARD_EXPECTED_WIN_RATE`: 34 keeps the trade floor
+    /// (≈2.94x gas) just under detection (≈2.9994x at 33.34%), so any gated
+    /// row clears preflight.
+    pub const TRADE_WIN_RATE_PCT_DEFAULT: u64 = 34;
+
     /// # Errors
     /// Fatal setup errors (bad address, unreadable files). Per-row failures
     /// are logged and skipped — one bad row must not stop the tail.
@@ -1660,6 +1667,25 @@ mod override_key_tests {
         }
     }
 
+    /// Floor nesting: the trade floor multiplier (100/pct) must stay strictly
+    /// under the detection floor multiplier (S/win_rate_fp), or gated rows
+    /// would die in preflight. Pins the 33.34%-vs-34% coupling in code so a
+    /// flag or constant change on either side fails loudly instead of
+    /// silently desynchronizing the gates.
+    #[test]
+    fn trade_floor_nests_under_detection_floor() {
+        use alloy_primitives::U256;
+        use shadow::{FIXED_POINT_SCALE, gate_defaults::STANDARD_EXPECTED_WIN_RATE};
+        // 100 * win_rate_fp < pct * S  ⟺  100/pct < S/win_rate_fp.
+        let lhs = U256::from(100u64) * STANDARD_EXPECTED_WIN_RATE;
+        let rhs = U256::from(super::command::TRADE_WIN_RATE_PCT_DEFAULT)
+            * U256::from(FIXED_POINT_SCALE);
+        assert!(
+            lhs < rhs,
+            "trade floor must nest under detection floor: 100*win_rate={lhs} pct*S={rhs}"
+        );
+    }
+
     /// Hook screen: non-allow-listed nonzero-hook V4 legs are refused
     /// before any estimate (live miss: pool `85aa9a…` via hooks
     /// `0x44455203…` reverted `WrappedError` at estimate).
@@ -1700,9 +1726,9 @@ mod override_key_tests {
         let mut listed = std::collections::HashSet::new();
         listed.insert(hooked.to_owned());
         assert!(check_v4_hook_policy(&row, &overrides, &listed).is_ok());
-        // Zero-hook legs always pass the screen.
+        // Zero-hook legs always pass the screen (fee 38962 = observed on-chain).
         let clean = GatedRow {
-            legs: vec![format!("v4:{pm}:{plain}:{usdg}:{weth}:38000")],
+            legs: vec![format!("v4:{pm}:{plain}:{usdg}:{weth}:38962")],
             ..row
         };
         assert!(check_v4_hook_policy(&clean, &overrides, &empty).is_ok());

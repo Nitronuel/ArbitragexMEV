@@ -736,6 +736,12 @@ impl PairDirtyEvaluator {
 
     /// Classifies a quote against an anchor token's USD price (triangles use
     /// their `p0` anchor). Pairs delegate here after resolving their anchor.
+    ///
+    /// Gas policy (operator ruling 2026-09-10): pairs are deliberately
+    /// charged `TRIANGLE_EXECUTION_GAS_UNITS` (420k) instead of
+    /// `PAIR_EXECUTION_GAS_UNITS` (300k). The ~40% higher pair floor misses
+    /// marginal pairs by design (gas-budget defense); do not "fix" this to
+    /// 300k without an explicit operator decision.
     fn classify_anchor(&self, anchor: Address, quote: &PairQuote) -> shadow::Classification {
         if quote.log2_skew > self.max_log2_skew {
             return self.skew_screened(quote);

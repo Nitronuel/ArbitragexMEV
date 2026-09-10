@@ -412,7 +412,7 @@ pub fn verify_capture_ledger(
         .ok_or("input conversion overflow")?
         / scale;
     // Aave V3 premium: 5 bps of the borrowed principal.
-    let aave_fee = input_usd * U256::from(5) / U256::from(100_000);
+    let aave_fee = input_usd * U256::from(5) / U256::from(10_000);
     let net = |cost: U256| gross_usd.saturating_sub(cost);
     Ok(CaptureLedger {
         token_lo: quote.token_lo,
@@ -3593,6 +3593,58 @@ mod tests {
         let map = load_prices(&path).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&usdg).copied(), Some(U256::from(10u128.pow(30))));
+    }
+
+    #[test]
+    fn committed_price_table_keeps_usdg_derive_scale() {
+        // Regression pin (2026-09-10): `data/prices-live.csv` once carried
+        // USDG at 1e18 instead of the derive convention ($1/whole ×
+        // 10^(36−6) = 1e30), so every USDG-anchored gross printed raw
+        // (profit == gross) and undervalued true USD by 1e12 — silently
+        // suppressing gates. The loader accepts the 1e30 pin (see above);
+        // this pins the committed table to the same scale.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/prices-live.csv");
+        let text = std::fs::read_to_string(&path).expect("prices-live.csv readable");
+        let mut found = false;
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() >= 2 && cols[0].trim().to_lowercase() == "0x5fc5360d0400a0fd4f2af552add042d716f1d168" {
+                found = true;
+                assert_eq!(
+                    cols[1].trim(),
+                    "1000000000000000000000000000000",
+                    "USDG must be $1 × 10^(36−6) = 1e30 (derive convention)"
+                );
+            }
+        }
+        assert!(found, "USDG row present in prices-live.csv");
+    }
+
+    #[test]
+    fn committed_price_table_prices_weth_anchor() {
+        // Companion pin (2026-09-10): WETH-anchored quotes (969 rows, 21% of
+        // flow) were permanently `not_evaluated` on an unpriced anchor while
+        // native USD was already known. The table must carry WETH at Eq. T
+        // scale ($/whole × 1e18 at 18 decimals); refresh with `--native-usd`.
+        // Bounds are wide on purpose (staleness is the operator's job; the
+        // gate still decimates dust) but reject zero and absurd values.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/prices-live.csv");
+        let text = std::fs::read_to_string(&path).expect("prices-live.csv readable");
+        let mut found = false;
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() >= 2 && cols[0].trim().to_lowercase() == "0x0bd7d308f8e1639fab988df18a8011f41eacad73" {
+                found = true;
+                let v: u128 = cols[1].trim().parse().expect("weth price parses");
+                assert!(
+                    v >= 100 * 10u128.pow(18) && v <= 100_000 * 10u128.pow(18),
+                    "WETH row must be $100–$100k/whole at 1e18 scale, got {v}"
+                );
+            }
+        }
+        assert!(found, "WETH row present in prices-live.csv");
     }
 
     #[test]
