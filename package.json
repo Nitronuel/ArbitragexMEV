@@ -1,0 +1,28 @@
+{
+  "name": "arbitrage",
+  "version": "1.0.0",
+  "description": "2–4 hop longtail cyclic arbitrage on Robinhood Chain (RHC, chain 4663) — Base (8453) disabled. Rust hot path + Solidity executor + `revm` simulation.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "lib": "lib",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nitronuel/ArbitrageMEV.git"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Nitronuel/ArbitrageMEV/issues"
+  },
+  "homepage": "https://github.com/Nitronuel/ArbitrageMEV#readme",
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.2",
+    "@openzeppelin/contracts-upgradeable": "^5.0.2"
+  }
+}

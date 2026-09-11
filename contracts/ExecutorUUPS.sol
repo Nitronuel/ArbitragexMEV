@@ -45,6 +45,8 @@ struct RouteLeg {
     int24 tickSpacing; // V4: router field
     address hooks; // V4 only
     bytes hookData; // V4 only
+    address pool; // V4: pool address
+    bytes32 poolKey; // V4: pool id
 }
 
 /// Single router element (matches 0x4d819a2a layout, round-trip verified).
@@ -349,13 +351,13 @@ contract ExecutorUUPS is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpg
             venue: 2,
             c0: leg.inTok,
             c1: leg.outTok,
-            pool: address(0),
+            pool: leg.pool,
             fee: leg.fee,
             tickSpacing: leg.tickSpacing,
             hooks: leg.hooks,
             hookData: leg.hookData,
             pm: PM,
-            poolKey: bytes32(0)
+            poolKey: leg.poolKey
         });
         bytes memory cd = abi.encodeWithSelector(
             ROUTER_SWAP_SEL, els, address(0), amountIn, uint256(1), uint256(0)

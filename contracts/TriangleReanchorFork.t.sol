@@ -44,7 +44,8 @@ contract TriangleReanchorForkTest is Test {
         return RouteLeg({
             venue: 0, v3Pool: pool, inTok: inTok, outTok: outTok,
             zeroForOne: zfo, sqrtPriceLimitX96: 0, fee: fee,
-            tickSpacing: 0, hooks: address(0), hookData: ""
+            tickSpacing: 0, hooks: address(0), hookData: "",
+            pool: address(0), poolKey: bytes32(0)
         });
     }
 
@@ -54,7 +55,8 @@ contract TriangleReanchorForkTest is Test {
         return RouteLeg({
             venue: 1, v3Pool: address(0), inTok: inTok, outTok: outTok,
             zeroForOne: false, sqrtPriceLimitX96: 0, fee: V4_FEE,
-            tickSpacing: tick, hooks: hooks, hookData: ""
+            tickSpacing: tick, hooks: hooks, hookData: "",
+            pool: address(0), poolKey: bytes32(0)
         });
     }
 

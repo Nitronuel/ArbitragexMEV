@@ -125,7 +125,9 @@ contract ExecutorUUPSTest is Test {
             fee: 0,
             tickSpacing: 200,
             hooks: address(0),
-            hookData: ""
+            hookData: "",
+            pool: address(0),
+            poolKey: bytes32(0)
         });
     }
 

@@ -14,13 +14,15 @@
 use std::str::FromStr;
 
 use alloy_network::{Ethereum, EthereumWallet};
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, U256, B256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::sol;
-
 use simulation::{RouteElement, encode_swap_calldata};
+
+/// Uniswap V4 PoolManager singleton on RHC.
+const PM: Address = alloy_primitives::address!("0x8366a39CC670B4001A1121B8F6A443A643e40951");
 
 sol! {
     #[sol(all_derives)]
@@ -51,6 +53,8 @@ sol! {
         int24 tickSpacing;
         address hooks;
         bytes hookData;
+        address pool;
+        bytes32 poolKey;
     }
 }
 
@@ -565,6 +569,8 @@ pub fn build_flash_legs_data(
             tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
             hooks: *hooks,
             hookData: alloy_primitives::Bytes::new(),
+            pool: PM,
+            poolKey: alloy_primitives::B256::from_slice(&pool_id),
         });
     }
     Ok(legs.abi_encode())
@@ -597,6 +603,8 @@ pub fn build_hybrid_legs_data(
                     tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(0).unwrap(),
                     hooks: Address::ZERO,
                     hookData: alloy_primitives::Bytes::new(),
+                    pool: Address::ZERO,
+                    poolKey: alloy_primitives::B256::ZERO,
                 });
             }
             "v4" => {
@@ -618,6 +626,8 @@ pub fn build_hybrid_legs_data(
                     tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
                     hooks: *hooks,
                     hookData: alloy_primitives::Bytes::new(),
+                    pool: PM,
+                    poolKey: alloy_primitives::B256::from_slice(&pool_id),
                 });
             }
             other => return Err(format!("unknown venue profile {other:?}")),
@@ -1307,9 +1317,20 @@ pub mod trade {
         // hook pools before any estimate (fail-closed skip, not a revert).
         check_v4_hook_policy(row, overrides, hook_allowlist)?;
         if flash {
-            // Settlement + continuity guards use the router convention:
-            // native is the 0x0 sentinel, never the wrapped alias.
-            let token = super::denormalize_currency(row.token_lo);
+            // Morpho Blue can only lend ERC20, so the flash token must be the
+            // wrapped-native CONTRACT (RHC_NATIVE), never the 0x0 sentinel:
+            // `ExecutorUUPS::_requestFlash` reverts FlashUnsupported on
+            // `token == address(0)`, and its `onMorphoFlashLoan` wrap-back
+            // logic explicitly handles `token == RHC_WNATIVE`. The route legs
+            // still use the router's 0x0 convention (denormalized inside the
+            // builders); `_sameToken` treats the two as equivalent on-chain.
+            let token = row.token_lo;
+            if token.is_zero() {
+                return Err(
+                    "native-anchored flash must borrow wrapped native (RHC_NATIVE), not the 0x0 sentinel"
+                        .to_owned(),
+                );
+            }
             let is_hybrid = row.legs.iter().any(|l| l.starts_with("v3:"));
             let legs_data = if is_hybrid {
                 // Hybrid V3+V4 via direct leg loop in ExecutorV3: build HybridLeg[] ABI
@@ -1555,6 +1576,8 @@ mod override_key_tests {
             tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(200).unwrap(),
             hooks: Address::ZERO,
             hookData: alloy_primitives::Bytes::new(),
+            pool: Address::ZERO,
+            poolKey: alloy_primitives::B256::ZERO,
         };
         let legs = vec![leg(a, b), leg(b, a)];
         let data = EntryPoint::for_route(CapitalSource::Morpho, true).encode(
@@ -1617,6 +1640,74 @@ mod override_key_tests {
             !map.contains_key("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Morpho flash entry: the flash token must be the wrapped-native
+    /// CONTRACT (raw `row.token_lo`), never the 0x0 sentinel — Morpho Blue can
+    /// only lend ERC20 and `ExecutorUUPS::_requestFlash` reverts
+    /// FlashUnsupported on `address(0)`. (The regression this pins: the flash
+    /// path used to `denormalize_currency` the anchor and sent `0x0` to the
+    /// executor for every native-anchored route, failing at estimate.)
+    #[test]
+    fn morpho_flash_borrows_wrapped_native_not_sentinel() {
+        use super::{build_flash_legs_data, build_hybrid_legs_data, trade::GatedRow};
+        use alloy_primitives::{Address, U256, Uint};
+        use alloy_sol_types::SolValue;
+
+        let wrapped: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+            .parse()
+            .unwrap();
+        let token: Address = "0x020bfc650a365f8BB26819deAAbF3E21291018b4"
+            .parse()
+            .unwrap();
+        let hooks = Address::ZERO;
+        let pid = "084cee4d5edcd028175abb3a04bce5ce95b1ec2b432e6365a924c98deb78d886";
+        let pm = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
+        let row = GatedRow {
+            kind: "pair".to_owned(),
+            token_lo: wrapped,
+            input: U256::from(1_000_000_u64),
+            output: U256::from(1_001_000_u64),
+            profit: U256::from(1_000_u64),
+            legs: vec![
+                format!("v4:{pm}:{pid}:{wrapped}:{token}:250"),
+                format!("v4:{pm}:{pid}:{token}:{wrapped}:250"),
+            ],
+        };
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(pid.to_owned(), (60_i32, hooks));
+
+        // The flash entry `token` equals the raw wrapped anchor — asserted via
+        // the legs: leg[0] must START at wrapped (executor re-denormalizes to
+        // 0x0 for the router/PM inside `_runLegs`, where the sentinel belongs).
+        let bytes = build_flash_legs_data(&row, &overrides).unwrap();
+        let legs = <Vec<super::RouteLegSol>>::abi_decode(&bytes).unwrap();
+        assert_eq!(legs[0].inTok, Address::ZERO); // router convention inside legs
+        assert_eq!(legs[1].outTok, Address::ZERO);
+
+        // Hybrid path keeps V3 legs at real addresses (no sentinel rewrite).
+        let v3: Address = "0x8df767cbef77ee0997a400f11a8902aa1728e179"
+            .parse()
+            .unwrap();
+        let row3 = GatedRow {
+            kind: "pair".to_owned(),
+            token_lo: wrapped,
+            input: U256::from(1_000_000_u64),
+            output: U256::from(1_001_000_u64),
+            profit: U256::from(1_000_u64),
+            legs: vec![
+                format!("v3:{v3}:{pid}:{wrapped}:{token}:10000"),
+                format!("v4:{pm}:{pid}:{token}:{wrapped}:250"),
+            ],
+        };
+        let bytes = build_hybrid_legs_data(&row3, &overrides).unwrap();
+        let legs = <Vec<super::RouteLegSol>>::abi_decode(&bytes).unwrap();
+        assert_eq!(legs[0].venue, 0);
+        assert_eq!(legs[0].inTok, wrapped);
+        assert_eq!(legs[0].outTok, token);
+        assert_eq!(legs[1].inTok, token);
+        assert_eq!(legs[1].outTok, Address::ZERO);
+        assert_eq!(legs[1].fee, Uint::<24, 1>::from(250));
     }
 
     /// Router-leg encoding: builders emit directional in/out with the 0x0
@@ -1726,9 +1817,9 @@ mod override_key_tests {
         let mut listed = std::collections::HashSet::new();
         listed.insert(hooked.to_owned());
         assert!(check_v4_hook_policy(&row, &overrides, &listed).is_ok());
-        // Zero-hook legs always pass the screen (fee 38962 = observed on-chain).
+        // Zero-hook legs always pass the screen (fee = true key fee).
         let clean = GatedRow {
-            legs: vec![format!("v4:{pm}:{plain}:{usdg}:{weth}:38962")],
+            legs: vec![format!("v4:{pm}:{plain}:{usdg}:{weth}:38000")],
             ..row
         };
         assert!(check_v4_hook_policy(&clean, &overrides, &empty).is_ok());
