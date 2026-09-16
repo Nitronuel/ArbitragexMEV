@@ -23,3 +23,9 @@ out/
 # Scratch canary artifacts (superseded by data/manifest-seed.csv)
 data/manifest-live.csv
 data/manifest-seed-old-backup.csv
+
+# Regenerable bulk catalog (219M, over the 100M LFS line — rebuild via build-pools-all)
+data/pools-all.csv
+
+# Timestamped auto-generated hot manifest / unknown-pool snapshots
+data/*-auto-*.csv
