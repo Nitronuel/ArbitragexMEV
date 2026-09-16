@@ -1,0 +1,13 @@
+# Router dead-list: V4 pools whose legs revert BAD_ARGS at estimate on the
+# current router impl (0x133E48d1…), although their (fee,tick,hooks) keys
+# are PROVEN correct by PoolId preimage (2026-09-14 fork forensics).
+# One pool_id per line (`0x` prefix optional, case-insensitive).
+# Effect: trade refuses rows touching these pools BEFORE estimate (loudly),
+# instead of spending preflight + estimate on certain reverts. Detection
+# keeps quoting them (no bakeoff/coverage loss); remove an entry the moment
+# a working call shape is found — see docs/plans/STATUS.md 2026-09-14.
+pool_id
+0x7159c43bcc3961cf25e85875cbfca5eb4294fb54ce7dd88047bc3559794d832f
+0xe9e93bd1fa0f05fcce035e0f4b456f7f8079e8da9a3dceefb0cc89607dfdaa6a
+0xe172fed4f53005ded9ef30d9cdf95f3b6a03dc095fe562c453ef595dab809a8b
+0x2500e77b68040591e0e75acaa612616fa6b4eaa33423ce35add57413c63ffa67

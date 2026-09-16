@@ -32,7 +32,12 @@ import subprocess
 import sys
 import time
 
-RPC = "https://rpc.mainnet.chain.robinhood.com"
+RPC = os.environ.get(
+    "FLASH_REFRESH_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"
+)
+# Default stays the public gateway (never burns Chainstack RU by accident —
+# same discipline as pool-indexer.py); export FLASH_REFRESH_RPC_URL only for
+# explicit one-shot refreshes during public-gateway 429 storms.
 MORPHO = "0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010"
 BALANCEOF = "0x70a08231"  # keccak("balanceOf(address)")[0:4]
 DECIMALS = "0x313ce567"  # keccak("decimals()")[0:4]
@@ -76,7 +81,10 @@ def eth_call_int(to, data):
 
 
 def norm(addr):
-    return addr.strip().lower().removeprefix("0x").rjust(40, "0")
+    # ABI-pad to a full 32-byte word (64 hex chars). A bare 40-char address
+    # makes short calldata and every probe reverts (found 2026-09-15: all
+    # 38 probes failed deterministically on two endpoints).
+    return addr.strip().lower().removeprefix("0x").rjust(64, "0")
 
 
 def balance_of(token):

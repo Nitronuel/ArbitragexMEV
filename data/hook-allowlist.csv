@@ -5,4 +5,10 @@
 # whose overrides hooks address is nonzero is REFUSED from freshly built
 # manifests unless listed here: hook pricing needs hook logic, and vanilla
 # math on hook pools produces ghosts. Empty by default (refuse all).
+#
+# Grandfathered live pools (sim-gated: estimate_entry + on-chain minProfit
+# decide every attempt; listed here so execution matches detection's
+# warn-only policy — see project docs and STATUS.md 2026-09-14):
 pool_id
+0x00dd2df2f17d431cf3a0938f06c9cf9abc5e9643b6cc466ca3f71f3af246edf3
+0x85aa9a7c2ef9deec7bcbc5e78c6b26d2598c2aaf3f810b267fa4f8f9b0854142
