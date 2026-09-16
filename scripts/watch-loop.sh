@@ -13,13 +13,21 @@ MAXGAP="${2:-90}"
 LOG="logs/live/run-pairs-hot.log"
 restart() {
   echo "$(date -u +%FT%TZ) watch-loop: $1, restarting hot loop" >> logs/live/watch-loop.log
-  if [[ -z "${CHAINSTACK_RHC_HTTP_URL:-}" ]]; then
-    # Non-interactive tmux panes skip the operator .bashrc exports (PS1
-    # guard), so restarts silently fell back to the public gateway and
-    # re-entered the throttle spiral (incident 2026-09-07). Load the
-    # exports so restarts stay on the Chainstack primary; values never
-    # leave this shell (label-only logging downstream).
-    PS1=x source ~/.bashrc 2>/dev/null || true
+  # WSS event lane always needs the operator exports (PS1 guard for
+  # non-interactive panes; values never leave this shell).
+  PS1=x source ~/.bashrc 2>/dev/null || true
+  # HTTP backend is operator-selectable via DETECTION_HTTP_BACKEND
+  # (default `public` since 2026-09-16): detection HTTP on the public
+  # gateway keeps the Chainstack account-level RPS budget for `trade`,
+  # which -32005-walls otherwise (incident 2026-09-16). Set
+  # DETECTION_HTTP_BACKEND=chainstack to restore the 2026-09-07 posture.
+  local backend="${DETECTION_HTTP_BACKEND:-public}"
+  if [[ "$backend" == "chainstack" && -z "${CHAINSTACK_RHC_HTTP_URL:-}" ]]; then
+    echo "$(date -u +%FT%TZ) watch-loop: DETECTION_HTTP_BACKEND=chainstack but CHAINSTACK_RHC_HTTP_URL unavailable; staying public" >> logs/live/watch-loop.log
+    backend="public"
+  fi
+  if [[ "$backend" == "public" ]]; then
+    unset CHAINSTACK_RHC_HTTP_URL
   fi
   pkill -f "manifest-hot" 2>/dev/null || true
   sleep 3
