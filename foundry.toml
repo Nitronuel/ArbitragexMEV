@@ -16,4 +16,4 @@ remappings = [
 ]
 
 [rpc_endpoints]
-rhc = "https://rpc.mainnet.chain.robinhood.com"
+rhc = "${CHAINSTACK_RHC_HTTP_URL}"
