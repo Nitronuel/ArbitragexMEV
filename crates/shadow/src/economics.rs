@@ -425,7 +425,9 @@ mod tests {
         );
         // ...but not far under: the rate stays within (33.3%, 33.5%].
         assert!(gate_defaults::STANDARD_EXPECTED_WIN_RATE > U256::from(333_000_000_000_000_000u64));
-        assert!(gate_defaults::STANDARD_EXPECTED_WIN_RATE <= U256::from(335_000_000_000_000_000u64));
+        assert!(
+            gate_defaults::STANDARD_EXPECTED_WIN_RATE <= U256::from(335_000_000_000_000_000u64)
+        );
     }
 
     #[test]

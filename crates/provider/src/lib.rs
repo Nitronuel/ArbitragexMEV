@@ -1,5 +1,6 @@
 mod budget;
 mod events;
+mod feed;
 mod http;
 mod live;
 mod redacted_url;
@@ -13,6 +14,7 @@ pub use events::{
     v3_mint_topic, v3_pool_created_topic, v3_swap_topic, v4_initialize_topic,
     v4_modify_liquidity_topic, v4_swap_topic,
 };
+pub use feed::{FeedClient, FeedFrame};
 pub use http::{
     ChainReader, HttpBackend, HttpResponse, LogFilter, RetryPolicy, RpcRequest, Sleeper,
     ThreadSleeper, TransportError, V4_POOLS_MAPPING_SLOT, parse_v4_slot0, v4_pool_slot,

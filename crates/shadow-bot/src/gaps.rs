@@ -2915,6 +2915,365 @@ pub fn quote_triangle(
     }))
 }
 
+/// A four-hop token cycle (quad) over cross-venue pairs: every consecutive
+/// edge (including the closing edge) is present on both venues. At least one
+/// member must be a pricing anchor (`RHC_NATIVE`/WETH or `RHC_USDG`) so the
+/// round-trip profit is denominated in a flash-borrowable, USD-priced token.
+pub type TokenQuad = ([u8; 20], [u8; 20], [u8; 20], [u8; 20]);
+
+/// A five-hop token cycle (quint); same structural + anchor rules as
+/// [`TokenQuad`].
+pub type TokenQuint = ([u8; 20], [u8; 20], [u8; 20], [u8; 20], [u8; 20]);
+
+/// Deterministic cap on enumerated 4/5-hop cycles per shape. Generation order
+/// is fully deterministic (sorted nodes, sorted adjacency), so truncation —
+/// if it ever binds — is stable across runs. Live counts are surfaced on the
+/// run-pairs poll line; raise only with a cost review (each cycle is quoted
+/// per member-swap trigger).
+pub const MAX_ENUM_CYCLES: usize = 20_000;
+
+/// Builds the cross-venue pair adjacency used by N-hop cycle enumeration:
+/// sorted node list, node -> sorted neighbor list, node -> index. Mirrors the
+/// adjacency core of [`enumerate_triangles`] (kept separate so the audited
+/// triangle path is untouched).
+fn build_cycle_adjacency(
+    a: &[PoolEntry],
+    b: &[PoolEntry],
+) -> (
+    Vec<[u8; 20]>,
+    HashMap<[u8; 20], Vec<[u8; 20]>>,
+    HashMap<[u8; 20], usize>,
+) {
+    let usable = |e: &PoolEntry| {
+        if e.profile == *b"v4" && (e.fee == 0 || e.fee == 8_388_608) {
+            return true;
+        }
+        leg_toll(e.fee, e.fee_denominator, e.profile).is_some()
+    };
+    let mut per_pair: HashMap<([u8; 20], [u8; 20]), u8> = HashMap::new();
+    for e in a.iter().filter(|e| usable(e)) {
+        *per_pair.entry(pair_key(e.token0, e.token1)).or_default() |= 1;
+    }
+    for e in b.iter().filter(|e| usable(e)) {
+        *per_pair.entry(pair_key(e.token0, e.token1)).or_default() |= 2;
+    }
+    let mut adj: HashMap<[u8; 20], Vec<[u8; 20]>> = HashMap::new();
+    for (k, mask) in &per_pair {
+        if *mask == 0b11 {
+            let (lo, hi) = *k;
+            adj.entry(lo).or_default().push(hi);
+            adj.entry(hi).or_default().push(lo);
+        }
+    }
+    for v in adj.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    let mut keys: Vec<[u8; 20]> = adj.keys().copied().collect();
+    keys.sort_unstable();
+    let index: HashMap<[u8; 20], usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    (keys, adj, index)
+}
+
+fn cycle_is_anchored(tokens: &[[u8; 20]]) -> bool {
+    tokens.iter().any(|t| {
+        let a = Address::from_slice(t);
+        a == RHC_NATIVE || a == RHC_USDG
+    })
+}
+
+/// Enumerates anchored 4-cycles `u -> v -> x -> w -> u` over cross-venue
+/// pairs. Canonical form: `u` is the smallest node and the second node sorts
+/// below the fourth, so each undirected cycle appears exactly once, oriented.
+/// Deterministic order; truncated at [`MAX_ENUM_CYCLES`].
+#[must_use]
+pub fn enumerate_quad(a: &[PoolEntry], b: &[PoolEntry]) -> Vec<TokenQuad> {
+    let (keys, adj, index) = build_cycle_adjacency(a, b);
+    let mut quads = Vec::new();
+    for (u_idx, u) in keys.iter().enumerate() {
+        let u_adj = &adj[u];
+        for v in u_adj {
+            let v_idx = index[v];
+            if v_idx <= u_idx {
+                continue;
+            }
+            let v_adj = &adj[v];
+            for x in v_adj {
+                let x_idx = match index.get(x) {
+                    Some(i) => *i,
+                    None => continue,
+                };
+                if x_idx <= u_idx || x_idx == v_idx {
+                    continue;
+                }
+                let x_adj = &adj[x];
+                for w in x_adj {
+                    let w_idx = match index.get(w) {
+                        Some(i) => *i,
+                        None => continue,
+                    };
+                    if w_idx <= u_idx || w_idx == v_idx || w_idx == x_idx {
+                        continue;
+                    }
+                    if w_idx <= v_idx {
+                        continue;
+                    }
+                    if adj[w].binary_search(u).is_err() {
+                        continue;
+                    }
+                    let quad = (*u, *v, *x, *w);
+                    if !cycle_is_anchored(&[quad.0, quad.1, quad.2, quad.3]) {
+                        continue;
+                    }
+                    quads.push(quad);
+                    if quads.len() >= MAX_ENUM_CYCLES {
+                        return quads;
+                    }
+                }
+            }
+        }
+    }
+    quads
+}
+
+/// Enumerates anchored 5-cycles `u -> v -> x -> y -> z -> u`, canonicalized
+/// like [`enumerate_quad`] (`u` smallest, second node below fifth).
+/// Deterministic order; truncated at [`MAX_ENUM_CYCLES`].
+#[must_use]
+pub fn enumerate_quint(a: &[PoolEntry], b: &[PoolEntry]) -> Vec<TokenQuint> {
+    let (keys, adj, index) = build_cycle_adjacency(a, b);
+    let mut quints = Vec::new();
+    for (u_idx, u) in keys.iter().enumerate() {
+        let u_adj = &adj[u];
+        for v in u_adj {
+            let v_idx = index[v];
+            if v_idx <= u_idx {
+                continue;
+            }
+            for x in &adj[v] {
+                let x_idx = match index.get(x) {
+                    Some(i) => *i,
+                    None => continue,
+                };
+                if x_idx <= u_idx || x_idx == v_idx {
+                    continue;
+                }
+                for y in &adj[x] {
+                    let y_idx = match index.get(y) {
+                        Some(i) => *i,
+                        None => continue,
+                    };
+                    if y_idx <= u_idx || y_idx == v_idx || y_idx == x_idx {
+                        continue;
+                    }
+                    for z in &adj[y] {
+                        let z_idx = match index.get(z) {
+                            Some(i) => *i,
+                            None => continue,
+                        };
+                        if z_idx <= u_idx || z_idx == v_idx || z_idx == x_idx || z_idx == y_idx {
+                            continue;
+                        }
+                        if z_idx <= v_idx {
+                            continue;
+                        }
+                        if adj[z].binary_search(u).is_err() {
+                            continue;
+                        }
+                        let quint = (*u, *v, *x, *y, *z);
+                        if !cycle_is_anchored(&[quint.0, quint.1, quint.2, quint.3, quint.4]) {
+                            continue;
+                        }
+                        quints.push(quint);
+                        if quints.len() >= MAX_ENUM_CYCLES {
+                            return quints;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    quints
+}
+
+/// Quotes an N-hop token cycle `tokens[0] -> ... -> tokens[n-1] -> tokens[0]`,
+/// choosing the cheapest-toll priced leg per edge across both venues. The
+/// closed-form `optimal_input` over the generic [`domain::Cycle`] sizes any
+/// hop count, so pairs (2), triangles (3), quads (4) and quints (5) share one
+/// math path; only enumeration and screening differ per shape.
+///
+/// # Errors
+///
+/// Returns a message describing malformed cycles or missing state.
+pub fn quote_cycle(
+    tokens: &[Address],
+    buckets: &PoolByPair,
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+) -> Result<Option<PairQuote>, String> {
+    use domain::{Cycle, CycleHop, CycleId, Fee, PoolId, PoolState, StateVersion};
+    use v2_math::optimal_input;
+
+    if tokens.len() < 2 {
+        return Err("cycle needs at least 2 tokens".to_owned());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for t in tokens {
+        if !seen.insert(t.0) {
+            return Err("cycle tokens must be distinct".to_owned());
+        }
+    }
+    let n = tokens.len();
+    let mut legs: Vec<CycleLeg> = Vec::with_capacity(n);
+    for i in 0..n {
+        let from = tokens[i];
+        let to = tokens[(i + 1) % n];
+        legs.push(
+            cheapest_leg_in(pair_key(from, to), buckets, prices_a, prices_b)
+                .ok_or_else(|| format!("cycle edge {i} unpriced"))?,
+        );
+    }
+    let states: Vec<PoolState> = legs
+        .iter()
+        .map(|leg| {
+            let (r0, r1) = virtual_reserves(leg.price.sqrt, leg.price.liquidity);
+            PoolState {
+                reserve0: r0,
+                reserve1: r1,
+                block_number: leg.price.block,
+                transaction_index: 0,
+                log_index: 0,
+                version: StateVersion(leg.price.block),
+            }
+        })
+        .collect();
+    let cycle = Cycle {
+        id: CycleId(0),
+        anchor: tokens[0],
+        hops: legs
+            .iter()
+            .enumerate()
+            .map(|(i, leg)| {
+                let from = tokens[i];
+                let to = tokens[(i + 1) % n];
+                CycleHop {
+                    pool_id: PoolId(i as u32),
+                    token_in: from,
+                    token_out: to,
+                    fee: Fee {
+                        numerator: leg.entry.fee_denominator.saturating_sub(leg.entry.fee),
+                        denominator: leg.entry.fee_denominator,
+                    },
+                    zero_for_one: leg.entry.token0 == from,
+                }
+            })
+            .collect(),
+    };
+    let leg_caps: Vec<U256> = legs
+        .iter()
+        .enumerate()
+        .map(|(i, leg)| {
+            single_tick_capacity(
+                leg.price.sqrt,
+                leg.price.liquidity,
+                tick_spacing_from_fee(leg.entry.fee),
+                leg.entry.token0 == tokens[i],
+            )
+        })
+        .collect();
+    let Some(unclamped) =
+        optimal_input(&cycle, &states).map_err(|e| format!("optimal input failed: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let (input, output, profit) = finalize_capacity_checked(&cycle, &states, &leg_caps, unclamped)?;
+    let mut keep_product = 1.0f64;
+    for leg in &legs {
+        let keep = effective_leg_toll(&leg.entry, &leg.price)
+            .map(|toll| 1.0 - toll)
+            .ok_or_else(|| "cycle edge has no quotable toll".to_owned())?;
+        keep_product *= keep;
+    }
+    let toll = 1.0 - keep_product;
+    let oriented = |leg: &CycleLeg, token_in: Address| -> f64 {
+        let raw = price_out(leg.price.sqrt);
+        if leg.entry.token0 == token_in {
+            raw
+        } else {
+            SQRT_PRICE_CONVENTION_K * SQRT_PRICE_CONVENTION_K / raw.max(f64::MIN_POSITIVE)
+        }
+    };
+    let mut product = 1.0f64;
+    for (i, leg) in legs.iter().enumerate() {
+        product *= oriented(leg, tokens[i]);
+    }
+    let log2_skew = (product.log2() - 96.0 * n as f64).abs();
+    Ok(Some(PairQuote {
+        token_lo: tokens[0],
+        token_hi: tokens[n - 1],
+        input,
+        output,
+        profit,
+        toll,
+        log2_skew,
+        optimal_unclamped: unclamped.input,
+        input_capacity: input.min(unclamped.input),
+        legs: legs
+            .iter()
+            .enumerate()
+            .map(|(i, leg)| LegRoute {
+                profile: leg.entry.profile,
+                pool: leg.entry.venue,
+                pool_id: leg.entry.id,
+                token_in: tokens[i],
+                token_out: tokens[(i + 1) % n],
+                fee_raw: leg.entry.fee,
+            })
+            .collect(),
+    }))
+}
+
+/// Quotes a four-hop quad cycle (see [`quote_cycle`] for the shared math).
+///
+/// # Errors
+///
+/// Returns a message describing malformed cycles or missing state.
+pub fn quote_quad(
+    quad: TokenQuad,
+    buckets: &PoolByPair,
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+) -> Result<Option<PairQuote>, String> {
+    let tokens = [
+        Address::from_slice(&quad.0),
+        Address::from_slice(&quad.1),
+        Address::from_slice(&quad.2),
+        Address::from_slice(&quad.3),
+    ];
+    quote_cycle(&tokens, buckets, prices_a, prices_b)
+}
+
+/// Quotes a five-hop quint cycle (see [`quote_cycle`] for the shared math).
+///
+/// # Errors
+///
+/// Returns a message describing malformed cycles or missing state.
+pub fn quote_quint(
+    quint: TokenQuint,
+    buckets: &PoolByPair,
+    prices_a: &HashMap<[u8; 32], PoolPrice>,
+    prices_b: &HashMap<[u8; 32], PoolPrice>,
+) -> Result<Option<PairQuote>, String> {
+    let tokens = [
+        Address::from_slice(&quint.0),
+        Address::from_slice(&quint.1),
+        Address::from_slice(&quint.2),
+        Address::from_slice(&quint.3),
+        Address::from_slice(&quint.4),
+    ];
+    quote_cycle(&tokens, buckets, prices_a, prices_b)
+}
+
 /// Combines the latest per-pool prices and computes gap-vs-toll aggregate
 /// statistics over the cross-venue pairs (see [`gap_rankings`] for the
 /// per-pair ranking it summarizes).
@@ -3603,13 +3962,15 @@ mod tests {
         // (profit == gross) and undervalued true USD by 1e12 — silently
         // suppressing gates. The loader accepts the 1e30 pin (see above);
         // this pins the committed table to the same scale.
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../data/prices-live.csv");
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/prices-live.csv");
         let text = std::fs::read_to_string(&path).expect("prices-live.csv readable");
         let mut found = false;
         for line in text.lines().skip(1) {
             let cols: Vec<&str> = line.split(',').collect();
-            if cols.len() >= 2 && cols[0].trim().to_lowercase() == "0x5fc5360d0400a0fd4f2af552add042d716f1d168" {
+            if cols.len() >= 2
+                && cols[0].trim().to_lowercase() == "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+            {
                 found = true;
                 assert_eq!(
                     cols[1].trim(),
@@ -3629,13 +3990,15 @@ mod tests {
         // scale ($/whole × 1e18 at 18 decimals); refresh with `--native-usd`.
         // Bounds are wide on purpose (staleness is the operator's job; the
         // gate still decimates dust) but reject zero and absurd values.
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../data/prices-live.csv");
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/prices-live.csv");
         let text = std::fs::read_to_string(&path).expect("prices-live.csv readable");
         let mut found = false;
         for line in text.lines().skip(1) {
             let cols: Vec<&str> = line.split(',').collect();
-            if cols.len() >= 2 && cols[0].trim().to_lowercase() == "0x0bd7d308f8e1639fab988df18a8011f41eacad73" {
+            if cols.len() >= 2
+                && cols[0].trim().to_lowercase() == "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+            {
                 found = true;
                 let v: u128 = cols[1].trim().parse().expect("weth price parses");
                 assert!(
@@ -5554,5 +5917,179 @@ mod tests {
         // Unknown keys and uninitialized pools are skipped.
         assert!(!out.contains_key(&[0xabu8; 32]));
         assert_eq!(out.len(), 2);
+    }
+
+    // ---- 4/5-hop cycle enumeration + quoting (max_hops extension) ----
+
+    fn cycle_entry(
+        profile: [u8; 2],
+        venue_byte: u8,
+        id_byte: u8,
+        t0: Address,
+        t1: Address,
+    ) -> PoolEntry {
+        PoolEntry {
+            profile,
+            venue: Address::repeat_byte(venue_byte),
+            id: [id_byte; 32],
+            fee: 3000,
+            token0: t0,
+            token1: t1,
+            fee_denominator: 1_000_000,
+            factory: Address::ZERO,
+            chain_id: 4663,
+        }
+    }
+
+    fn cycle_edges_both_venues(edges: &[(Address, Address)]) -> (Vec<PoolEntry>, Vec<PoolEntry>) {
+        let mut a_side = Vec::new();
+        let mut b_side = Vec::new();
+        for (i, (t0, t1)) in edges.iter().enumerate() {
+            let k = u8::try_from(i).unwrap_or(0);
+            a_side.push(cycle_entry(*b"v3", 0xa0, k, *t0, *t1));
+            b_side.push(cycle_entry(*b"v4", 0xb0, 0x40 + k, *t0, *t1));
+        }
+        (a_side, b_side)
+    }
+
+    #[test]
+    fn enumerate_quad_finds_anchored_four_cycle() {
+        let anchor = RHC_USDG;
+        let b = Address::repeat_byte(0x02);
+        let c = Address::repeat_byte(0x03);
+        let d = Address::repeat_byte(0x04);
+        let (a_side, b_side) = cycle_edges_both_venues(&[(anchor, b), (b, c), (c, d), (d, anchor)]);
+        let quads = enumerate_quad(&a_side, &b_side);
+        assert_eq!(quads.len(), 1, "one anchored square, got {quads:?}");
+        let q = quads[0];
+        let members = [q.0, q.1, q.2, q.3];
+        assert_eq!(
+            q.0,
+            *members.iter().min().unwrap(),
+            "canonical start is the minimum"
+        );
+        let mut sorted = members;
+        sorted.sort_unstable();
+        let mut expected = [anchor.0, b.0, c.0, d.0];
+        expected.sort_unstable();
+        assert_eq!(sorted, expected);
+    }
+
+    #[test]
+    fn enumerate_quad_excludes_unanchored_cycle() {
+        let w = Address::repeat_byte(0x05);
+        let x = Address::repeat_byte(0x06);
+        let y = Address::repeat_byte(0x07);
+        let z = Address::repeat_byte(0x08);
+        let (a_side, b_side) = cycle_edges_both_venues(&[(w, x), (x, y), (y, z), (z, w)]);
+        assert!(
+            enumerate_quad(&a_side, &b_side).is_empty(),
+            "anchorless squares must not enumerate"
+        );
+    }
+
+    #[test]
+    fn enumerate_quad_dedupes_k4_rotations() {
+        // K4 on {anchor, x, y, z} has exactly (4-1)!/2 = 3 undirected
+        // 4-cycles; canonicalization must yield all three exactly once.
+        let anchor = RHC_USDG;
+        let x = Address::repeat_byte(0x09);
+        let y = Address::repeat_byte(0x0a);
+        let z = Address::repeat_byte(0x0b);
+        let nodes = [anchor, x, y, z];
+        let mut edges = Vec::new();
+        for (i, a) in nodes.iter().enumerate() {
+            for b in nodes.iter().skip(i + 1) {
+                edges.push((*a, *b));
+            }
+        }
+        let (a_side, b_side) = cycle_edges_both_venues(&edges);
+        let quads = enumerate_quad(&a_side, &b_side);
+        assert_eq!(quads.len(), 3, "K4 holds 3 four-cycles, got {quads:?}");
+        // Every 4-cycle of K4 spans all four vertices, so dedupe must
+        // compare edge sets, not member sets.
+        let mut seen = std::collections::HashSet::new();
+        for q in &quads {
+            let toks = [
+                Address::from_slice(&q.0),
+                Address::from_slice(&q.1),
+                Address::from_slice(&q.2),
+                Address::from_slice(&q.3),
+            ];
+            let mut edges: Vec<([u8; 20], [u8; 20])> = (0..4)
+                .map(|i| pair_key(toks[i], toks[(i + 1) % 4]))
+                .collect();
+            edges.sort_unstable();
+            assert!(seen.insert(edges), "duplicate rotation: {q:?}");
+        }
+    }
+
+    #[test]
+    fn enumerate_quint_finds_anchored_five_cycle() {
+        let anchor = RHC_NATIVE;
+        let n1 = Address::repeat_byte(0x0c);
+        let n2 = Address::repeat_byte(0x0d);
+        let n3 = Address::repeat_byte(0x0e);
+        let n4 = Address::repeat_byte(0x0f);
+        let (a_side, b_side) =
+            cycle_edges_both_venues(&[(anchor, n1), (n1, n2), (n2, n3), (n3, n4), (n4, anchor)]);
+        let quints = enumerate_quint(&a_side, &b_side);
+        assert_eq!(quints.len(), 1, "one anchored pentagon, got {quints:?}");
+        assert_eq!(
+            quints[0].0,
+            *[
+                quints[0].0,
+                quints[0].1,
+                quints[0].2,
+                quints[0].3,
+                quints[0].4
+            ]
+            .iter()
+            .min()
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn quote_cycle_matches_triangle_quote() {
+        // Same fixture through both entry points: the generic N-hop core
+        // must reproduce the audited triangle quote field-for-field.
+        let p0 = RHC_USDG;
+        let p1 = Address::repeat_byte(0x21);
+        let p2 = Address::repeat_byte(0x22);
+        let e01 = cycle_entry(*b"v3", 0xc0, 0x01, p0, p1);
+        let e12 = cycle_entry(*b"v3", 0xc0, 0x02, p1, p2);
+        let e20 = cycle_entry(*b"v3", 0xc0, 0x03, p2, p0);
+        let liq = U256::from(10_000_000_000_000_000_000_000u128);
+        let mut prices_a = HashMap::new();
+        for (e, shift) in [(&e01, 0u32), (&e12, 1u32), (&e20, 0u32)] {
+            prices_a.extend(price_map(e, U256::from(1u64) << (96 + shift), liq));
+        }
+        let mut buckets: PoolByPair = HashMap::new();
+        for e in [&e01, &e12, &e20] {
+            buckets
+                .entry(pair_key(e.token0, e.token1))
+                .or_default()
+                .0
+                .push(*e);
+        }
+        let tri = quote_triangle(p0, p1, p2, &buckets, &prices_a, &HashMap::new())
+            .expect("triangle quote must not error");
+        let cyc = quote_cycle(&[p0, p1, p2], &buckets, &prices_a, &HashMap::new())
+            .expect("cycle quote must not error");
+        match (tri, cyc) {
+            (Some(t), Some(c)) => {
+                assert_eq!(t.input, c.input);
+                assert_eq!(t.output, c.output);
+                assert_eq!(t.profit, c.profit);
+                assert_eq!(t.toll, c.toll);
+                assert_eq!(t.log2_skew, c.log2_skew);
+                assert_eq!(t.token_lo, c.token_lo);
+                assert_eq!(t.token_hi, c.token_hi);
+                assert_eq!(t.legs.len(), c.legs.len());
+            }
+            (None, None) => {}
+            (t, c) => panic!("triangle/cycle quote diverged: {t:?} vs {c:?}"),
+        }
     }
 }

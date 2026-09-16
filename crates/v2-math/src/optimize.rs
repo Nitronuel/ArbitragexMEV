@@ -30,7 +30,7 @@ pub fn optimal_input(
     cycle: &Cycle,
     states: &[PoolState],
 ) -> Result<Option<OptimalQuote>, MathError> {
-    if !(2..=4).contains(&cycle.hops.len()) {
+    if !(2..=5).contains(&cycle.hops.len()) {
         return Err(MathError::InvalidCycleLength);
     }
     validate_route(cycle)?;

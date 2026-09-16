@@ -64,6 +64,8 @@ where
 
 type DirtyPairQueue = DirtyQueue<PairKey>;
 type DirtyTriQueue = DirtyQueue<usize>;
+type DirtyQuadQueue = DirtyQueue<usize>;
+type DirtyQuintQueue = DirtyQueue<usize>;
 
 /// Backstop age bound: a cached price this many blocks behind the tip screens
 /// even when sweep coverage claims continuity. Generous by design — under
@@ -116,12 +118,43 @@ pub struct PairRunOutcome {
     pub triangle_interesting: Vec<usize>,
     /// Triangles whose quote failed or lacked a priced edge.
     pub triangle_not_evaluated: Vec<usize>,
+    /// First `quote_triangle` failure reason this batch (Phase 3 visibility,
+    /// 2026-09-15): distinguishes "no member pool swapped" (empty batch,
+    /// field stays `None`) from "dirty but unquotable" (co-pricing miss).
+    /// Kept to the first error only — the poll line renders it truncated.
+    pub triangle_first_error: Option<String>,
     /// Pairs screened because a priced candidate pool's sweep coverage is
     /// broken (or its price breached the age backstop). Each entry carries the
     /// screening detail. These pairs are *not* evaluated economically.
     pub stale_screened: Vec<(PairKey, String)>,
     /// Triangles screened for the same reason, parallel semantics.
     pub triangle_stale_screened: Vec<(usize, String)>,
+    /// Four-hop quads (indexes into the evaluator's quad list) that produced
+    /// a quote this batch.
+    pub quad_evaluated: Vec<usize>,
+    /// Quotes and classifications parallel to [`Self::quad_evaluated`].
+    pub quad_results: Vec<(crate::gaps::PairQuote, shadow::Classification)>,
+    /// Quads whose quote cleared the submission-gate floor.
+    pub quad_interesting: Vec<usize>,
+    /// Quads whose quote failed or lacked a priced edge.
+    pub quad_not_evaluated: Vec<usize>,
+    /// First quad-quote failure reason this batch (same visibility role as
+    /// [`Self::triangle_first_error`]).
+    pub quad_first_error: Option<String>,
+    /// Quads screened for broken sweep coverage, parallel semantics.
+    pub quad_stale_screened: Vec<(usize, String)>,
+    /// Five-hop quints; fields parallel to the quad set above.
+    pub quint_evaluated: Vec<usize>,
+    /// Quotes and classifications parallel to [`Self::quint_evaluated`].
+    pub quint_results: Vec<(crate::gaps::PairQuote, shadow::Classification)>,
+    /// Quints whose quote cleared the submission-gate floor.
+    pub quint_interesting: Vec<usize>,
+    /// Quints whose quote failed or lacked a priced edge.
+    pub quint_not_evaluated: Vec<usize>,
+    /// First quint-quote failure reason this batch.
+    pub quint_first_error: Option<String>,
+    /// Quints screened for broken sweep coverage, parallel semantics.
+    pub quint_stale_screened: Vec<(usize, String)>,
     /// The dirty queue exceeded its configured capacity this batch.
     pub degraded: bool,
 }
@@ -140,6 +173,19 @@ pub struct PairDirtyEvaluator {
     triangles: Vec<crate::gaps::TokenTriple>,
     /// `(profile, pool)` -> triangle indexes touching that pool.
     by_pool_tri: HashMap<([u8; 2], [u8; 32]), HashSet<usize>>,
+    /// Enumerated four-hop quads (anchored); indexes shared by
+    /// `by_pool_quad`. Screened only when `max_hops >= 4`.
+    quads: Vec<crate::gaps::TokenQuad>,
+    /// `(profile, pool)` -> quad indexes touching that pool.
+    by_pool_quad: HashMap<([u8; 2], [u8; 32]), HashSet<usize>>,
+    /// Enumerated five-hop quints (anchored); screened only when
+    /// `max_hops >= 5`.
+    quints: Vec<crate::gaps::TokenQuint>,
+    /// `(profile, pool)` -> quint indexes touching that pool.
+    by_pool_quint: HashMap<([u8; 2], [u8; 32]), HashSet<usize>>,
+    /// Maximum cycle hop count screened per batch: 2 = pairs only, 3 =
+    /// pairs + triangles (default, pre-5-hop behavior), 4/5 add quads/quints.
+    max_hops: u8,
     profile_a: [u8; 2],
     profile_b: [u8; 2],
     prices_a: HashMap<[u8; 32], PoolPrice>,
@@ -149,6 +195,8 @@ pub struct PairDirtyEvaluator {
     token_usd: HashMap<Address, U256>,
     queue: DirtyPairQueue,
     tri_queue: DirtyTriQueue,
+    quad_queue: DirtyQuadQueue,
+    quint_queue: DirtyQuintQueue,
     economics: Economics,
     reference: CostSnapshot,
     /// Maximum `|log2 skew|` a quote may carry and still be classified
@@ -188,6 +236,13 @@ pub struct PairDirtyEvaluator {
     /// Pools refreshed live via slot0 (`block == u64::MAX`, zero-liquidity
     /// excluded at refresh) are exempt — that path is already live truth.
     max_swap_age_blocks: u64,
+    /// Experimental opt-in (`--triangle-always-evaluate`, default off):
+    /// evaluate every enumerated triangle each batch from latest-known
+    /// prices instead of only member-swapped ones. Staleness screens,
+    /// skew, capacity, flash, and economics gates still apply unchanged,
+    /// so this widens only the trigger, never the bar. Off by default
+    /// because unevaluated-but-quiet triangles currently cost nothing.
+    always_eval_triangles: bool,
 }
 
 impl PairDirtyEvaluator {
@@ -280,11 +335,89 @@ impl PairDirtyEvaluator {
                 }
             }
         }
+        // Index each quad by every pool that could serve one of its edges.
+        let quads = crate::gaps::enumerate_quad(
+            &by_pair
+                .values()
+                .flat_map(|(a, _)| a.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            &by_pair
+                .values()
+                .flat_map(|(_, b)| b.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        let mut by_pool_quad: HashMap<([u8; 2], [u8; 32]), HashSet<usize>> = HashMap::new();
+        for (index, quad) in quads.iter().enumerate() {
+            let toks = [
+                Address::from_slice(&quad.0),
+                Address::from_slice(&quad.1),
+                Address::from_slice(&quad.2),
+                Address::from_slice(&quad.3),
+            ];
+            for i in 0..4 {
+                let edge = crate::gaps::pair_key(toks[i], toks[(i + 1) % 4]);
+                let Some((a_pools, b_pools)) = by_pair.get(&edge) else {
+                    continue;
+                };
+                for (profile, pools) in [(*b"v3", a_pools), (*b"v4", b_pools)] {
+                    for entry in pools {
+                        by_pool_quad
+                            .entry((profile, pool_key(entry)))
+                            .or_default()
+                            .insert(index);
+                    }
+                }
+            }
+        }
+        // Index each quint the same way.
+        let quints = crate::gaps::enumerate_quint(
+            &by_pair
+                .values()
+                .flat_map(|(a, _)| a.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            &by_pair
+                .values()
+                .flat_map(|(_, b)| b.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        let mut by_pool_quint: HashMap<([u8; 2], [u8; 32]), HashSet<usize>> = HashMap::new();
+        for (index, quint) in quints.iter().enumerate() {
+            let toks = [
+                Address::from_slice(&quint.0),
+                Address::from_slice(&quint.1),
+                Address::from_slice(&quint.2),
+                Address::from_slice(&quint.3),
+                Address::from_slice(&quint.4),
+            ];
+            for i in 0..5 {
+                let edge = crate::gaps::pair_key(toks[i], toks[(i + 1) % 5]);
+                let Some((a_pools, b_pools)) = by_pair.get(&edge) else {
+                    continue;
+                };
+                for (profile, pools) in [(*b"v3", a_pools), (*b"v4", b_pools)] {
+                    for entry in pools {
+                        by_pool_quint
+                            .entry((profile, pool_key(entry)))
+                            .or_default()
+                            .insert(index);
+                    }
+                }
+            }
+        }
         Self {
             by_pair,
             by_pool,
             triangles,
             by_pool_tri,
+            quads,
+            by_pool_quad,
+            quints,
+            by_pool_quint,
+            max_hops: 3,
             profile_a: *b"v3",
             profile_b: *b"v4",
             prices_a: HashMap::new(),
@@ -292,6 +425,8 @@ impl PairDirtyEvaluator {
             token_usd: HashMap::new(),
             queue: DirtyPairQueue::new(queue_capacity),
             tri_queue: DirtyTriQueue::new(queue_capacity),
+            quad_queue: DirtyQuadQueue::new(queue_capacity),
+            quint_queue: DirtyQuintQueue::new(queue_capacity),
             economics,
             reference: CostSnapshot::invalid(),
             max_log2_skew: 10.0, // was 0.5 (~41% gap) — lifted for full range (now ~1024× gap)
@@ -304,6 +439,7 @@ impl PairDirtyEvaluator {
             max_leg_age_spread_blocks: DEFAULT_MAX_LEG_AGE_SPREAD_BLOCKS,
             max_swap_age_blocks: DEFAULT_MAX_SWAP_AGE_BLOCKS,
             max_capacity_overshoot: DEFAULT_MAX_CAPACITY_OVERSHOOT,
+            always_eval_triangles: false,
         }
     }
 
@@ -403,6 +539,21 @@ impl PairDirtyEvaluator {
     /// live slot0 refreshes stay exempt.
     pub fn set_max_swap_age_blocks(&mut self, max_swap_age_blocks: u64) {
         self.max_swap_age_blocks = max_swap_age_blocks;
+    }
+
+    /// Enables experimental always-evaluate for triangles (see
+    /// [`Self::always_eval_triangles`]).
+    pub fn set_always_eval_triangles(&mut self, always_eval_triangles: bool) {
+        self.always_eval_triangles = always_eval_triangles;
+    }
+
+    /// Maximum cycle hop count screened per batch (2 = pairs only, 3 = pairs
+    /// + triangles, 4/5 add quads/quints). Values above 5 are clamped to 5;
+    /// below 2 to 2. Quads/quints are pre-indexed at construction, so this
+    /// only flips the screening switch (same trigger/bar widening semantics
+    /// as the triangle opt-in flag).
+    pub fn set_max_hops(&mut self, max_hops: u8) {
+        self.max_hops = max_hops.clamp(2, 5);
     }
 
     /// Overrides the single-tick capacity overshoot bound (default
@@ -568,7 +719,9 @@ impl PairDirtyEvaluator {
         self.token_usd.get(&token).is_some_and(|usd| !usd.is_zero())
     }
 
-    /// Marks every pair and triangle indexed by the changed pool as dirty.
+    /// Marks every pair, triangle, quad and quint indexed by the changed
+    /// pool as dirty (quads/quints only when `max_hops` enables them, so a
+    /// 3-hop run carries no 4/5-hop queue cost).
     pub fn mark_pool(&mut self, profile: [u8; 2], pool: [u8; 32]) {
         if let Some(pairs) = self.by_pool.get(&(profile, pool)) {
             for &pair in pairs {
@@ -578,6 +731,20 @@ impl PairDirtyEvaluator {
         if let Some(tris) = self.by_pool_tri.get(&(profile, pool)) {
             for &tri in tris {
                 self.tri_queue.enqueue(tri);
+            }
+        }
+        if self.max_hops >= 4 {
+            if let Some(quads) = self.by_pool_quad.get(&(profile, pool)) {
+                for &quad in quads {
+                    self.quad_queue.enqueue(quad);
+                }
+            }
+        }
+        if self.max_hops >= 5 {
+            if let Some(quints) = self.by_pool_quint.get(&(profile, pool)) {
+                for &quint in quints {
+                    self.quint_queue.enqueue(quint);
+                }
             }
         }
     }
@@ -596,10 +763,10 @@ impl PairDirtyEvaluator {
         self.mark_pool(profile, pool);
     }
 
-    /// Number of currently queued dirty pairs and triangles.
+    /// Number of currently queued dirty pairs, triangles, quads and quints.
     #[must_use]
     pub fn queue_len(&self) -> usize {
-        self.queue.len() + self.tri_queue.len()
+        self.queue.len() + self.tri_queue.len() + self.quad_queue.len() + self.quint_queue.len()
     }
 
     /// Seeds local prices from a sweep result, marking affected pairs dirty as
@@ -638,8 +805,15 @@ impl PairDirtyEvaluator {
             degraded,
             ..PairRunOutcome::default()
         };
-        if batch.is_empty() && self.tri_queue.pending.is_empty() {
-            return outcome;
+        if batch.is_empty()
+            && self.tri_queue.pending.is_empty()
+            && self.quad_queue.pending.is_empty()
+            && self.quint_queue.pending.is_empty()
+        {
+            // Opt-in always-evaluate still runs the triangle batch below.
+            if !(self.always_eval_triangles && !self.triangles.is_empty()) {
+                return outcome;
+            }
         }
 
         for pair in batch {
@@ -693,7 +867,14 @@ impl PairDirtyEvaluator {
             outcome.pair_results.push((quote, classification));
         }
 
-        let tri_batch = self.tri_queue.drain();
+        let mut tri_batch = self.tri_queue.drain();
+        if self.always_eval_triangles {
+            for tri in 0..self.triangles.len() {
+                if !tri_batch.contains(&tri) {
+                    tri_batch.push(tri);
+                }
+            }
+        }
         for tri in tri_batch {
             if tri >= self.triangles.len() {
                 outcome.triangle_not_evaluated.push(tri);
@@ -712,26 +893,140 @@ impl PairDirtyEvaluator {
                 outcome.triangle_stale_screened.push((tri, detail));
                 continue;
             }
-            let Ok(Some(quote)) = crate::gaps::quote_triangle(
+            match crate::gaps::quote_triangle(
                 t0,
                 t1,
                 t2,
                 &self.by_pair,
                 &self.prices_a,
                 &self.prices_b,
-            ) else {
-                outcome.triangle_not_evaluated.push(tri);
-                continue;
-            };
-            outcome.triangle_evaluated.push(tri);
+            ) {
+                Ok(Some(quote)) => {
+                    outcome.triangle_evaluated.push(tri);
 
-            let classification = self.classify_anchor(t0, &quote);
-            if matches!(classification.reason, ClassificationReason::AboveThreshold) {
-                outcome.triangle_interesting.push(tri);
+                    let classification = self.classify_anchor(t0, &quote);
+                    if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+                        outcome.triangle_interesting.push(tri);
+                    }
+                    outcome.triangle_results.push((quote, classification));
+                }
+                Ok(None) => {
+                    outcome.triangle_not_evaluated.push(tri);
+                    if outcome.triangle_first_error.is_none() {
+                        outcome.triangle_first_error =
+                            Some("triangle quote returned no route".to_owned());
+                    }
+                }
+                Err(error) => {
+                    outcome.triangle_not_evaluated.push(tri);
+                    if outcome.triangle_first_error.is_none() {
+                        outcome.triangle_first_error = Some(error);
+                    }
+                }
             }
-            outcome.triangle_results.push((quote, classification));
+        }
+        if self.max_hops >= 4 {
+            let quad_batch = self.quad_queue.drain();
+            for quad in quad_batch {
+                if quad >= self.quads.len() {
+                    outcome.quad_not_evaluated.push(quad);
+                    continue;
+                }
+                let q = self.quads[quad];
+                let tokens = [
+                    Address::from_slice(&q.0),
+                    Address::from_slice(&q.1),
+                    Address::from_slice(&q.2),
+                    Address::from_slice(&q.3),
+                ];
+                self.eval_cycle_tokens(
+                    quad,
+                    &tokens,
+                    &mut outcome.quad_evaluated,
+                    &mut outcome.quad_results,
+                    &mut outcome.quad_interesting,
+                    &mut outcome.quad_not_evaluated,
+                    &mut outcome.quad_first_error,
+                    &mut outcome.quad_stale_screened,
+                );
+            }
+        }
+        if self.max_hops >= 5 {
+            let quint_batch = self.quint_queue.drain();
+            for quint in quint_batch {
+                if quint >= self.quints.len() {
+                    outcome.quint_not_evaluated.push(quint);
+                    continue;
+                }
+                let q = self.quints[quint];
+                let tokens = [
+                    Address::from_slice(&q.0),
+                    Address::from_slice(&q.1),
+                    Address::from_slice(&q.2),
+                    Address::from_slice(&q.3),
+                    Address::from_slice(&q.4),
+                ];
+                self.eval_cycle_tokens(
+                    quint,
+                    &tokens,
+                    &mut outcome.quint_evaluated,
+                    &mut outcome.quint_results,
+                    &mut outcome.quint_interesting,
+                    &mut outcome.quint_not_evaluated,
+                    &mut outcome.quint_first_error,
+                    &mut outcome.quint_stale_screened,
+                );
+            }
         }
         outcome
+    }
+
+    /// Screens one N-hop cycle (quad or quint) through the staleness screen,
+    /// the generic [`crate::gaps::quote_cycle`] quoter, and the anchor
+    /// economics gate — the same trigger/bar semantics as triangles, shared
+    /// so 4/5-hop behavior cannot drift from the audited 3-hop path.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_cycle_tokens(
+        &self,
+        index: usize,
+        tokens: &[Address],
+        evaluated: &mut Vec<usize>,
+        results: &mut Vec<(crate::gaps::PairQuote, shadow::Classification)>,
+        interesting: &mut Vec<usize>,
+        not_evaluated: &mut Vec<usize>,
+        first_error: &mut Option<String>,
+        stale_screened: &mut Vec<(usize, String)>,
+    ) {
+        let n = tokens.len();
+        let stale = (0..n).find_map(|i| {
+            self.staleness_screen(crate::gaps::pair_key(tokens[i], tokens[(i + 1) % n]))
+        });
+        if let Some(detail) = stale {
+            stale_screened.push((index, detail));
+            return;
+        }
+        match crate::gaps::quote_cycle(tokens, &self.by_pair, &self.prices_a, &self.prices_b) {
+            Ok(Some(quote)) => {
+                evaluated.push(index);
+                let classification = self.classify_anchor(tokens[0], &quote);
+                if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+                    interesting.push(index);
+                }
+                results.push((quote, classification));
+            }
+            Ok(None) => {
+                not_evaluated.push(index);
+                if first_error.is_none() {
+                    *first_error = Some("cycle quote returned no route".to_owned());
+                }
+            }
+            Err(error) => {
+                not_evaluated.push(index);
+                if first_error.is_none() {
+                    *first_error = Some(error);
+                }
+            }
+        }
     }
 
     /// Classifies a quote against an anchor token's USD price (triangles use
@@ -958,6 +1253,56 @@ impl PairDirtyEvaluator {
             crate::gaps::quote_triangle(t0, t1, t2, &self.by_pair, &self.prices_a, &self.prices_b)
                 .ok()??;
         let classification = self.classify_anchor(t0, &quote);
+        Some((quote, classification))
+    }
+
+    /// The enumerated quad at `index`.
+    #[must_use]
+    pub fn quad(&self, index: usize) -> crate::gaps::TokenQuad {
+        self.quads[index]
+    }
+
+    /// The enumerated quint at `index`.
+    #[must_use]
+    pub fn quint(&self, index: usize) -> crate::gaps::TokenQuint {
+        self.quints[index]
+    }
+
+    /// Number of enumerated quads (for startup visibility).
+    #[must_use]
+    pub fn quad_count(&self) -> usize {
+        self.quads.len()
+    }
+
+    /// Number of enumerated quints (for startup visibility).
+    #[must_use]
+    pub fn quint_count(&self) -> usize {
+        self.quints.len()
+    }
+
+    /// Re-quotes one quad (by index) from cached prices. Used by tests; the
+    /// poll loop consumes `PairRunOutcome::quad_results` directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub fn quote_quad(&self, quad: usize) -> Option<(PairQuote, shadow::Classification)> {
+        let q = *self.quads.get(quad)?;
+        let quote =
+            crate::gaps::quote_quad(q, &self.by_pair, &self.prices_a, &self.prices_b).ok()??;
+        let anchor = Address::from_slice(&q.0);
+        let classification = self.classify_anchor(anchor, &quote);
+        Some((quote, classification))
+    }
+
+    /// Re-quotes one quint (by index) from cached prices. Used by tests; the
+    /// poll loop consumes `PairRunOutcome::quint_results` directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub fn quote_quint(&self, quint: usize) -> Option<(PairQuote, shadow::Classification)> {
+        let q = *self.quints.get(quint)?;
+        let quote =
+            crate::gaps::quote_quint(q, &self.by_pair, &self.prices_a, &self.prices_b).ok()??;
+        let anchor = Address::from_slice(&q.0);
+        let classification = self.classify_anchor(anchor, &quote);
         Some((quote, classification))
     }
 }
@@ -2409,5 +2754,166 @@ mod tests {
         let (quote, classification) = evaluator.quote_triangle(0).expect("triangle re-quote");
         assert!(quote.profit > U256::ZERO, "profitable drift expected");
         assert_eq!(classification.reason, ClassificationReason::AboveThreshold);
+    }
+
+    /// Opt-in always-evaluate: with the flag on, a second `run_once` with
+    /// no new swaps still quotes the triangle from latest-known prices;
+    /// with the flag off (default) the quiet batch evaluates nothing.
+    #[test]
+    fn always_eval_triangles_requotes_quiet_batch() {
+        let (v3_pools, v4_pools, _) = triangle_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&v3_pools, &v4_pools, interesting_economics(), 100);
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(200.0);
+        price_anchor(&mut evaluator);
+        for (i, pool) in v3_pools.iter().enumerate() {
+            let shift = u32::try_from(i).unwrap_or(0);
+            evaluator.apply_swap(
+                *b"v3",
+                pool.venue.into_word().into(),
+                price(
+                    U256::from(1u64) << (96 + shift),
+                    10_000_000_000_000_000_000_000,
+                    1,
+                ),
+            );
+        }
+        // First drain consumes the swap-triggered batch.
+        assert_eq!(evaluator.run_once().triangle_evaluated.len(), 1);
+        // Quiet batch: default evaluates nothing...
+        assert!(evaluator.run_once().triangle_evaluated.is_empty());
+        // ...while the opt-in flag re-quotes from latest-known prices.
+        evaluator.set_always_eval_triangles(true);
+        assert_eq!(evaluator.run_once().triangle_evaluated.len(), 1);
+    }
+
+    /// Five nodes forming one anchored quad (anchor,b,c,d) plus one anchored
+    /// quint (anchor,b,c,d,e): edges ab,bc,cd,da,de,ea on both venues.
+    /// The anchor is `RHC_NATIVE` (WETH): a pricing anchor per
+    /// `cycle_is_anchored`, and it sorts below the other fixture tokens so
+    /// enumerated cycles start on it (canonical form).
+    fn quad_quint_fixture() -> (Vec<PoolEntry>, Vec<PoolEntry>) {
+        let anchor = crate::gaps::RHC_NATIVE;
+        let b = token_b();
+        let c: Address = "0xc000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let d: Address = "0xd000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let e: Address = "0xe000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let v3_pool = |token0: Address, token1: Address, id: u8| {
+            entry(
+                format!("0xf4000000000000000000000000000000000000{id:02x}")
+                    .parse()
+                    .unwrap(),
+                token0,
+                token1,
+                3000,
+                *b"v3",
+                [id; 32],
+            )
+        };
+        let v4_pool = |token0: Address, token1: Address, id: u8| {
+            entry(
+                "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+                    .parse()
+                    .unwrap(),
+                token0,
+                token1,
+                2500,
+                *b"v4",
+                [id; 32],
+            )
+        };
+        let mut v3_pools = Vec::new();
+        let mut v4_pools = Vec::new();
+        for (i, (t0, t1)) in [
+            (anchor, b),
+            (b, c),
+            (c, d),
+            (d, anchor),
+            (d, e),
+            (e, anchor),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id = u8::try_from(i).unwrap_or(0);
+            v3_pools.push(v3_pool(*t0, *t1, 0x30 + id));
+            v4_pools.push(v4_pool(*t0, *t1, 0x50 + id));
+        }
+        (v3_pools, v4_pools)
+    }
+
+    #[test]
+    fn quads_screen_only_when_max_hops_allows() {
+        let (v3_pools, v4_pools) = quad_quint_fixture();
+        let mut evaluator =
+            PairDirtyEvaluator::new(&v3_pools, &v4_pools, interesting_economics(), 100);
+        evaluator.set_max_capacity_overshoot(f64::INFINITY);
+        let mut anchor_price = HashMap::new();
+        anchor_price.insert(crate::gaps::RHC_NATIVE, usd(1));
+        evaluator.set_token_prices(anchor_price);
+        evaluator.set_reference(valid_reference());
+        evaluator.set_max_log2_skew(200.0);
+        assert_eq!(evaluator.quad_count(), 1, "one anchored quad expected");
+        assert_eq!(evaluator.quint_count(), 1, "one anchored quint expected");
+        let tip = 1_000_000u64;
+        for (i, pool) in v3_pools.iter().enumerate() {
+            let shift = u32::try_from(i).unwrap_or(0);
+            evaluator.apply_swap(
+                *b"v3",
+                pool.venue.into_word().into(),
+                price(
+                    U256::from(1u64) << (96 + shift),
+                    10_000_000_000_000_000_000_000,
+                    tip - 999_000,
+                ),
+            );
+        }
+        for (i, pool) in v4_pools.iter().enumerate() {
+            let shift = u32::try_from(i).unwrap_or(0);
+            evaluator.apply_swap(
+                *b"v4",
+                pool.id,
+                price(
+                    U256::from(2u64) << (96 + shift),
+                    10_000_000_000_000_000_000_000,
+                    tip,
+                ),
+            );
+        }
+        // Default (3 hops): quad/quint marks enqueue nothing.
+        let outcome = evaluator.run_once();
+        assert!(outcome.quad_evaluated.is_empty());
+        assert!(outcome.quint_evaluated.is_empty());
+        // Re-mark under 5 hops: both shapes evaluate economically.
+        evaluator.set_max_hops(5);
+        evaluator.mark_pool(*b"v3", v3_pools[0].venue.into_word().into());
+        let outcome = evaluator.run_once();
+        assert_eq!(outcome.quad_evaluated.len(), 1);
+        assert_eq!(outcome.quint_evaluated.len(), 1);
+        for (_, classification) in outcome.quad_results.iter().chain(&outcome.quint_results) {
+            assert!(
+                matches!(
+                    &classification.reason,
+                    ClassificationReason::AboveThreshold
+                        | ClassificationReason::BelowThreshold
+                        | ClassificationReason::NotProfitable
+                ),
+                "longer-hop cycles must evaluate economically, not screen: {classification:?}"
+            );
+        }
+        // Dropping back to 3 hops silences 4/5-hop screening again.
+        evaluator.set_max_hops(3);
+        evaluator.mark_pool(*b"v3", v3_pools[0].venue.into_word().into());
+        let outcome = evaluator.run_once();
+        assert!(outcome.quad_evaluated.is_empty());
+        assert!(outcome.quint_evaluated.is_empty());
     }
 }

@@ -4412,6 +4412,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer-local",
  "alloy-sol-types",
+ "base64",
  "catalog",
  "clap",
  "csv",

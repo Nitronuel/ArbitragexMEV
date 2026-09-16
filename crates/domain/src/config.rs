@@ -145,7 +145,7 @@ impl ShadowConfig {
         Chain::from_id(self.chain_id)
             .ok_or(ConfigError::InvalidChainId(self.chain_id))
             .and_then(|chain| {
-                if !(2..=4).contains(&self.max_hops) {
+                if !(2..=5).contains(&self.max_hops) {
                     return Err(ConfigError::InvalidMaxHops(self.max_hops));
                 }
                 // 0 = unlimited (full ~1M global sweep) — allowed, bypasses cap.
@@ -231,7 +231,7 @@ pub enum ConfigError {
     MissingEnvironment(&'static str),
     #[error("chain ID {0} is unsupported or disabled; active chain ID is 4663 (robinhood)")]
     InvalidChainId(u64),
-    #[error("max_hops must be in 2..=4, got {0}")]
+    #[error("max_hops must be in 2..=5, got {0}")]
     InvalidMaxHops(u8),
     #[error("stale_timeout_seconds must be > 0, got {0}")]
     InvalidStaleTimeout(u64),
@@ -335,7 +335,7 @@ max_trade_size_bps_v3_v4 = 100
 
     #[test]
     fn rejects_max_hops_outside_supported_range() {
-        for max_hops in [1, 5] {
+        for max_hops in [1, 6] {
             let input = VALID_TOML.replace("max_hops = 4", &format!("max_hops = {max_hops}"));
             let error = ShadowConfig::from_toml_and_urls(
                 &input,

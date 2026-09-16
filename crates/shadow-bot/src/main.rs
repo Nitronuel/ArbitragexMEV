@@ -27,6 +27,7 @@ use storage::Storage;
 
 mod dirty;
 mod enumerate;
+mod feed;
 mod gaps;
 mod pool_lens;
 mod submit;
@@ -194,11 +195,25 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         deadline_secs: u64,
         /// Poll interval for new CSV rows (ms).
-        #[arg(long, default_value_t = 500)]
+        #[arg(long, default_value_t = 50)]
         poll_ms: u64,
         /// Stop after this many broadcast attempts (0 = unlimited).
         #[arg(long, default_value_t = 0)]
         max_attempts: u64,
+        /// Skip rows older than this many blocks at read time (stale
+        /// dislocations have already closed; attempting them delays fresh
+        /// rows past their window). Newest-first within each poll.
+        #[arg(long, default_value_t = 600)]
+        max_row_age_blocks: u64,
+        /// Router dead-list CSV (one pool_id per line): V4 pools with
+        /// proven BAD_ARGS reverts, refused pre-estimate. Empty = off.
+        #[arg(long)]
+        router_dead_pools: Option<PathBuf>,
+        /// Algebra-exclusion CSV (one pool address per line): V3-catalog
+        /// pools proven to be Algebra-logic (unexecutable via V3-direct
+        /// settlement), refused pre-estimate. Empty = off.
+        #[arg(long)]
+        v3_algebra: Option<PathBuf>,
         /// Broadcast when every gate passes; without it, dry-run only.
         /// Production runs with `cast send=allow` (no per-tx prompt), so any
         /// new gate must stay log-only through its soak before it may promote
@@ -276,6 +291,23 @@ enum Command {
         /// Bench sidecar poll interval in ms (0 = off).
         #[arg(long, default_value_t = 0)]
         bench_http_ms: u64,
+    },
+    /// Observes the Nitro sequencer feed (shadow-only, log-only, never trades).
+    FeedWatch {
+        /// Feed endpoint URL or `env:VAR_NAME` (defaults to RHC Nitro feed).
+        #[arg(long)]
+        feed_url: Option<String>,
+        #[arg(long, default_value_t = 300)]
+        duration_secs: u64,
+        /// Append raw payloads here (fixture capture for decoder tests).
+        #[arg(long)]
+        raw_log: Option<PathBuf>,
+        /// Append `seq<TAB>touches` trigger lines here (agreement input).
+        #[arg(long)]
+        touch_log: Option<PathBuf>,
+        /// Envelopes older than now minus this are backlog (never triggers).
+        #[arg(long, default_value_t = 30)]
+        max_backlog_secs: u64,
     },
     /// Inspects one token: every known pool, live price/depth board, and a
     /// spread matrix. Read-only; no transactions.
@@ -717,6 +749,12 @@ enum Command {
         /// refuse all hook pools from fresh manifests.
         #[arg(long)]
         hook_allowlist: Option<PathBuf>,
+        /// Algebra-exclusion CSV (one pool address per line): V3-catalog
+        /// pools proven to be Algebra-logic (unquotable with V3 math,
+        /// unexecutable via V3-direct settlement). Excluded at load so
+        /// they are never priced, subscribed, or gated. Empty = off.
+        #[arg(long)]
+        v3_algebra: Option<PathBuf>,
         /// Simulation gate (audit task 2.3): a candidate may gate only after
         /// a passing route simulation. With `--quote-source math` (default)
         /// the route simulator is unavailable for V4 legs, so enabling this
@@ -742,6 +780,20 @@ enum Command {
         /// (keeps math) instead of spending the provider budget.
         #[arg(long, default_value_t = 8)]
         max_quoter_calls_per_poll: u64,
+        /// Experimental: evaluate every enumerated triangle each poll from
+        /// latest-known leg prices instead of only member-swapped ones.
+        /// Staleness, skew, capacity, flash, and economics gates still
+        /// apply unchanged — widens only the trigger, never the bar.
+        /// Default off (quiet triangles currently cost nothing).
+        #[arg(long, default_value_t = false)]
+        triangle_always_evaluate: bool,
+        /// Maximum cycle hop count screened per batch: 2 = pairs only, 3 =
+        /// pairs + triangles (default, pre-5-hop behavior), 4/5 add anchored
+        /// quad/quint cycles (contain WETH or USDG). Values above 5 clamp
+        /// to 5. Quads/quints share the triangle trigger/bar semantics and
+        /// the same closed-form quoter math.
+        #[arg(long, default_value_t = 3)]
+        max_hops: u8,
         /// Backstop age bound: a cached price this many blocks behind the tip
         /// screens the quote even when sweep coverage claims continuity (0
         /// disables the age backstop; coverage screening always applies).
@@ -802,6 +854,9 @@ fn main() {
             deadline_secs,
             poll_ms,
             max_attempts,
+            max_row_age_blocks,
+            router_dead_pools,
+            v3_algebra,
             broadcast,
         } => {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -821,8 +876,11 @@ fn main() {
                 deadline_secs,
                 poll_ms,
                 max_attempts,
+                max_row_age_blocks,
                 broadcast,
                 &capital_source,
+                router_dead_pools.as_deref(),
+                v3_algebra.as_deref(),
             ))
         }
         Command::VerifyBlue { rpc, support } => {
@@ -866,6 +924,19 @@ fn main() {
             },
         ),
         Command::PoolLens { lens } => pool_lens::run_pool_lens(&lens),
+        Command::FeedWatch {
+            feed_url,
+            duration_secs,
+            raw_log,
+            touch_log,
+            max_backlog_secs,
+        } => feed::feed_watch_command(
+            feed_url.as_deref(),
+            duration_secs,
+            raw_log,
+            touch_log,
+            max_backlog_secs,
+        ),
         Command::Run {
             config,
             snapshot,
@@ -1084,10 +1155,13 @@ fn main() {
             flash_support,
             overrides,
             hook_allowlist,
+            v3_algebra,
             simulate,
             quote_source,
             max_quote_divergence,
             max_quoter_calls_per_poll,
+            triangle_always_evaluate,
+            max_hops,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
             max_swap_age_blocks,
@@ -1123,10 +1197,13 @@ fn main() {
             flash_support: flash_support.as_deref(),
             overrides: overrides.as_deref(),
             hook_allowlist: hook_allowlist.as_deref(),
+            v3_algebra: v3_algebra.as_deref(),
             simulate,
             quote_source: &quote_source,
             max_quote_divergence,
             max_quoter_calls_per_poll,
+            triangle_always_evaluate,
+            max_hops,
             max_leg_age_blocks,
             max_leg_age_spread_blocks,
             max_swap_age_blocks,
@@ -2473,6 +2550,10 @@ struct RunPairsArgs<'a> {
     max_quote_divergence: f64,
     /// Per-poll quoter `eth_call` budget.
     max_quoter_calls_per_poll: u64,
+    /// Experimental always-evaluate for triangles (see CLI flag).
+    triangle_always_evaluate: bool,
+    /// Maximum cycle hop count screened per batch (see CLI flag).
+    max_hops: u8,
     /// Flash-loan cost mode for gating (`none`, a provider name, or `auto`).
     flash_provider: &'a str,
     /// Support CSV backing `flash_provider = auto`.
@@ -2481,6 +2562,8 @@ struct RunPairsArgs<'a> {
     overrides: Option<&'a std::path::Path>,
     /// Hook allow-list CSV (None = empty: refuse all hook pools).
     hook_allowlist: Option<&'a std::path::Path>,
+    /// Algebra-exclusion CSV (None = empty: no exclusions).
+    v3_algebra: Option<&'a std::path::Path>,
     /// Backstop age bound for cached leg prices (blocks behind the tip).
     max_leg_age_blocks: u64,
     /// Maximum block spread across one quote's priced candidate pools.
@@ -2529,6 +2612,15 @@ fn check_native_usd_scale(v: U256) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Unix millis for log-line timestamps (same convention as the trade
+/// `ts={}` lines in `submit.rs`): lets stage latency be reconstructed
+/// post-hoc from `run-pairs-hot.log` (poll/WS cadence, detection lag).
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
@@ -2664,7 +2756,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         4663,
     );
 
-    let (a_entries, b_entries) = if let Some(path) = manifest_path {
+    let (mut a_entries, mut b_entries) = if let Some(path) = manifest_path {
         gaps::restrict_to_manifest(path, profile_bytes_a, profile_bytes_b)?
     } else {
         let catalog_a = gaps::load_catalog(a_path, None, None)?;
@@ -2679,6 +2771,28 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             "no pools for profiles v{} on both venues",
             profile_bytes_a[1]
         ));
+    }
+    // Algebra exclusion at load (2026-09-15 fork forensics): V3-catalog
+    // pools with Algebra logic are unquotable with V3 math and
+    // unexecutable via V3-direct settlement, so they are dropped before
+    // pricing, WS subscription, and gating — loudly, with a count.
+    if let Some(path) = args.v3_algebra {
+        let algebra = gaps::load_hook_allowlist(path)?;
+        if !algebra.is_empty() {
+            let mut dropped = 0usize;
+            for entries in [&mut a_entries, &mut b_entries] {
+                let before = entries.len();
+                entries.retain(|entry| {
+                    entry.profile != *b"v3" || !algebra.contains(&format!("{:x}", entry.venue))
+                });
+                dropped += before - entries.len();
+            }
+            if dropped > 0 {
+                eprintln!(
+                    "run-pairs: excluded {dropped} Algebra-logic V3 pool(s) via --v3-algebra"
+                );
+            }
+        }
     }
     // Phase-3 hooks preflight: V4 rows with nonzero-hook overrides that are
     // not allow-listed are LOUD (counted per startup) but do not abort —
@@ -2815,6 +2929,25 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     evaluator.set_staleness_bounds(args.max_leg_age_blocks, args.max_leg_age_spread_blocks);
     evaluator.set_max_swap_age_blocks(args.max_swap_age_blocks);
     evaluator.set_max_capacity_overshoot(args.max_capacity_overshoot);
+    evaluator.set_always_eval_triangles(args.triangle_always_evaluate);
+    if args.triangle_always_evaluate {
+        eprintln!(
+            "run-pairs: experimental --triangle-always-evaluate ON (trigger widened, bar unchanged)"
+        );
+    }
+    evaluator.set_max_hops(args.max_hops);
+    if args.max_hops >= 4 {
+        println!(
+            "run-pairs: {} anchored quads + {} anchored quints indexed (max_hops={})",
+            evaluator.quad_count(),
+            if args.max_hops >= 5 {
+                evaluator.quint_count()
+            } else {
+                0
+            },
+            args.max_hops
+        );
+    }
     if let Some(path) = prices_path {
         let prices = gaps::load_prices(path)?;
         println!(
@@ -2841,6 +2974,12 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let mut stale_screened = 0usize;
     let mut triangle_evals = 0usize;
     let mut triangle_interesting = 0usize;
+    let mut triangle_not_evaluated = 0usize;
+    let mut triangle_first_error: Option<String> = None;
+    let mut quad_evals = 0usize;
+    let mut quad_interesting = 0usize;
+    let mut quint_evals = 0usize;
+    let mut quint_interesting = 0usize;
     let mut near_misses = 0usize;
     let mut provisionals = 0usize;
     let mut last_window = 0u64;
@@ -3126,7 +3265,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             // so emit a poll line at most every 60 s even with zero events.
             if last_poll_line.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
                 println!(
-                    "run-pairs: poll tip={latest} swept_to={to_eff} priced a=0 b=0 evals=0 gated=0 sim_screened=0 triangles=0/0 stale_screened=0 dirty=0"
+                    "run-pairs: ts={} poll tip={latest} swept_to={to_eff} priced a=0 b=0 evals=0 gated=0 sim_screened=0 triangles=0/0 quads=0/0 quints=0/0 stale_screened=0 dirty=0",
+                    unix_ms()
                 );
                 last_poll_line = Some(Instant::now());
             }
@@ -3310,11 +3450,17 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         if quoter_vetoed > 0 {
             eprintln!("run-pairs: quoter-vetoed {quoter_vetoed} candidate(s) this poll");
         }
-        if !outcome.stale_screened.is_empty() || !outcome.triangle_stale_screened.is_empty() {
+        if !outcome.stale_screened.is_empty()
+            || !outcome.triangle_stale_screened.is_empty()
+            || !outcome.quad_stale_screened.is_empty()
+            || !outcome.quint_stale_screened.is_empty()
+        {
             eprintln!(
-                "run-pairs: screened {} pair(s), {} triangle(s) on broken sweep coverage or leg age",
+                "run-pairs: screened {} pair(s), {} triangle(s), {} quad(s), {} quint(s) on broken sweep coverage or leg age",
                 outcome.stale_screened.len(),
-                outcome.triangle_stale_screened.len()
+                outcome.triangle_stale_screened.len(),
+                outcome.quad_stale_screened.len(),
+                outcome.quint_stale_screened.len()
             );
         }
         // One line per gate-passing row, carrying the pair identity: this is
@@ -3326,7 +3472,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                 // Print the quote's CHOSEN anchor (task 0.6), which need not
                 // match canonical pair order.
                 println!(
-                    "run-pairs: GATED pair token_lo={} token_hi={} net_usd={} threshold_usd={} floor_ratio={:.4}",
+                    "run-pairs: GATED pair ts={} token_lo={} token_hi={} net_usd={} threshold_usd={} floor_ratio={:.4}",
+                    now_unix_ms(),
                     quote.token_lo,
                     quote.token_hi,
                     classification.estimated_net_profit_usd,
@@ -3346,10 +3493,54 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             if matches!(classification.reason, ClassificationReason::AboveThreshold) {
                 let t = evaluator.triangle(*tri);
                 println!(
-                    "run-pairs: GATED triangle tokens={},{},{} skew={:.6} net_usd={} floor_ratio={:.4}",
+                    "run-pairs: GATED triangle ts={} tokens={},{},{} skew={:.6} net_usd={} floor_ratio={:.4}",
+                    now_unix_ms(),
                     Address::from_slice(&t.0),
                     Address::from_slice(&t.1),
                     Address::from_slice(&t.2),
+                    quote.log2_skew,
+                    classification.estimated_net_profit_usd,
+                    floor_ratio(
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd
+                    ),
+                );
+            }
+        }
+        for (quad, (quote, classification)) in
+            outcome.quad_evaluated.iter().zip(&outcome.quad_results)
+        {
+            if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+                let q = evaluator.quad(*quad);
+                println!(
+                    "run-pairs: GATED quad ts={} tokens={},{},{},{} skew={:.6} net_usd={} floor_ratio={:.4}",
+                    now_unix_ms(),
+                    Address::from_slice(&q.0),
+                    Address::from_slice(&q.1),
+                    Address::from_slice(&q.2),
+                    Address::from_slice(&q.3),
+                    quote.log2_skew,
+                    classification.estimated_net_profit_usd,
+                    floor_ratio(
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd
+                    ),
+                );
+            }
+        }
+        for (quint, (quote, classification)) in
+            outcome.quint_evaluated.iter().zip(&outcome.quint_results)
+        {
+            if matches!(classification.reason, ClassificationReason::AboveThreshold) {
+                let q = evaluator.quint(*quint);
+                println!(
+                    "run-pairs: GATED quint ts={} tokens={},{},{},{},{} skew={:.6} net_usd={} floor_ratio={:.4}",
+                    now_unix_ms(),
+                    Address::from_slice(&q.0),
+                    Address::from_slice(&q.1),
+                    Address::from_slice(&q.2),
+                    Address::from_slice(&q.3),
+                    Address::from_slice(&q.4),
                     quote.log2_skew,
                     classification.estimated_net_profit_usd,
                     floor_ratio(
@@ -3368,13 +3559,26 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         interesting += outcome.interesting.len();
         sim_screened_total += sim_screened;
         not_evaluated += outcome.not_evaluated.len();
-        stale_screened += outcome.stale_screened.len() + outcome.triangle_stale_screened.len();
+        stale_screened += outcome.stale_screened.len()
+            + outcome.triangle_stale_screened.len()
+            + outcome.quad_stale_screened.len()
+            + outcome.quint_stale_screened.len();
         triangle_evals += outcome.triangle_evaluated.len();
         triangle_interesting += outcome.triangle_interesting.len();
+        triangle_not_evaluated += outcome.triangle_not_evaluated.len();
+        quad_evals += outcome.quad_evaluated.len();
+        quad_interesting += outcome.quad_interesting.len();
+        quint_evals += outcome.quint_evaluated.len();
+        quint_interesting += outcome.quint_interesting.len();
+        if triangle_first_error.is_none() {
+            triangle_first_error.clone_from(&outcome.triangle_first_error);
+        }
         near_misses += outcome
             .pair_results
             .iter()
             .chain(&outcome.triangle_results)
+            .chain(&outcome.quad_results)
+            .chain(&outcome.quint_results)
             .filter(|(_, classification)| {
                 let ratio = floor_ratio(
                     classification.estimated_net_profit_usd,
@@ -3387,6 +3591,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             .pair_results
             .iter()
             .chain(&outcome.triangle_results)
+            .chain(&outcome.quad_results)
+            .chain(&outcome.quint_results)
             .filter(|(_, classification)| {
                 matches!(
                     classification.reason,
@@ -3397,6 +3603,51 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         if let Some(out) = csv_out.as_mut() {
             // A CSV I/O failure must not kill the whole 24h window: log it
             // once and disable further CSV output, keeping the poller alive.
+            //
+            // Cycle rows (triangle/quad/quint) share one format with pair
+            // rows; only `kind` and the token endpoints differ. The `legs`
+            // column carries the full N-hop route the trade command encodes.
+            fn write_cycle_csv_row(
+                out: &mut std::io::BufWriter<std::fs::File>,
+                kind: &str,
+                lo: alloy_primitives::Address,
+                hi: alloy_primitives::Address,
+                latest: u64,
+                quote: &crate::gaps::PairQuote,
+                classification: &shadow::Classification,
+                priced: bool,
+            ) -> std::io::Result<()> {
+                writeln!(
+                    out,
+                    "{kind},{lo},{hi},{latest},{input},{output},{profit},{log2_skew:.6},{gross},{net},{shortfall},{threshold},{floor:.4},{unclamped},{capacity},{reason_code},{reason_detail},{priced},{legs}",
+                    lo = lo,
+                    hi = hi,
+                    latest = latest,
+                    input = quote.input,
+                    output = quote.output,
+                    profit = quote.profit,
+                    log2_skew = quote.log2_skew,
+                    gross = classification.gross_profit_usd,
+                    net = classification.estimated_net_profit_usd,
+                    shortfall = classification.shortfall_usd,
+                    threshold = classification.threshold_usd,
+                    floor = floor_ratio(
+                        classification.estimated_net_profit_usd,
+                        classification.threshold_usd
+                    ),
+                    unclamped = quote.optimal_unclamped,
+                    capacity = quote.input_capacity,
+                    reason_code = code_and_detail(&classification.reason).0,
+                    reason_detail = code_and_detail(&classification.reason).1,
+                    priced = priced,
+                    legs = quote
+                        .legs
+                        .iter()
+                        .map(crate::gaps::LegRoute::encode_csv)
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                )
+            }
             let mut write_all = || -> std::io::Result<()> {
                 for (_pair, (quote, classification)) in
                     outcome.evaluated.iter().zip(&outcome.pair_results)
@@ -3442,37 +3693,45 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                     .zip(&outcome.triangle_results)
                 {
                     let t = evaluator.triangle(*tri);
-                    let lo = alloy_primitives::Address::from_slice(&t.0);
-                    let hi = alloy_primitives::Address::from_slice(&t.1);
-                    writeln!(
+                    write_cycle_csv_row(
                         out,
-                        "triangle,{lo},{hi},{latest},{input},{output},{profit},{log2_skew:.6},{gross},{net},{shortfall},{threshold},{floor:.4},{unclamped},{capacity},{reason_code},{reason_detail},{priced},{legs}",
-                        lo = lo,
-                        hi = hi,
-                        latest = latest,
-                        input = quote.input,
-                        output = quote.output,
-                        profit = quote.profit,
-                        log2_skew = quote.log2_skew,
-                        gross = classification.gross_profit_usd,
-                        net = classification.estimated_net_profit_usd,
-                        shortfall = classification.shortfall_usd,
-                        threshold = classification.threshold_usd,
-                        floor = floor_ratio(
-                            classification.estimated_net_profit_usd,
-                            classification.threshold_usd
-                        ),
-                        unclamped = quote.optimal_unclamped,
-                        capacity = quote.input_capacity,
-                        reason_code = code_and_detail(&classification.reason).0,
-                        reason_detail = code_and_detail(&classification.reason).1,
-                        priced = evaluator.token_is_priced(lo),
-                        legs = quote
-                            .legs
-                            .iter()
-                            .map(crate::gaps::LegRoute::encode_csv)
-                            .collect::<Vec<_>>()
-                            .join("|"),
+                        "triangle",
+                        alloy_primitives::Address::from_slice(&t.0),
+                        alloy_primitives::Address::from_slice(&t.1),
+                        latest,
+                        quote,
+                        classification,
+                        evaluator.token_is_priced(quote.token_lo),
+                    )?;
+                }
+                for (quad, (quote, classification)) in
+                    outcome.quad_evaluated.iter().zip(&outcome.quad_results)
+                {
+                    let q = evaluator.quad(*quad);
+                    write_cycle_csv_row(
+                        out,
+                        "quad",
+                        alloy_primitives::Address::from_slice(&q.0),
+                        alloy_primitives::Address::from_slice(&q.1),
+                        latest,
+                        quote,
+                        classification,
+                        evaluator.token_is_priced(quote.token_lo),
+                    )?;
+                }
+                for (quint, (quote, classification)) in
+                    outcome.quint_evaluated.iter().zip(&outcome.quint_results)
+                {
+                    let q = evaluator.quint(*quint);
+                    write_cycle_csv_row(
+                        out,
+                        "quint",
+                        alloy_primitives::Address::from_slice(&q.0),
+                        alloy_primitives::Address::from_slice(&q.1),
+                        latest,
+                        quote,
+                        classification,
+                        evaluator.token_is_priced(quote.token_lo),
                     )?;
                 }
                 Ok(())
@@ -3587,7 +3846,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         last_window = to_eff;
         last_poll_line = Some(Instant::now());
         println!(
-            "run-pairs: poll tip={latest} swept_to={to_eff} priced a={} b={} evals={} gated={} sim_screened={} triangles={}/{} stale_screened={} dirty={}",
+            "run-pairs: ts={} poll tip={latest} swept_to={to_eff} priced a={} b={} evals={} gated={} sim_screened={} triangles={}/{} tri_not_eval={} tri_err={} quads={}/{} quints={}/{} stale_screened={} dirty={}",
+            unix_ms(),
             priced_a.len(),
             priced_b.len(),
             outcome.evaluated.len(),
@@ -3595,7 +3855,22 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             sim_screened,
             outcome.triangle_interesting.len(),
             outcome.triangle_evaluated.len(),
-            outcome.stale_screened.len() + outcome.triangle_stale_screened.len(),
+            outcome.triangle_not_evaluated.len(),
+            outcome
+                .triangle_first_error
+                .as_deref()
+                .unwrap_or("none")
+                .chars()
+                .take(64)
+                .collect::<String>(),
+            outcome.quad_interesting.len(),
+            outcome.quad_evaluated.len(),
+            outcome.quint_interesting.len(),
+            outcome.quint_evaluated.len(),
+            outcome.stale_screened.len()
+                + outcome.triangle_stale_screened.len()
+                + outcome.quad_stale_screened.len()
+                + outcome.quint_stale_screened.len(),
             outcome.not_evaluated.len(),
         );
         if let Some(lane) = ws_lane.as_ref() {
@@ -3621,7 +3896,8 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
                 })
                 .collect();
             println!(
-                "run-pairs: ws events={} pending={} drops={} reconnects={} dupes={} supervisor={} slots=[{}]",
+                "run-pairs: ts={} ws events={} pending={} drops={} reconnects={} dupes={} supervisor={} slots=[{}]",
+                unix_ms(),
                 lane.ws_events,
                 lane.pending.len(),
                 lane.ws_drops,
@@ -3636,7 +3912,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
 
     let dirty_now = evaluator.queue_len();
     println!(
-        "run-pairs: done at block {} applied={} evals={} gated={} sim_screened={} triangles={}/{} stale_screened={} near_miss={} provisional={} not_evaluated={} dirty={} elapsed_s={}",
+        "run-pairs: done at block {} applied={} evals={} gated={} sim_screened={} triangles={}/{} quads={}/{} quints={}/{} stale_screened={} near_miss={} provisional={} not_evaluated={} dirty={} elapsed_s={}",
         last_window,
         applied,
         evals,
@@ -3644,6 +3920,10 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         sim_screened_total,
         triangle_interesting,
         triangle_evals,
+        quad_interesting,
+        quad_evals,
+        quint_interesting,
+        quint_evals,
         stale_screened,
         near_misses,
         provisionals,
@@ -4761,7 +5041,8 @@ mod baseline_tests {
     }
 
     #[test]
-    fn capacity_ratio_is_one_when_unclamped() {        let v = U256::from(1_000_000u64);
+    fn capacity_ratio_is_one_when_unclamped() {
+        let v = U256::from(1_000_000u64);
         assert!((baseline_capacity_ratio(v, v) - 1.0).abs() < 1e-9);
     }
 

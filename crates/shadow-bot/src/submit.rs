@@ -14,7 +14,7 @@
 use std::str::FromStr;
 
 use alloy_network::{Ethereum, EthereumWallet};
-use alloy_primitives::{Address, Bytes, U256, B256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
@@ -156,7 +156,20 @@ pub struct Submitter {
     pub executor: Address,
     pub wallet: Address,
     rpc_url: String,
+    /// Cached `(as-of secs, chain tip)`: per-poll tip reads 429 the public
+    /// gateway — observed 2026-09-12. See [`Submitter::fresh_tip`].
+    tip_cached: std::cell::Cell<(u64, u64)>,
+    /// Cached `(as-of secs, gas price wei)`: gas moves every block but
+    /// slowly on RHC, so a short TTL removes a round trip per attempt.
+    /// The cap is enforced against the cached value because that is the
+    /// price the transaction is built at.
+    gas_cached: std::cell::Cell<(u64, u128)>,
 }
+
+/// Gas-price cache TTL: removes one round trip per attempt. RHC gas drifts
+/// slowly (observed 0.09–0.11 gwei for hours); 10s staleness is negligible
+/// against a 1.0 gwei cap, and the cap binds on the cached price we act on.
+pub const GAS_TTL_SECS: u64 = 10;
 
 impl Submitter {
     /// Build a submitter from the RPC URL and the key *value* (env-sourced).
@@ -176,7 +189,33 @@ impl Submitter {
             executor,
             wallet,
             rpc_url: rpc_url.to_owned(),
+            tip_cached: std::cell::Cell::new((0, 0)),
+            gas_cached: std::cell::Cell::new((0, 0)),
         })
+    }
+
+    /// Chain tip for the freshness gate (`TIP_TTL_SECS` cache). Fail-open:
+    /// a tip failure returns `u64::MAX` (attempt unfiltered, logged) — and
+    /// stamps the failure time so retries also back off instead of
+    /// hammering a struggling gateway every poll (self-inflicted 429
+    /// storm, observed 2026-09-12).
+    pub async fn fresh_tip(&self) -> u64 {
+        let now = trade::now_secs();
+        let (at, tip) = self.tip_cached.get();
+        if !trade::cache_due(at, now, trade::TIP_TTL_SECS) {
+            return if tip > 0 { tip } else { u64::MAX };
+        }
+        match self.provider.get_block_number().await {
+            Ok(n) => {
+                self.tip_cached.set((now, n));
+                n
+            }
+            Err(e) => {
+                eprintln!("trade: tip fetch failed ({e}); skipping rows until tip recovers");
+                self.tip_cached.set((now, 0));
+                u64::MAX
+            }
+        }
     }
 
     /// Read-only provider handle for the trade bridge's fee/override reads.
@@ -236,16 +275,28 @@ impl Submitter {
         Ok(bal)
     }
 
-    /// Gas price must be under `cap_gwei` (budget protection).
+    /// Gas price must be under `cap_gwei` (budget protection). Short-TTL
+    /// cached: gas drifts slowly on RHC, and the cap binds on the cached
+    /// price the transaction is actually built at.
     ///
     /// # Errors
     /// Fails on transport error or a price above the cap.
     pub async fn check_gas_price(&self, cap_gwei: f64) -> Result<u128, String> {
+        let now = trade::now_secs();
+        let (at, cached) = self.gas_cached.get();
+        if !trade::cache_due(at, now, GAS_TTL_SECS) && cached > 0 {
+            return Self::enforce_gas_cap(cached, cap_gwei);
+        }
         let gp = self
             .provider
             .get_gas_price()
             .await
             .map_err(|e| format!("gas price read failed: {e}"))?;
+        self.gas_cached.set((now, gp));
+        Self::enforce_gas_cap(gp, cap_gwei)
+    }
+
+    fn enforce_gas_cap(gp: u128, cap_gwei: f64) -> Result<u128, String> {
         let gwei = gp as f64 / 1e9;
         if gwei > cap_gwei {
             return Err(format!(
@@ -386,10 +437,26 @@ impl Submitter {
             .input(alloy_rpc_types_eth::TransactionInput::new(
                 entry.encode(token, amount, legs_data, min_profit),
             ));
-        self.provider
-            .estimate_gas(tx)
-            .await
-            .map_err(|e| format!("{} would revert (estimate): {e}", entry.describe()))
+        let start = std::time::Instant::now();
+        let result = self.provider.estimate_gas(tx).await;
+        let rtt_ms = start.elapsed().as_millis();
+        match result {
+            Ok(est) => {
+                eprintln!(
+                    "estimate: entry={} rtt_ms={rtt_ms} gas={est}",
+                    entry.describe()
+                );
+                Ok(est)
+            }
+            Err(e) => {
+                let msg = format!("{} would revert (estimate): {e}", entry.describe());
+                eprintln!(
+                    "estimate: entry={} rtt_ms={rtt_ms} error={msg}",
+                    entry.describe()
+                );
+                Err(msg)
+            }
+        }
     }
 
     /// Sign, broadcast, and wait for the receipt of any executor entry point.
@@ -704,10 +771,46 @@ pub mod command {
 
     /// Default `--win-rate-pct` for `trade`, kept as a named constant (not a
     /// magic literal) so the nesting test below can pin it against the
-    /// detection-side `STANDARD_EXPECTED_WIN_RATE`: 34 keeps the trade floor
-    /// (≈2.94x gas) just under detection (≈2.9994x at 33.34%), so any gated
-    /// row clears preflight.
-    pub const TRADE_WIN_RATE_PCT_DEFAULT: u64 = 34;
+    /// detection-side `STANDARD_EXPECTED_WIN_RATE`. Matches live ops
+    /// (`--win-rate-pct 50` in the launch runbook).
+    pub const TRADE_WIN_RATE_PCT_DEFAULT: u64 = 50;
+
+    /// One CSV poll: parse new rows, drop stale ones, return fresh
+    /// newest-first. Tip failures fail closed (rows skipped until the tip
+    /// recovers) — attempting blind rows during a gateway outage would
+    /// pile estimates onto the same struggling gateway.
+    async fn poll_fresh_rows(
+        tailer: &mut super::trade::CsvTailer,
+        csv: &Path,
+        submitter: &super::Submitter,
+        max_row_age_blocks: u64,
+        poll_ms: u64,
+    ) -> Vec<super::trade::GatedRow> {
+        let rows = match tailer.poll(csv) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("trade: csv poll failed: {e}");
+                tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+                return Vec::new();
+            }
+        };
+        let mut parsed = Vec::with_capacity(rows.len());
+        for line in rows {
+            match super::trade::parse_row(&line) {
+                Ok(Some(row)) => parsed.push(row),
+                Ok(None) => (),
+                Err(e) => {
+                    eprintln!("trade: skipping malformed row: {e}");
+                }
+            }
+        }
+        let tip = submitter.fresh_tip().await;
+        let (fresh, stale) = super::trade::select_fresh_rows(parsed, tip, max_row_age_blocks);
+        if stale > 0 {
+            eprintln!("trade: skipped {stale} stale rows older than {max_row_age_blocks} blocks");
+        }
+        fresh
+    }
 
     /// # Errors
     /// Fatal setup errors (bad address, unreadable files). Per-row failures
@@ -729,8 +832,11 @@ pub mod command {
         deadline_secs: u64,
         poll_ms: u64,
         max_attempts: u64,
+        max_row_age_blocks: u64,
         broadcast: bool,
         capital_source: &str,
+        router_dead_pools: Option<&Path>,
+        v3_algebra: Option<&Path>,
     ) -> Result<(), String> {
         let key = std::env::var("ARBITRAGE_WALLET_PRIVATE_KEY")
             .map_err(|_| "ARBITRAGE_WALLET_PRIVATE_KEY not set in the environment".to_owned())?;
@@ -754,6 +860,18 @@ pub mod command {
             Some(path) => crate::gaps::load_hook_allowlist(path)?,
             None => std::collections::HashSet::new(),
         };
+        // Router dead-list: proven BAD_ARGS pools, refused pre-estimate.
+        // Same file format as the hook allow-list (one pool_id per line).
+        let deadlist = match router_dead_pools {
+            Some(path) => crate::gaps::load_hook_allowlist(path)?,
+            None => std::collections::HashSet::new(),
+        };
+        // Algebra exclusion: V3-catalog pools with Algebra logic, refused
+        // pre-estimate. Same file format (one pool address per line).
+        let algebra = match v3_algebra {
+            Some(path) => crate::gaps::load_hook_allowlist(path)?,
+            None => std::collections::HashSet::new(),
+        };
         let mut tailer = CsvTailer::default();
         // Start from the current end of file: only NEW gated rows are traded.
         let len = std::fs::metadata(csv)
@@ -761,10 +879,12 @@ pub mod command {
             .len();
         tailer.skip_to(len);
         eprintln!(
-            "trade: wallet {:#?} executor {executor:#?} flash={flash} capital={capital_source:?} broadcast={broadcast} overrides={} hook_allowlist={} tailing {}",
+            "trade: wallet {:#?} executor {executor:#?} flash={flash} capital={capital_source:?} broadcast={broadcast} overrides={} hook_allowlist={} deadlist={} algebra={} max_row_age_blocks={max_row_age_blocks} tailing {}",
             submitter.wallet,
             overrides.len(),
             hook_allowlist.len(),
+            deadlist.len(),
+            algebra.len(),
             csv.display()
         );
         let mut attempts: u64 = 0;
@@ -773,25 +893,14 @@ pub mod command {
                 eprintln!("trade: attempt cap {max_attempts} reached; stopping");
                 return Ok(());
             }
-            let rows = match tailer.poll(csv) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    eprintln!("trade: csv poll failed: {e}");
-                    tokio::time::sleep(Duration::from_millis(poll_ms)).await;
-                    continue;
-                }
-            };
-            for line in rows {
-                let row = match super::trade::parse_row(&line) {
-                    Ok(Some(row)) => row,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        eprintln!("trade: skipping malformed row: {e}");
-                        continue;
-                    }
-                };
+            for row in
+                poll_fresh_rows(&mut tailer, csv, &submitter, max_row_age_blocks, poll_ms).await
+            {
                 eprintln!(
-                    "trade: GATED {} anchor {:#?} input {} profit {} ({} legs)",
+                    "trade: GATED ts={} {} anchor {:#?} input {} profit {} ({} legs)",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis()),
                     row.kind,
                     row.token_lo,
                     row.input,
@@ -803,6 +912,8 @@ pub mod command {
                     &row,
                     &overrides,
                     &hook_allowlist,
+                    &deadlist,
+                    &algebra,
                     &prices,
                     win_rate_pct,
                     native_usd,
@@ -818,11 +929,23 @@ pub mod command {
                 {
                     Ok(outcome) => {
                         attempts += u64::from(!outcome.dry_run);
-                        println!("trade: EXECUTED dry={} {}", outcome.dry_run, outcome.detail);
+                        println!(
+                            "trade: EXECUTED ts={} dry={} {}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_millis()),
+                            outcome.dry_run,
+                            outcome.detail
+                        );
                     }
                     Err(e) => {
                         // Fail-closed per row: log and keep the tail alive.
-                        eprintln!("trade: attempt refused: {e}");
+                        eprintln!(
+                            "trade: attempt refused ts={} {e}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_millis())
+                        );
                     }
                 }
             }
@@ -912,6 +1035,62 @@ pub mod trade {
     use std::io::{Seek, SeekFrom};
     use std::path::Path;
 
+    /// Classifies an estimate error as transport/throttle (retryable,
+    /// provider-side) vs a genuine on-chain revert. Fail-closed either way —
+    /// the label only decides whether a floor re-estimate is worth a second
+    /// call on a struggling gateway.
+    #[must_use]
+    pub fn estimate_throttled(err: &str) -> bool {
+        let lower = err.to_lowercase();
+        const MARKERS: &[&str] = &[
+            "429",
+            " 502",
+            " 503",
+            " 504",
+            "rate limit",
+            "rate-limit",
+            "ratelimit",
+            "throttle",
+            "too many requests",
+            "timeout",
+            "timed out",
+            "deadline exceeded",
+            "connection refused",
+            "connection reset",
+            "connection",
+            "dial tcp",
+            "eof",
+            "unexpected eof",
+            "broken pipe",
+            "overloaded",
+            "service unavailable",
+            "try again",
+            "temporarily",
+            "temporarily unavailable",
+        ];
+        MARKERS.iter().any(|m| lower.contains(m))
+    }
+
+    /// Chain-tip cache TTL for the freshness gate: per-poll tip reads (5/s
+    /// at 200ms cadence) 429 the public gateway — observed 2026-09-12.
+    pub const TIP_TTL_SECS: u64 = 2;
+
+    /// Current unix seconds (0 on clock failure — treated as ancient).
+    #[must_use]
+    pub fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    /// Whether a cached timestamp is due for refresh: never set, or the
+    /// TTL elapsed. A future `last` (clock skew) counts as fresh, never
+    /// as due.
+    #[must_use]
+    pub fn cache_due(last_secs: u64, now_secs: u64, ttl_secs: u64) -> bool {
+        last_secs == 0 || now_secs.saturating_sub(last_secs) >= ttl_secs
+    }
+
     /// One parsed gate-passing CSV row, ready to become a route.
     #[derive(Debug, Clone)]
     pub struct GatedRow {
@@ -921,6 +1100,33 @@ pub mod trade {
         pub output: U256,
         pub profit: U256,
         pub legs: Vec<String>,
+        /// Detection block: rows older than the freshness bound are never
+        /// attempted (their dislocation outlived the quote long ago).
+        pub to_block: u64,
+    }
+
+    /// Split freshly polled rows into fresh (newest-first) and a stale
+    /// count. Rows with `to_block` below `tip - max_age_blocks` are dead:
+    /// attempting them spends preflight + estimate latency on dislocations
+    /// that have already closed, delaying fresh rows past their window.
+    #[must_use]
+    pub fn select_fresh_rows(
+        rows: Vec<GatedRow>,
+        tip: u64,
+        max_age_blocks: u64,
+    ) -> (Vec<GatedRow>, usize) {
+        let cutoff = tip.saturating_sub(max_age_blocks);
+        let mut fresh = Vec::with_capacity(rows.len());
+        let mut stale = 0_usize;
+        for row in rows {
+            if row.to_block >= cutoff {
+                fresh.push(row);
+            } else {
+                stale += 1;
+            }
+        }
+        fresh.sort_by_key(|r| std::cmp::Reverse(r.to_block));
+        (fresh, stale)
     }
 
     /// Incremental CSV tailer: remembers the byte offset, yields only new rows.
@@ -994,6 +1200,9 @@ pub mod trade {
         let parse_u = |s: &str| -> Result<U256, String> {
             U256::from_str_radix(s, 10).map_err(|e| format!("bad number {s}: {e}"))
         };
+        let to_block: u64 = cols[3]
+            .parse()
+            .map_err(|e| format!("bad to_block {}: {e}", cols[3]))?;
         // legs may itself contain no commas (encode_csv uses ':' and '|').
         let legs: Vec<String> = legs_col
             .split('|')
@@ -1007,6 +1216,7 @@ pub mod trade {
             output: parse_u(cols[5])?,
             profit: parse_u(cols[6])?,
             legs,
+            to_block,
         }))
     }
 
@@ -1127,6 +1337,62 @@ pub mod trade {
                         "refusing: V4 hook pool 0x{key} without allow-list (hooks {hooks:#?}; estimate would revert)"
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Router dead-list: V4 pools whose legs revert BAD_ARGS at estimate
+    /// on the current router impl although their keys are proven correct
+    /// (see `data/router-dead-pools.csv`). Refusing before any estimate
+    /// saves preflight + estimate spend on certain reverts; detection
+    /// keeps quoting them, and entries are lifted once a working call
+    /// shape is found.
+    pub fn check_router_deadlist(
+        row: &GatedRow,
+        deadlist: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        if deadlist.is_empty() {
+            return Ok(());
+        }
+        for leg in &row.legs {
+            let (profile, _pool, pool_id, _tin, _tout, _fee) = parse_leg(leg)?;
+            if profile != "v4" {
+                continue;
+            }
+            let key = alloy_primitives::hex::encode(pool_id);
+            if deadlist.contains(&key) {
+                return Err(format!(
+                    "refusing: V4 pool 0x{key} is on the router dead-list (BAD_ARGS forensic pending; estimate would revert)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Algebra-pool exclusion: V3-catalog pools proven (2026-09-15 fork
+    /// trace) to be Algebra-logic — `slot0()` reverts, settlement calls
+    /// back `algebraSwapCallback` (our executor only implements the
+    /// UniswapV3 callback → empty revert), and fees are dynamic while
+    /// quotes assume static. Refusing before any estimate saves preflight
+    /// + estimate spend on certain reverts; see `data/v3-algebra.csv`.
+    pub fn check_v3_algebra(
+        row: &GatedRow,
+        algebra: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        if algebra.is_empty() {
+            return Ok(());
+        }
+        for leg in &row.legs {
+            let (profile, pool, _pool_id, _tin, _tout, _fee) = parse_leg(leg)?;
+            if profile != "v3" {
+                continue;
+            }
+            let key = format!("{pool:x}");
+            if algebra.contains(&key) {
+                return Err(format!(
+                    "refusing: V3 pool 0x{key} is Algebra-logic (unexecutable via V3-direct settlement; estimate would revert)"
+                ));
             }
         }
         Ok(())
@@ -1302,6 +1568,8 @@ pub mod trade {
         row: &GatedRow,
         overrides: &Overrides,
         hook_allowlist: &std::collections::HashSet<String>,
+        deadlist: &std::collections::HashSet<String>,
+        algebra: &std::collections::HashSet<String>,
         prices: &std::collections::HashMap<Address, U256>,
         win_rate_pct: u64,
         native_usd: u64,
@@ -1316,6 +1584,10 @@ pub mod trade {
         // Manifest hook policy at execution time: refuse non-allow-listed
         // hook pools before any estimate (fail-closed skip, not a revert).
         check_v4_hook_policy(row, overrides, hook_allowlist)?;
+        // Router dead-list: proven BAD_ARGS pools, refused before estimate.
+        check_router_deadlist(row, deadlist)?;
+        // Algebra exclusion: V3-catalog pools our settlement cannot execute.
+        check_v3_algebra(row, algebra)?;
         if flash {
             // Morpho Blue can only lend ERC20, so the flash token must be the
             // wrapped-native CONTRACT (RHC_NATIVE), never the 0x0 sentinel:
@@ -1384,10 +1656,21 @@ pub mod trade {
             if floor > min_profit {
                 eprintln!("trade (flash): gas floor binds {min_profit} -> {floor}");
                 min_profit = floor;
-                est = submitter
+                match submitter
                     .estimate_entry(entry, token, row.input, &legs_data, min_profit)
-                    .await?;
-                eprintln!("preflight (flash): re-estimate {est} gas with floor");
+                    .await
+                {
+                    Ok(re) => {
+                        est = re;
+                        eprintln!("preflight (flash): re-estimate {est} gas with floor");
+                    }
+                    Err(e) if super::trade::estimate_throttled(&e) => {
+                        return Err(format!(
+                            "estimate throttled (floor re-estimate), skipping retry: {e}"
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             let need = U256::from(est.saturating_mul(2)) * U256::from(gas_price_wei);
             submitter.check_wallet_gas(need).await?;
@@ -1673,6 +1956,7 @@ mod override_key_tests {
                 format!("v4:{pm}:{pid}:{wrapped}:{token}:250"),
                 format!("v4:{pm}:{pid}:{token}:{wrapped}:250"),
             ],
+            to_block: 62_400_000,
         };
         let mut overrides = std::collections::HashMap::new();
         overrides.insert(pid.to_owned(), (60_i32, hooks));
@@ -1699,6 +1983,7 @@ mod override_key_tests {
                 format!("v3:{v3}:{pid}:{wrapped}:{token}:10000"),
                 format!("v4:{pm}:{pid}:{token}:{wrapped}:250"),
             ],
+            to_block: 62_400_000,
         };
         let bytes = build_hybrid_legs_data(&row3, &overrides).unwrap();
         let legs = <Vec<super::RouteLegSol>>::abi_decode(&bytes).unwrap();
@@ -1739,6 +2024,7 @@ mod override_key_tests {
                 format!("v4:{pm}:{pid}:{wrapped}:{token}:250"),
                 format!("v4:{pm}:{pid}:{token}:{wrapped}:250"),
             ],
+            to_block: 62_400_000,
         };
         let mut overrides = std::collections::HashMap::new();
         overrides.insert(pid.to_owned(), (60_i32, hooks));
@@ -1769,8 +2055,8 @@ mod override_key_tests {
         use shadow::{FIXED_POINT_SCALE, gate_defaults::STANDARD_EXPECTED_WIN_RATE};
         // 100 * win_rate_fp < pct * S  ⟺  100/pct < S/win_rate_fp.
         let lhs = U256::from(100u64) * STANDARD_EXPECTED_WIN_RATE;
-        let rhs = U256::from(super::command::TRADE_WIN_RATE_PCT_DEFAULT)
-            * U256::from(FIXED_POINT_SCALE);
+        let rhs =
+            U256::from(super::command::TRADE_WIN_RATE_PCT_DEFAULT) * U256::from(FIXED_POINT_SCALE);
         assert!(
             lhs < rhs,
             "trade floor must nest under detection floor: 100*win_rate={lhs} pct*S={rhs}"
@@ -1804,6 +2090,7 @@ mod override_key_tests {
             output: U256::from(2u64),
             profit: U256::from(1u64),
             legs: vec![format!("v4:{pm}:{hooked}:{usdg}:{weth}:25")],
+            to_block: 62_400_000,
         };
         let mut overrides = std::collections::HashMap::new();
         overrides.insert(hooked.to_owned(), (1_i32, hook_addr));
@@ -1823,5 +2110,130 @@ mod override_key_tests {
             ..row
         };
         assert!(check_v4_hook_policy(&clean, &overrides, &empty).is_ok());
+    }
+
+    #[test]
+    fn estimate_throttled_labels_transport_not_revert() {
+        use super::trade::estimate_throttled;
+        assert!(estimate_throttled("429 too many requests"));
+        assert!(estimate_throttled(
+            "execution reverted: deadline exceeded? no — timeout"
+        ));
+        assert!(estimate_throttled("dial tcp: connection refused"));
+        assert!(estimate_throttled("unexpected eof while reading response"));
+        assert!(!estimate_throttled("execution reverted: BAD_ARGS"));
+        assert!(!estimate_throttled("WrappedError 0x90bfb865"));
+        assert!(!estimate_throttled("execution reverted"));
+    }
+
+    #[test]
+    fn router_deadlist_refuses_listed_v4_before_estimate() {
+        use super::trade::{GatedRow, check_router_deadlist};
+        use alloy_primitives::{Address, U256};
+        let dead = "7159c43bcc3961cf25e85875cbfca5eb4294fb54ce7dd88047bc3559794d832f";
+        let pm = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
+        let usdg = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+        let weth = "0x0bd7d308f8e1639fab988df18a8011f41eacad73";
+        let row = GatedRow {
+            kind: "pair".to_owned(),
+            token_lo: Address::ZERO,
+            input: U256::from(1u64),
+            output: U256::from(2u64),
+            profit: U256::from(1u64),
+            legs: vec![format!("v4:{pm}:{dead}:{usdg}:{weth}:38000")],
+            to_block: 62_400_000,
+        };
+        let mut listed = std::collections::HashSet::new();
+        listed.insert(dead.to_owned());
+        let err = check_router_deadlist(&row, &listed).unwrap_err();
+        assert!(err.contains("dead-list"), "unexpected: {err}");
+        assert!(check_router_deadlist(&row, &std::collections::HashSet::new()).is_ok());
+        // V3 legs never match the list.
+        let v3row = GatedRow {
+            legs: vec![format!("v3:{usdg}:{dead}:{usdg}:{weth}:3000")],
+            ..row
+        };
+        assert!(check_router_deadlist(&v3row, &listed).is_ok());
+    }
+
+    /// Algebra exclusion: listed V3-catalog pools are refused before any
+    /// estimate (live miss: triangle blk 63799054 via Algebra pool
+    /// `0x544e…` reverted with empty data at estimate).
+    #[test]
+    fn v3_algebra_refuses_listed_pool_before_estimate() {
+        use super::trade::{GatedRow, check_v3_algebra};
+        use alloy_primitives::{Address, U256};
+        let alg = "544e1492315f24ec61c2a500a1c75e55e5bb20eb";
+        let weth = "0x0bd7d308f8e1639fab988df18a8011f41eacad73";
+        let tkn = "0x39dbed3a2bd333467115de45665cc57f813c4571";
+        let row = GatedRow {
+            kind: "triangle".to_owned(),
+            token_lo: weth.parse().unwrap(),
+            input: U256::from(1u64),
+            output: U256::from(2u64),
+            profit: U256::from(1u64),
+            legs: vec![format!(
+                "v3:0x{alg}:0000000000000000000000000000000000000000000000000000000000000000:{weth}:{tkn}:1000"
+            )],
+            to_block: 63_799_054,
+        };
+        let mut listed = std::collections::HashSet::new();
+        listed.insert(alg.to_owned());
+        let err = check_v3_algebra(&row, &listed).unwrap_err();
+        assert!(err.contains("Algebra"), "unexpected: {err}");
+        assert!(check_v3_algebra(&row, &std::collections::HashSet::new()).is_ok());
+        // V4 legs never match the list.
+        let v4row = GatedRow {
+            legs: vec![format!(
+                "v4:0x8366a39cc670b4001a1121b8f6a443a643e40951:{alg}:{weth}:{tkn}:10000"
+            )],
+            ..row.clone()
+        };
+        assert!(check_v3_algebra(&v4row, &listed).is_ok());
+        // Case-insensitive: checksummed pool matches the lowercase list.
+        let mixed = GatedRow {
+            legs: vec![format!(
+                "v3:0x544e1492315f24ec61C2A500a1C75e55E5bb20EB:0000000000000000000000000000000000000000000000000000000000000000:{weth}:{tkn}:1000"
+            )],
+            ..row.clone()
+        };
+        assert!(check_v3_algebra(&mixed, &listed).is_err());
+    }
+
+    #[test]
+    fn cache_due_pins_ttl_edges() {
+        use super::trade::cache_due;
+        assert!(cache_due(0, 1_000, 2));
+        assert!(cache_due(998, 1_000, 2));
+        assert!(!cache_due(999, 1_000, 2));
+        // Future timestamp (clock skew) counts as fresh, never due.
+        assert!(!cache_due(1_001, 1_000, 2));
+    }
+
+    #[test]
+    fn select_fresh_rows_splits_and_orders_newest_first() {
+        use super::trade::{GatedRow, select_fresh_rows};
+        use alloy_primitives::{Address, U256};
+        let mk = |block: u64| GatedRow {
+            kind: "pair".to_owned(),
+            token_lo: Address::ZERO,
+            input: U256::from(1u64),
+            output: U256::from(2u64),
+            profit: U256::from(1u64),
+            legs: Vec::new(),
+            to_block: block,
+        };
+        let rows = vec![mk(100), mk(90), mk(700), mk(699)];
+        let (fresh, stale) = select_fresh_rows(rows, 700, 600);
+        assert_eq!(stale, 1);
+        assert_eq!(
+            fresh.iter().map(|r| r.to_block).collect::<Vec<_>>(),
+            vec![700, 699, 100]
+        );
+        // Tip failure (u64::MAX) fails closed: cutoff exceeds every real
+        // block, so nothing is attempted blind during an outage.
+        let (fresh, stale) = select_fresh_rows(vec![mk(1)], u64::MAX, 600);
+        assert_eq!(stale, 1);
+        assert!(fresh.is_empty());
     }
 }

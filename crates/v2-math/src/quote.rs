@@ -58,7 +58,7 @@ pub fn quote_hop(
 /// Returns an error when the cycle shape or state index is invalid, or a hop
 /// quote fails.
 pub fn quote_cycle(input: U256, cycle: &Cycle, states: &[PoolState]) -> Result<U256, MathError> {
-    if !(2..=4).contains(&cycle.hops.len()) {
+    if !(2..=5).contains(&cycle.hops.len()) {
         return Err(MathError::InvalidCycleLength);
     }
 
@@ -91,7 +91,7 @@ pub fn hop_inputs(
     cycle: &Cycle,
     states: &[PoolState],
 ) -> Result<Vec<U256>, MathError> {
-    if !(2..=4).contains(&cycle.hops.len()) {
+    if !(2..=5).contains(&cycle.hops.len()) {
         return Err(MathError::InvalidCycleLength);
     }
     let mut amounts = Vec::with_capacity(cycle.hops.len());
