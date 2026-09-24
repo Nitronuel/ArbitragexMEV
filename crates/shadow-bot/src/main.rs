@@ -209,6 +209,14 @@ enum Command {
         /// proven BAD_ARGS reverts, refused pre-estimate. Empty = off.
         #[arg(long)]
         router_dead_pools: Option<PathBuf>,
+        /// Direct-PM V4 legs: route sentinel-fee (dynamic) and hook-pool V4
+        /// legs through the executor's own PM unlock session (venue=2) instead
+        /// of the RHC router (venue=1). Needs an executor with the venue=2
+        /// direct-PM leg (ExecutorUUPS upgraded 2026-09-16); the router
+        /// rejects both shapes (BAD_ARGS / 0xb98b76b7). Off = legacy router
+        /// legs only.
+        #[arg(long, default_value_t = false)]
+        v4_direct_pm: bool,
         /// Algebra-exclusion CSV (one pool address per line): V3-catalog
         /// pools proven to be Algebra-logic (unexecutable via V3-direct
         /// settlement), refused pre-estimate. Empty = off.
@@ -221,6 +229,13 @@ enum Command {
         /// docs/plans/2026-09-09-v4-quoter-hook-hardening.md).
         #[arg(long, default_value_t = false)]
         broadcast: bool,
+        /// PROBE OVERRIDE (operator-authorized diagnostics only): broadcast a
+        /// gated row even when the preflight gas estimate reverts, using a
+        /// fallback gas limit. Hook/dead-list/Algebra screens, the gas floor,
+        /// the gas cap, and throttled-estimate refusal are never bypassed.
+        /// Intended for single-row diagnostic broadcasts with `--max-attempts 1`.
+        #[arg(long, default_value_t = false)]
+        probe: bool,
     },
     /// Verifies Morpho Blue holds every `morpho`-labeled support token
     /// (read-only, no key). Exits nonzero when nothing is flash-fundable.
@@ -749,6 +764,12 @@ enum Command {
         /// refuse all hook pools from fresh manifests.
         #[arg(long)]
         hook_allowlist: Option<PathBuf>,
+        /// Hook-cost table CSV (`pool_id,haircut_frac[,evidence]`): measured
+        /// executable-vs-model shortfalls that scale gate-passing gross
+        /// before the floor check (see `data/hook-costs.csv`). Missing or
+        /// unreadable = warn once and continue with no haircuts.
+        #[arg(long, default_value = "data/hook-costs.csv")]
+        hook_costs: PathBuf,
         /// Algebra-exclusion CSV (one pool address per line): V3-catalog
         /// pools proven to be Algebra-logic (unquotable with V3 math,
         /// unexecutable via V3-direct settlement). Excluded at load so
@@ -857,7 +878,9 @@ fn main() {
             max_row_age_blocks,
             router_dead_pools,
             v3_algebra,
+            v4_direct_pm,
             broadcast,
+            probe,
         } => {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(submit::command::trade_command(
@@ -881,6 +904,8 @@ fn main() {
                 &capital_source,
                 router_dead_pools.as_deref(),
                 v3_algebra.as_deref(),
+                v4_direct_pm,
+                probe,
             ))
         }
         Command::VerifyBlue { rpc, support } => {
@@ -1155,6 +1180,7 @@ fn main() {
             flash_support,
             overrides,
             hook_allowlist,
+            hook_costs,
             v3_algebra,
             simulate,
             quote_source,
@@ -1197,6 +1223,7 @@ fn main() {
             flash_support: flash_support.as_deref(),
             overrides: overrides.as_deref(),
             hook_allowlist: hook_allowlist.as_deref(),
+            hook_costs: &hook_costs,
             v3_algebra: v3_algebra.as_deref(),
             simulate,
             quote_source: &quote_source,
@@ -2444,6 +2471,38 @@ fn demote_quoter_vetoed(classification: &mut shadow::Classification) {
         .saturating_sub(classification.estimated_net_profit_usd);
 }
 
+/// Hook-cost screen for one gate-passing candidate: scales its gross by the
+/// combined keep-weight of measured costed V4 legs
+/// (`gaps::hook_keep_bps`) and demotes it when the hook-aware net no
+/// longer clears the floor. Rewrites `estimated_net_profit_usd` to the
+/// hook-aware value whenever a costed leg is present (honest books), even
+/// when it still passes. Pure arithmetic — no chain reads.
+///
+/// Returns `(adjusted, demoted)`.
+fn apply_hook_cost(
+    quote: &gaps::PairQuote,
+    classification: &mut shadow::Classification,
+    costs: &std::collections::HashMap<[u8; 32], u64>,
+) -> (bool, bool) {
+    use alloy_primitives::U256;
+    let keep = gaps::hook_keep_bps(&quote.legs, costs);
+    if keep >= 1_000_000 {
+        return (false, false);
+    }
+    let adj_gross =
+        classification.gross_profit_usd.saturating_mul(U256::from(keep)) / U256::from(1_000_000u64);
+    let adj_net = adj_gross
+        .saturating_sub(classification.flash_cost_usd)
+        .saturating_sub(classification.gas_cost_usd);
+    classification.estimated_net_profit_usd = adj_net;
+    if floor_ratio(adj_net, classification.threshold_usd) < 1.0 {
+        classification.reason = ClassificationReason::BelowThreshold;
+        classification.shortfall_usd = classification.threshold_usd.saturating_sub(adj_net);
+        return (true, true);
+    }
+    (true, false)
+}
+
 /// Builds the flash-loan cost selection from CLI arguments.
 ///
 /// `auto` reads the support CSV (`token,provider` rows) and fails closed at
@@ -2562,6 +2621,8 @@ struct RunPairsArgs<'a> {
     overrides: Option<&'a std::path::Path>,
     /// Hook allow-list CSV (None = empty: refuse all hook pools).
     hook_allowlist: Option<&'a std::path::Path>,
+    /// Hook-cost table CSV with measured executable-vs-model haircuts.
+    hook_costs: &'a std::path::Path,
     /// Algebra-exclusion CSV (None = empty: no exclusions).
     v3_algebra: Option<&'a std::path::Path>,
     /// Backstop age bound for cached leg prices (blocks behind the tip).
@@ -2824,6 +2885,23 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
             eprintln!("run-pairs: hooks preflight skipped (no --overrides)");
         }
     }
+    // Hook-cost table: measured executable-vs-model haircuts per V4 pool
+    // (data/hook-costs.csv). Missing/unreadable = warn once and continue
+    // with no haircuts — the screen below simply never fires.
+    let hook_costs = match gaps::load_hook_costs(args.hook_costs) {
+        Ok(map) => {
+            eprintln!(
+                "run-pairs: loaded {} hook-cost pool(s) from {}",
+                map.len(),
+                args.hook_costs.display()
+            );
+            map
+        }
+        Err(error) => {
+            eprintln!("run-pairs: WARNING hook-costs unreadable ({error}); continuing without hook haircuts");
+            std::collections::HashMap::new()
+        }
+    };
     // WS lane timing (http mode ignores these): push drains are frequent
     // and cheap; the HTTP supervisor keeps coverage honest.
     let ws_mode = args.events == "ws";
@@ -3449,6 +3527,49 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
         }
         if quoter_vetoed > 0 {
             eprintln!("run-pairs: quoter-vetoed {quoter_vetoed} candidate(s) this poll");
+        }
+        // Hook-cost screen: pools with measured executable-vs-model
+        // haircuts demote AboveThreshold candidates whose margin cannot
+        // survive them (covers pair/triangle/quad/quint — the quoter veto
+        // above only sees pair/triangle). Runs only when candidates
+        // exist, so quiet polls cost nothing.
+        let mut hook_adjusted = 0u64;
+        let mut hook_costed = 0u64;
+        if !hook_costs.is_empty()
+            && (outcome
+                .pair_results
+                .iter()
+                .chain(outcome.triangle_results.iter())
+                .chain(outcome.quad_results.iter())
+                .chain(outcome.quint_results.iter())
+                .any(|(_, classification)| {
+                    matches!(classification.reason, ClassificationReason::AboveThreshold)
+                }))
+        {
+            for (quote, classification) in outcome
+                .pair_results
+                .iter_mut()
+                .chain(outcome.triangle_results.iter_mut())
+                .chain(outcome.quad_results.iter_mut())
+                .chain(outcome.quint_results.iter_mut())
+            {
+                if !matches!(
+                    classification.reason,
+                    ClassificationReason::AboveThreshold
+                ) {
+                    continue;
+                }
+                let (adjusted, demoted) = apply_hook_cost(quote, classification, &hook_costs);
+                if adjusted {
+                    hook_adjusted += 1;
+                }
+                if demoted {
+                    hook_costed += 1;
+                }
+            }
+        }
+        if hook_costed > 0 {
+            eprintln!("run-pairs: hook-cost demoted {hook_costed} candidate(s) this poll ({hook_adjusted} adjusted)");
         }
         if !outcome.stale_screened.is_empty()
             || !outcome.triangle_stale_screened.is_empty()

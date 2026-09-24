@@ -9,6 +9,30 @@
 # Grandfathered live pools (sim-gated: estimate_entry + on-chain minProfit
 # decide every attempt; listed here so execution matches detection's
 # warn-only policy — see project docs and STATUS.md 2026-09-14):
+# 2026-09-18: 00dd2df2 UN-GRANDFATHERED — hook 0x2cd91bd2… takes ~3.000%
+# (proven same-block V4Quoter-vs-CP batch, twice, vs -0.10% on zero-hook
+# control). Every sub-3% quote through it is phantom (274 estimate refusals).
+# Refuse-all resumes for this pool; re-admit only with hook-aware tolls.
+# 2026-09-21: 85aa9a UN-GRANDFATHERED — hook 0x44455203… reverts V4Quoter
+# simulation outright (inner 0x490bfb86); execution unpredictable, not just
+# taxed. 2 ancient marginal gates only. Re-admit only with hook-aware tolls.
 pool_id
-0x00dd2df2f17d431cf3a0938f06c9cf9abc5e9643b6cc466ca3f71f3af246edf3
-0x85aa9a7c2ef9deec7bcbc5e78c6b26d2598c2aaf3f810b267fa4f8f9b0854142
+#
+# Fables shared hooks (operator-approved 2026-09-16, master plan §4 step 1):
+# hook 0x08E52564…a080 (6 pools) + hook 0x5eb87f69…0080 (4 pools). Hook
+# behavior verified against official architecture docs: beforeSwap fee only —
+# NO amount rewriting, NO liquidity callbacks, immutable. Settlement through
+# both hook pools PROVEN on-fork (ForkFablesSettle probe: 100 USDG → 173.8
+# 0x39db, observed fee 3499 = 0.35%; ForkFablesDirectLeg venue=2 leg).
+# Execution requires the executor venue=2 direct-PM leg (--v4-direct-pm):
+# the router rejects registry keys (BAD_ARGS, ForkFablesSettle matrix).
+0x6ef20273e821b24ca2b27861d700db239c5449f6446c91d13d9c2bc01c7b8bb9
+0x31608601d541e868706aa557558a4d4f99c57e6dd13bd3362edcf05d00a16212
+0x5619cb8420678b47997f20925eb01be8750c907d6226a0df5d7eafeff966346f
+0x16dce5f6a91bd93c2f5f05866dbb780afbe47d2776ea8dcdbb758efff57248a7
+0xb81d873dfb2bb1aaf08804053f8940fd06bb30a2b5a0fafcdbcc7325544452b9
+0x486435a1f76cd58193f854c6e6213cd05fd58d637865d02065ff558b387fa6ea
+0x8660c1c24d58fdad98d9008be534240e5d79ece4d4d4ef16f215af001779ec1f
+0xbb15d6b62c893a86912b5d4b14599f9cc72111e5898327dcadefa0352f20ae11
+0x01b71670a61dd9175a3d1e08d4e0af00ce71e76d230c92649f3ce9857f7d4abd
+0x422ed2d698601ea2114b103501e305ae7e3164f87079c72c626d2df832d74a0e

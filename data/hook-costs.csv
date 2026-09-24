@@ -1,0 +1,16 @@
+# Measured executable-vs-model haircuts per V4 hook pool.
+#
+# `haircut_frac` is the fraction of a leg's modeled output the hook (or the
+# executable path through it) demonstrably withholds, measured by same-block
+# `StateView` slot0/liquidity + `V4Quoter.quoteExactInputSingle` batches
+# (model output from identical state). run-pairs scales gate-passing gross
+# by Π(1−haircut) over costed legs and demotes what no longer clears the
+# floor. Vanilla math on hook pools produces ghosts — this prices them.
+#
+# Seeds (2026-09-18):
+# - 00dd2df2 (hook 0x2cd91bd2…): haircut 0.03 — executable = model × 0.97000,
+#   twice, same-block; zero-hook control pool 7159c4 measured -0.001 in the
+#   same session. Pool since screened from manifest-hot + allow-list; entry
+#   retained as defense-in-depth and method documentation.
+pool_id,haircut_frac,evidence
+0x00dd2df2f17d431cf3a0938f06c9cf9abc5e9643b6cc466ca3f71f3af246edf3,0.03,2026-09-18 same-block StateView+V4Quoter batch x2 (-3.000% exact) vs -0.10% zero-hook control 7159c4

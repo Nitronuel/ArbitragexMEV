@@ -596,12 +596,12 @@ fn denormalize_currency(token: Address) -> Address {
     }
 }
 
-/// Build `FlashLeg[]` abi-encoded bytes for `ExecutorV3.executeFlash` from a
-/// `GatedRow`. Only V4 legs are supported in flash mode (V3 needs a separate callback).
-///
 /// Build `RouteLeg[]` abi-encoded bytes for `ExecutorV3.executeFlash` from a
 /// `GatedRow`. Only V4 legs are supported in flash mode; they execute through
-/// the RHC router (never direct PM.swap).
+/// the RHC router (never direct PM.swap) unless `direct_pm` promotes
+/// sentinel-fee/hook pools to venue=2 legs (the router rejects both shapes —
+/// ForkFablesSettle matrix + `0xb98b76b7` static-leg pin — while the executor's
+/// own PM session settles them, proven in `ForkFablesDirectLeg`).
 ///
 /// # Errors
 /// Fails if any leg is not V4 or lacks tick/hooks overrides.
@@ -609,7 +609,20 @@ pub fn build_flash_legs_data(
     row: &trade::GatedRow,
     overrides: &std::collections::HashMap<String, (i32, Address)>,
 ) -> Result<Vec<u8>, String> {
+    build_flash_legs_data_ext(row, overrides, false)
+}
+
+/// `--v4-direct-pm`-aware flash builder. A V4 leg goes venue=2 (direct PM)
+/// when the pool carries the dynamic-fee sentinel (0x800000) or a nonzero
+/// hook — the two shapes the RHC router provably rejects — and venue=1
+/// (router) otherwise. Static zero-hook legs stay on the router path.
+pub fn build_flash_legs_data_ext(
+    row: &trade::GatedRow,
+    overrides: &std::collections::HashMap<String, (i32, Address)>,
+    direct_pm: bool,
+) -> Result<Vec<u8>, String> {
     use alloy_sol_types::SolValue;
+    const V4_DYNAMIC_FEE_FLAG: u32 = 0x0080_0000;
     let mut legs: Vec<RouteLegSol> = Vec::with_capacity(row.legs.len());
     for leg in &row.legs {
         let (profile, _pool, pool_id, tin, tout, fee_raw) = trade::parse_leg(leg)?;
@@ -623,10 +636,17 @@ pub fn build_flash_legs_data(
             return Err(format!("V4 pool {key} missing tick/hooks override"));
         };
         // Router convention: directional in/out with the 0x0 native sentinel.
+        // Venue=2 legs rebuild the canonical PoolKey from (c0, c1, fee, ts,
+        // hooks) — native on either side is rejected by the executor, so
+        // direct-PM promotion of a native-pair leg would revert BadVenue.
         let tin = denormalize_currency(tin);
         let tout = denormalize_currency(tout);
+        let pm_leg = direct_pm
+            && (*hooks != Address::ZERO || fee_raw & V4_DYNAMIC_FEE_FLAG != 0)
+            && tin != Address::ZERO
+            && tout != Address::ZERO;
         legs.push(RouteLegSol {
-            venue: 1,
+            venue: if pm_leg { 2 } else { 1 },
             v3Pool: Address::ZERO,
             inTok: tin,
             outTok: tout,
@@ -636,7 +656,7 @@ pub fn build_flash_legs_data(
             tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
             hooks: *hooks,
             hookData: alloy_primitives::Bytes::new(),
-            pool: PM,
+            pool: if pm_leg { Address::ZERO } else { PM },
             poolKey: alloy_primitives::B256::from_slice(&pool_id),
         });
     }
@@ -645,12 +665,24 @@ pub fn build_flash_legs_data(
 
 /// Build `RouteLeg[]` for `ExecutorV3.executeHybrid` — supports V3+V4 mixes.
 /// V3 legs execute direct pool.swap (exact input, positive amount); V4 legs
-/// execute through the RHC router with directional in/out tokens.
+/// execute through the RHC router with directional in/out tokens — unless
+/// `direct_pm` promotes sentinel-fee/hook V4 pools to venue=2 (see
+/// [`build_flash_legs_data_ext`]).
 pub fn build_hybrid_legs_data(
     row: &trade::GatedRow,
     overrides: &std::collections::HashMap<String, (i32, Address)>,
 ) -> Result<Vec<u8>, String> {
+    build_hybrid_legs_data_ext(row, overrides, false)
+}
+
+/// `--v4-direct-pm`-aware hybrid builder.
+pub fn build_hybrid_legs_data_ext(
+    row: &trade::GatedRow,
+    overrides: &std::collections::HashMap<String, (i32, Address)>,
+    direct_pm: bool,
+) -> Result<Vec<u8>, String> {
     use alloy_sol_types::SolValue;
+    const V4_DYNAMIC_FEE_FLAG: u32 = 0x0080_0000;
     let mut legs: Vec<RouteLegSol> = Vec::with_capacity(row.legs.len());
     for leg in &row.legs {
         let (profile, pool, pool_id, tin, tout, fee_raw) = trade::parse_leg(leg)?;
@@ -682,8 +714,16 @@ pub fn build_hybrid_legs_data(
                 // Router convention: directional in/out, 0x0 native sentinel.
                 let tin = denormalize_currency(tin);
                 let tout = denormalize_currency(tout);
+                // Direct-PM promotion: sentinel-fee/hook pools only (router
+                // rejects them), ERC20 on both sides (executor rejects
+                // native-pair PM legs), and the poolKey id must be present.
+                let pm_leg = direct_pm
+                    && (*hooks != Address::ZERO || fee_raw & V4_DYNAMIC_FEE_FLAG != 0)
+                    && tin != Address::ZERO
+                    && tout != Address::ZERO
+                    && pool_id.iter().any(|b| *b != 0);
                 legs.push(RouteLegSol {
-                    venue: 1,
+                    venue: if pm_leg { 2 } else { 1 },
                     v3Pool: Address::ZERO,
                     inTok: tin,
                     outTok: tout,
@@ -693,7 +733,7 @@ pub fn build_hybrid_legs_data(
                     tickSpacing: alloy_primitives::Signed::<24, 1>::try_from(*tick).unwrap(),
                     hooks: *hooks,
                     hookData: alloy_primitives::Bytes::new(),
-                    pool: PM,
+                    pool: if pm_leg { Address::ZERO } else { PM },
                     poolKey: alloy_primitives::B256::from_slice(&pool_id),
                 });
             }
@@ -837,6 +877,8 @@ pub mod command {
         capital_source: &str,
         router_dead_pools: Option<&Path>,
         v3_algebra: Option<&Path>,
+        v4_direct_pm: bool,
+        probe: bool,
     ) -> Result<(), String> {
         let key = std::env::var("ARBITRAGE_WALLET_PRIVATE_KEY")
             .map_err(|_| "ARBITRAGE_WALLET_PRIVATE_KEY not set in the environment".to_owned())?;
@@ -879,7 +921,7 @@ pub mod command {
             .len();
         tailer.skip_to(len);
         eprintln!(
-            "trade: wallet {:#?} executor {executor:#?} flash={flash} capital={capital_source:?} broadcast={broadcast} overrides={} hook_allowlist={} deadlist={} algebra={} max_row_age_blocks={max_row_age_blocks} tailing {}",
+            "trade: wallet {:#?} executor {executor:#?} flash={flash} capital={capital_source:?} broadcast={broadcast} probe={probe} overrides={} hook_allowlist={} deadlist={} algebra={} v4_direct_pm={v4_direct_pm} max_row_age_blocks={max_row_age_blocks} tailing {}",
             submitter.wallet,
             overrides.len(),
             hook_allowlist.len(),
@@ -924,6 +966,8 @@ pub mod command {
                     broadcast,
                     flash,
                     capital_source,
+                    v4_direct_pm,
+                    probe,
                 )
                 .await
                 {
@@ -1034,6 +1078,13 @@ pub mod trade {
 
     use std::io::{Seek, SeekFrom};
     use std::path::Path;
+
+    /// Fallback gas estimate for `--probe` broadcasts when the preflight
+    /// estimate reverts (operator-authorized diagnostic only). 800k covers the
+    /// 420k pair charge plus headroom; `broadcast_entry` pads a further 25%.
+    /// Worst case at the 0.5 gwei gas cap is ~$1.25; at live ~0.05 gwei it is
+    /// ~$0.12 — inside the probe budget either way.
+    const PROBE_FALLBACK_GAS: u64 = 800_000;
 
     /// Classifies an estimate error as transport/throttle (retryable,
     /// provider-side) vs a genuine on-chain revert. Fail-closed either way —
@@ -1560,8 +1611,15 @@ pub mod trade {
     /// the gas floor expresses `gas_cost / win_rate` in input-token terms so a
     /// tiny-quoted episode can never pass at a net loss (SECURITY.md gate).
     ///
+    /// `probe` (operator-authorized diagnostics only) broadcasts even when the
+    /// preflight gas estimate reverts, using `PROBE_FALLBACK_GAS`. Throttled
+    /// estimates, hook/dead-list/Algebra screens, the gas floor, and the gas
+    /// cap are never bypassed. Every other gate failure aborts before signing
+    /// (fail-closed).
+    ///
     /// # Errors
-    /// Any gate failure aborts before signing (fail-closed).
+    /// Any gate failure aborts before signing (fail-closed), except the
+    /// estimate-revert bypass when `probe` is set.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn attempt(
         submitter: &Submitter,
@@ -1580,6 +1638,8 @@ pub mod trade {
         broadcast: bool,
         flash: bool,
         capital_source: CapitalSource,
+        v4_direct_pm: bool,
+        probe: bool,
     ) -> Result<TradeOutcome, String> {
         // Manifest hook policy at execution time: refuse non-allow-listed
         // hook pools before any estimate (fail-closed skip, not a revert).
@@ -1606,9 +1666,9 @@ pub mod trade {
             let is_hybrid = row.legs.iter().any(|l| l.starts_with("v3:"));
             let legs_data = if is_hybrid {
                 // Hybrid V3+V4 via direct leg loop in ExecutorV3: build HybridLeg[] ABI
-                crate::submit::build_hybrid_legs_data(row, overrides)?
+                crate::submit::build_hybrid_legs_data_ext(row, overrides, v4_direct_pm)?
             } else {
-                crate::submit::build_flash_legs_data(row, overrides)?
+                crate::submit::build_flash_legs_data_ext(row, overrides, v4_direct_pm)?
             };
             let mut min_profit =
                 row.profit.saturating_mul(U256::from(profit_safety_pct)) / U256::from(100_u64);
@@ -1632,10 +1692,22 @@ pub mod trade {
             // Estimate with quoted minProfit to learn gas, then enforce floor
             let entry = EntryPoint::for_route(capital_source, is_hybrid);
             eprintln!("preflight (flash): entry {}", entry.describe());
-            let mut est = submitter
+            let mut est = match submitter
                 .estimate_entry(entry, token, row.input, &legs_data, min_profit)
-                .await?;
-            eprintln!("preflight (flash): estimate {est} gas");
+                .await
+            {
+                Ok(est) => {
+                    eprintln!("preflight (flash): estimate {est} gas");
+                    est
+                }
+                Err(e) if probe && !estimate_throttled(&e) => {
+                    eprintln!(
+                        "PROBE OVERRIDE: estimate reverted ({e}) — broadcasting anyway with fallback gas {PROBE_FALLBACK_GAS} (operator-authorized diagnostic, single row)"
+                    );
+                    PROBE_FALLBACK_GAS
+                }
+                Err(e) => return Err(e),
+            };
             // Gas floor (price table is keyed by matching-convention
             // addresses — look up the raw anchor, not the denormalized one).
             // No price → refuse (fail-closed): an unpriced input must never
@@ -1668,6 +1740,11 @@ pub mod trade {
                         return Err(format!(
                             "estimate throttled (floor re-estimate), skipping retry: {e}"
                         ));
+                    }
+                    Err(e) if probe => {
+                        eprintln!(
+                            "PROBE OVERRIDE: floor re-estimate reverted ({e}) — keeping minProfit {min_profit} with gas {est} (operator-authorized diagnostic, single row)"
+                        );
                     }
                     Err(e) => return Err(e),
                 }
@@ -2061,6 +2138,80 @@ mod override_key_tests {
             lhs < rhs,
             "trade floor must nest under detection floor: 100*win_rate={lhs} pct*S={rhs}"
         );
+    }
+
+    /// `--v4-direct-pm` promotion: sentinel-fee and hook V4 legs become
+    /// venue=2 (executor direct PM), static zero-hook legs stay venue=1
+    /// (router), and the ERC20-only constraint holds (the executor rejects
+    /// native-pair PM legs with BadVenue). Fables settlement
+    /// (ForkFablesDirectLeg) pins the on-chain half of this contract.
+    #[test]
+    fn v4_direct_pm_promotes_sentinel_and_hook_legs_only() {
+        use super::trade::GatedRow;
+        use super::{build_flash_legs_data_ext, PM};
+        use alloy_primitives::{Address, U256, Uint};
+        use alloy_sol_types::SolValue;
+
+        let usdg: Address = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168".parse().unwrap();
+        let tkn: Address = "0x39dBED3a2bd333467115dE45665cC57F813C4571".parse().unwrap();
+        let hook: Address = "0x08E52564Bad99E05a694b4809F397edcA417A080".parse().unwrap();
+        let fables_pid = "486435a1f76cd58193f854c6e6213cd05fd58d637865d02065ff558b387fa6ea";
+        let plain_pid = "4ce1ef533e1535b04b47326514b3d214a13b48f0dc37a54e28ae2fc0bf85784d";
+        let sentinel_fee = 0x0080_0000_u32;
+        let row = |legs: Vec<String>| GatedRow {
+            kind: "pair".to_owned(),
+            token_lo: usdg,
+            input: U256::from(1_000_000_u64),
+            output: U256::from(1_001_000_u64),
+            profit: U256::from(1_000_u64),
+            legs,
+            to_block: 62_400_000,
+        };
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(fables_pid.to_owned(), (60_i32, hook));
+        overrides.insert(plain_pid.to_owned(), (200_i32, Address::ZERO));
+
+        // Sentinel-fee Fables leg: promoted to venue=2 with the registry id.
+        let bytes = build_flash_legs_data_ext(
+            &row(vec![format!("v4:{PM:#x}:{fables_pid}:{usdg}:{tkn}:{sentinel_fee}")]),
+            &overrides,
+            true,
+        )
+        .unwrap();
+        let legs = <Vec<super::RouteLegSol>>::abi_decode(&bytes).unwrap();
+        assert_eq!(legs[0].venue, 2, "sentinel-fee leg must go direct-PM");
+        assert_eq!(legs[0].pool, Address::ZERO, "venue=2 never calls the router");
+        assert_eq!(legs[0].hooks, hook);
+        assert_eq!(legs[0].fee, Uint::<24, 1>::from(sentinel_fee));
+        // Directional (unsorted) in/out preserved — the executor sorts.
+        assert_eq!(legs[0].inTok, usdg);
+        assert_eq!(legs[0].outTok, tkn);
+
+        // Static zero-hook leg: stays on the router even with the flag on.
+        let weth_native = crate::gaps::RHC_NATIVE;
+        let bytes = build_flash_legs_data_ext(
+            &row(vec![format!(
+                "v4:{PM:#x}:{plain_pid}:{weth_native}:{tkn}:10000"
+            )]),
+            &overrides,
+            true,
+        )
+        .unwrap();
+        let legs = <Vec<super::RouteLegSol>>::abi_decode(&bytes).unwrap();
+        assert_eq!(legs[0].venue, 1, "static zero-hook leg stays on the router");
+        assert_eq!(legs[0].pool, PM);
+        assert_eq!(legs[0].inTok, Address::ZERO); // native sentinel preserved
+
+        // Flag off: everything stays venue=1 (legacy behavior unchanged).
+        let bytes = build_flash_legs_data_ext(
+            &row(vec![format!("v4:{PM:#x}:{fables_pid}:{usdg}:{tkn}:{sentinel_fee}")]),
+            &overrides,
+            false,
+        )
+        .unwrap();
+        let legs = <Vec<super::RouteLegSol>>::abi_decode(&bytes).unwrap();
+        assert_eq!(legs[0].venue, 1, "flag off = legacy router legs");
     }
 
     /// Hook screen: non-allow-listed nonzero-hook V4 legs are refused

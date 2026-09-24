@@ -8,11 +8,16 @@ pragma solidity ^0.8.26;
 /// primary source; the owner-seeded float remains as fallback for tokens Blue
 /// does not hold. Every leg spends holdings physically:
 /// - V3 legs: direct pool.swap with callback paid from holdings (proven).
-/// - V4 legs: single-element call into the RHC router (0x4d819a2a), the only
-///   V4 execution path with live volume. Direct PM.swap is NOT used.
-/// No PM session is opened anywhere here (the router manages its own), so the
-/// ExecutorV3 "flash-around-PM is impossible" finding does not apply: Morpho
-/// flash is external to PM — borrow Blue, run legs, repay Blue.
+/// - V4 legs venue=1: single-element call into the RHC router (0x4d819a2a).
+/// - V4 legs venue=2: DIRECT PM.swap inside the executor's own unlock session
+///   (added 2026-09-16): unlock → swap → sync/transfer/settle → take, all in
+///   one callback, settled against holdings. Needed because the router rejects
+///   Fables registry keys with BAD_ARGS (proven ForkFablesSettle) and static
+///   zero-hook V4 legs; the direct path settles both (proven ForkFablesSettle
+///   probe: 100 USDG → 173.8 0x39db through the shared hook, fee 0.35%).
+/// No PM session is left open (each venue=2 leg opens and fully settles its
+/// own), so the ExecutorV3 "flash-around-PM is impossible" finding does not
+/// apply: Morpho flash is external to PM — borrow Blue, run legs, repay Blue.
 /// Output is measured by balance delta per leg; minProfit is enforced on the
 /// final amount; dust leftovers are swept via rescue().
 /// Security: owner-only entries, reentrancy-gated, one-shot callback
@@ -35,7 +40,7 @@ pragma solidity ^0.8.26;
 /// router element. Rust builders (submit.rs) encode this exact layout —
 /// DO NOT reorder fields (cross-pinned by ExecutorV3EncodingTest).
 struct RouteLeg {
-    uint8 venue; // 0 = V3 direct, 1 = V4 via router
+    uint8 venue; // 0 = V3 direct, 1 = V4 via router, 2 = V4 direct PM
     address v3Pool; // V3 only
     address inTok; // swap input, 0x0 = native
     address outTok; // swap output, 0x0 = native
@@ -78,6 +83,29 @@ interface IWETH {
     function withdraw(uint256) external;
 }
 
+/// v4-core PoolManager subset for venue=2 legs (mirror of the proven
+/// ForkFablesSettle probe interfaces; PM constant verified 2026-08-28).
+interface IPM {
+    struct PoolKey {
+        address currency0;
+        address currency1;
+        uint24 fee;
+        int24 tickSpacing;
+        address hooks;
+    }
+
+    struct SwapParams {
+        bool zeroForOne;
+        int256 amountSpecified;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function unlock(bytes calldata data) external returns (bytes memory);
+    function settle() external payable returns (uint256 paid);
+    function take(address currency, address to, uint256 amount) external;
+    function sync(address currency) external;
+}
+
 interface IMorpho {
     function flashLoan(address token, uint256 assets, bytes calldata data) external;
 }
@@ -94,6 +122,9 @@ contract ExecutorUUPS is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpg
     address public constant MORPHO = 0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010;
     /// Router entry selector.
     bytes4 constant ROUTER_SWAP_SEL = bytes4(0x4d819a2a);
+    /// v4-core PM.swap((address,address,uint24,int24,address),(bool,int256,uint160),bytes) —
+    /// pinned via `cast sig` (custom packed return keeps it off the IPM interface).
+    bytes4 constant PM_SWAP_SEL = bytes4(0xf3cd914c);
     /// Wrapped native alias accepted wherever the null sentinel is (comparison only).
     address constant RHC_WNATIVE = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
 
@@ -118,6 +149,7 @@ contract ExecutorUUPS is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpg
     error InvalidCallback();
     error FlashMismatch();
     error FlashUnsupported();
+    error PMSwapFailed();
 
     event ExecutedFlash(uint256 amountIn, uint256 profit, uint256 gasUsed);
     event ExecutedMorphoFlash(uint256 amountIn, uint256 profit, uint256 gasUsed);
@@ -138,9 +170,9 @@ contract ExecutorUUPS is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpg
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /// Float-funded entry, V4 legs only. `legsData` = abi.encode(RouteLeg[])
-    /// with every leg venue == 1 (V4 via router). `amount` of `token` is spent
-    /// from the owner-seeded float; it must be present (ShortBalance
-    /// otherwise — fail fast before any swap).
+    /// with every leg venue == 1 (router) or venue == 2 (direct PM). `amount`
+    /// of `token` is spent from the owner-seeded float; it must be present
+    /// (ShortBalance otherwise — fail fast before any swap).
     function executeFlash(
         address token,
         uint256 amount,
@@ -260,15 +292,15 @@ contract ExecutorUUPS is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpg
 
         RouteLeg[] memory legs = abi.decode(legsData, (RouteLeg[]));
         if (legs.length == 0) revert RouteEmpty();
-        if (legs[0].venue > 1) revert BadVenue();
+        if (legs[0].venue > 2) revert BadVenue();
         if (!_sameToken(legs[0].inTok, token)) revert NotCyclic();
         if (!isHybrid) {
             for (uint256 i = 0; i < legs.length; i++) {
-                if (legs[i].venue != 1) revert BadVenue();
+                if (legs[i].venue == 0) revert BadVenue();
             }
         }
         for (uint256 i = 1; i < legs.length; i++) {
-            if (legs[i].venue > 1) revert BadVenue();
+            if (legs[i].venue > 2) revert BadVenue();
             if (!_sameToken(legs[i].inTok, legs[i - 1].outTok)) revert NotCyclic();
         }
         if (!_sameToken(legs[legs.length - 1].outTok, token)) revert NotCyclic();
@@ -277,6 +309,7 @@ contract ExecutorUUPS is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpg
                 revert BadVenue();
             }
             if (legs[i].venue == 0 && legs[i].v3Pool == address(0)) revert BadVenue();
+            if (legs[i].venue == 2 && legs[i].poolKey == bytes32(0)) revert BadVenue();
         }
         _fundLeg(legs[0].inTok, amount);
         if (_balanceOf(legs[0].inTok) < amount) revert ShortBalance();
@@ -289,6 +322,8 @@ contract ExecutorUUPS is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpg
             _fundLeg(leg.inTok, curAmount);
             if (leg.venue == 1) {
                 curAmount = _routerSwap(leg, curAmount);
+            } else if (leg.venue == 2) {
+                curAmount = _pmSwap(leg, curAmount);
             } else {
                 if (curAmount > uint256(type(int256).max)) revert NoProfit();
                 s_activeV3Pool = leg.v3Pool;
@@ -343,6 +378,116 @@ contract ExecutorUUPS is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpg
         }
         emit ExecutedFlash(amount, profit, startGas - gasleft());
         s_curAmount = 0;
+    }
+
+    /// PM unlock callback for venue=2 legs: one-shot, PM-authenticated. Runs
+    /// the swap, settles the input side from holdings (sync/transfer/settle),
+    /// takes the output to the executor, and stores the measured amount.
+    /// Native-pair pools are rejected in _pmSwap, so both sides are ERC20.
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != PM) revert NotPM();
+        if (!s_pmActive) revert InvalidCallback();
+        s_pmActive = false;
+
+        // Payload fully resolved by _pmSwap: key verbatim, swap params ready
+        // (negative exact-input amount + literal min/max price limit).
+        (IPM.PoolKey memory key, IPM.SwapParams memory sp, bytes memory hookData) =
+            abi.decode(data, (IPM.PoolKey, IPM.SwapParams, bytes));
+        (int256 d0, int256 d1) = _pmDoSwap(key, sp, hookData);
+        _pmSettleTake(key, sp.zeroForOne, d0, d1);
+        return "";
+    }
+
+    /// Executes the PM.swap and decodes the packed (int128,int128) delta word
+    /// (proven decode in ForkFablesSettle). Deltas — not the requested amount —
+    /// drive settlement, so hook fees and partial fills settle exactly.
+    /// Semantics (proven in ForkFablesSettle probe): the returned deltas are
+    /// the CALLER's — positive = the PM owes the caller (take), negative =
+    /// the caller owes the PM (settle).
+    function _pmDoSwap(
+        IPM.PoolKey memory key,
+        IPM.SwapParams memory sp,
+        bytes memory hookData
+    ) internal returns (int256 d0, int256 d1) {
+        (bool ok, bytes memory ret) = address(PM).call(
+            // PM.swap has a non-standard packed return: selector pinned like
+            // ROUTER_SWAP_SEL and invoked low-level.
+            abi.encodeWithSelector(PM_SWAP_SEL, key, sp, hookData)
+        );
+        if (!ok) {
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+        require(ret.length == 32, "pm swap ret");
+        uint256 raw = uint256(bytes32(ret));
+        d0 = int128(uint128(raw >> 128));
+        d1 = int128(uint128(raw));
+    }
+
+    /// Settles the input side from holdings (sync/transfer/settle) and takes
+    /// the output the PM owes. Native-pair pools are rejected in _pmSwap, so
+    /// both currencies are ERC20 here.
+    ///
+    /// Caller-delta signs: the input side came back NEGATIVE (caller owes the
+    /// PM `-inDelta`), the output side POSITIVE (PM owes the caller). Exact
+    /// input therefore satisfies inDelta < 0 < outDelta for every real fill;
+    /// anything else is not a filled exact-input swap (fail closed).
+    function _pmSettleTake(IPM.PoolKey memory key, bool zeroForOne, int256 d0, int256 d1) internal {
+        address inCur = zeroForOne ? key.currency0 : key.currency1;
+        address outCur = zeroForOne ? key.currency1 : key.currency0;
+        int256 inDelta = zeroForOne ? d0 : d1; // < 0: caller owes the PM
+        int256 outDelta = zeroForOne ? d1 : d0; // > 0: PM owes the caller
+        if (inDelta >= 0 || outDelta <= 0) revert NoProfit();
+        uint256 owed = uint256(-inDelta);
+        if (_balanceOf(inCur) < owed) revert ShortBalance();
+        IPM(PM).sync(inCur);
+        IERC20(inCur).transfer(PM, owed);
+        IPM(PM).settle();
+        IPM(PM).take(outCur, address(this), uint256(outDelta));
+        s_pmCur = uint256(outDelta);
+    }
+
+    /// Venue=2 leg: direct PM.swap inside a self-contained unlock session.
+    /// The pool key is rebuilt from the leg's key fields (currency0/1 = sorted
+    /// inTok/outTok, fee/tickSpacing/hooks verbatim) and verified against the
+    /// builder-supplied poolKey id — the venue=2 whitelist equivalent. Native
+    /// on either side is rejected (value-settle + WETH-alias take are
+    /// deliberate non-goals for this first cut).
+    /// Output measured as the taken amount (equals the pool's output delta).
+    function _pmSwap(RouteLeg memory leg, uint256 amountIn) internal returns (uint256) {
+        if (leg.inTok == address(0) || leg.outTok == address(0)) revert BadVenue();
+        address c0 = leg.inTok < leg.outTok ? leg.inTok : leg.outTok;
+        address c1 = leg.inTok < leg.outTok ? leg.outTok : leg.inTok;
+        IPM.PoolKey memory key = IPM.PoolKey({
+            currency0: c0,
+            currency1: c1,
+            fee: leg.fee,
+            tickSpacing: leg.tickSpacing,
+            hooks: leg.hooks
+        });
+        if (keccak256(abi.encode(key)) != leg.poolKey) revert InvalidCallback();
+        bool zeroForOne = key.currency0 == leg.inTok;
+
+        s_pmActive = true;
+        s_pmCur = 0;
+        IPM.SwapParams memory sp = IPM.SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: -int256(amountIn), // exact input
+            // v4-core takes the limit literally (0 is invalid) and reverts
+            // PriceLimitWrongDirection when the limit sits on the wrong side
+            // of the current price: a zeroForOne (c0→c1) swap moves the price
+            // DOWN, so its limit must be MIN; the c1→c0 direction rises, so
+            // MAX. Mirrors the proven ForkFablesSettle probe (false → MAX).
+            sqrtPriceLimitX96: leg.sqrtPriceLimitX96 == 0
+                ? (zeroForOne ? MIN_SQRT_PRICE : MAX_SQRT_PRICE)
+                : leg.sqrtPriceLimitX96
+        });
+        IPM(PM).unlock(abi.encode(key, sp, leg.hookData));
+        uint256 out = s_pmCur;
+        s_pmCur = 0;
+        if (out == 0) revert NoProfit();
+        return out;
     }
 
     function _routerSwap(RouteLeg memory leg, uint256 amountIn) internal returns (uint256) {
@@ -415,8 +560,12 @@ contract ExecutorUUPS is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpg
     address private s_expectedInTok;
     // Morpho flash state (appended after V3 slots)
     bool private s_morphoActive;
-    // Storage gap for future UUPS upgrades
-    uint256[50] private __gap;
+    // Per-unlock state for venue=2 direct-PM legs (occupy former gap slots;
+    // existing V3/Morpho slots untouched — append-only rule preserved)
+    bool private s_pmActive;
+    uint256 private s_pmCur;
+    // Storage gap for future UUPS upgrades (50 → 48: two slots consumed above)
+    uint256[48] private __gap;
 
     /// V3 swap callback: pays the pool from contract holdings.
     function uniswapV3SwapCallback(

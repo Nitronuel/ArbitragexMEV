@@ -598,6 +598,87 @@ pub fn load_hook_allowlist(path: &Path) -> Result<std::collections::HashSet<Stri
     Ok(out)
 }
 
+/// Loads a hook-cost table (`pool_id,haircut_frac[,evidence]`) into
+/// per-pool haircut weights in basis points (parts per million). Each entry
+/// prices a measured executable-vs-model shortfall (see
+/// `data/hook-costs.csv`): a gate-passing gross through that pool is scaled
+/// by `(1e6 − bps) / 1e6` before the floor check, so vanilla math on hook
+/// pools cannot promote phantom edges.
+///
+/// Fails closed on malformed rows, out-of-range fractions (`0 <= f < 1`),
+/// and duplicates.
+///
+/// # Errors
+///
+/// Returns the parser's message on unreadable files or malformed rows.
+pub fn load_hook_costs(path: &Path) -> Result<HashMap<[u8; 32], u64>, String> {
+    use std::io::{BufRead, BufReader};
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("hook-costs unreadable: {e}"))?;
+    let mut out = HashMap::new();
+    for (lineno, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| format!("hook-costs line {}: {e}", lineno + 1))?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("pool_id") {
+            continue;
+        }
+        let mut cols = line.splitn(3, ',');
+        let id_raw = cols.next().unwrap_or("").trim();
+        let frac_raw = cols.next().unwrap_or("").trim();
+        if id_raw.is_empty() || frac_raw.is_empty() {
+            return Err(format!("hook-costs line {}: need pool_id,haircut_frac", lineno + 1));
+        }
+        let id_hex = normalize_pool_id_hex(id_raw);
+        if id_hex.len() != 64 || !id_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("hook-costs line {}: bad pool_id", lineno + 1));
+        }
+        let mut id = [0u8; 32];
+        for (i, byte) in id.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&id_hex[2 * i..2 * i + 2], 16)
+                .map_err(|_| format!("hook-costs line {}: bad pool_id", lineno + 1))?;
+        }
+        let frac: f64 = frac_raw
+            .parse()
+            .map_err(|_| format!("hook-costs line {}: bad haircut_frac", lineno + 1))?;
+        if !(0.0..1.0).contains(&frac) {
+            return Err(format!(
+                "hook-costs line {}: haircut_frac must satisfy 0 <= f < 1",
+                lineno + 1
+            ));
+        }
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bps = (frac * 1_000_000.0).round() as u64;
+        if out.insert(id, bps).is_some() {
+            return Err(format!("hook-costs line {}: duplicate pool_id", lineno + 1));
+        }
+    }
+    Ok(out)
+}
+
+/// Combined keep-weight (parts per million) for one quoted cycle: the
+/// product of `(1e6 − haircut_bps)` over costed V4 legs, `1_000_000` when no
+/// leg is costed. Pure arithmetic on [`LegRoute`] pool ids — no chain reads,
+/// so it runs inside the hot poll loop for free.
+#[must_use]
+pub fn hook_keep_bps(legs: &[LegRoute], costs: &HashMap<[u8; 32], u64>) -> u64 {
+    if costs.is_empty() {
+        return 1_000_000;
+    }
+    let mut keep: u128 = 1_000_000;
+    for leg in legs {
+        if leg.profile != *b"v4" {
+            continue;
+        }
+        if let Some(bps) = costs.get(&leg.pool_id) {
+            keep = keep * u128::from(1_000_000 - (*bps).min(1_000_000)) / 1_000_000;
+            if keep == 0 {
+                return 0;
+            }
+        }
+    }
+    u64::try_from(keep).unwrap_or(u64::MAX)
+}
+
 /// Scans manifest V4 rows against overrides hooks (Phase 3 of
 /// docs/plans/2026-09-09-v4-quoter-hook-hardening.md): returns the pool
 /// ids (hex, `0x`-prefixed) whose hooks address is nonzero and which are
@@ -3411,8 +3492,7 @@ mod tests {
     use alloy_primitives::Bytes;
 
     #[test]
-    fn normalizes_native_sentinel() {
-        let sentinel = "0x0000000000000000000000000000000000000000"
+    fn normalizes_native_sentinel() {        let sentinel = "0x0000000000000000000000000000000000000000"
             .parse::<Address>()
             .unwrap();
         assert_eq!(normalize_currency(sentinel), RHC_NATIVE);
@@ -3465,6 +3545,98 @@ mod tests {
         entry.fee = 3_000;
         entry.fee_denominator = 1_000_000;
         assert_eq!(effective_leg_toll(&entry, &price), Some(0.003));
+    }
+
+    fn hook_cost_leg(pool_id: [u8; 32], profile: [u8; 2]) -> LegRoute {
+        LegRoute {
+            profile,
+            pool: Address::ZERO,
+            pool_id,
+            token_in: Address::repeat_byte(1),
+            token_out: Address::repeat_byte(2),
+            fee_raw: 10_000,
+        }
+    }
+
+    fn write_hook_costs(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hook-costs-{}.csv",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_hook_costs_parses_and_validates() {
+        let path = write_hook_costs(
+            "# comment\npool_id,haircut_frac,evidence\n00dd2df2f17d431cf3a0938f06c9cf9abc5e9643b6cc466ca3f71f3af246edf3,0.03,measured\n",
+        );
+        let map = load_hook_costs(&path).unwrap();
+        assert_eq!(map.len(), 1);
+        let key = [0x00u8; 32];
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(
+            &alloy_primitives::hex::decode(
+                "00dd2df2f17d431cf3a0938f06c9cf9abc5e9643b6cc466ca3f71f3af246edf3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(map[&expected], 30_000);
+        assert!(!map.contains_key(&key));
+        std::fs::remove_file(path).unwrap();
+
+        // Out-of-range fractions fail closed.
+        for bad in ["x,1.0", "x,1.5", "x,-0.01", "x,abc"] {
+            let p = write_hook_costs(&format!(
+                "pool_id,haircut_frac\n00dd2df2f17d431cf3a0938f06c9cf9abc5e9643b6cc466ca3f71f3af246edf3,{}\n",
+                bad.split(',').nth(1).unwrap()
+            ));
+            assert!(load_hook_costs(&p).is_err(), "accepts {bad}");
+            std::fs::remove_file(p).unwrap();
+        }
+        // Bad pool id and duplicates fail closed.
+        let p = write_hook_costs("pool_id,haircut_frac\nzzzz,0.03\n");
+        assert!(load_hook_costs(&p).is_err());
+        std::fs::remove_file(p).unwrap();
+        let p = write_hook_costs(
+            "pool_id,haircut_frac\n00dd2df2f17d431cf3a0938f06c9cf9abc5e9643b6cc466ca3f71f3af246edf3,0.03\n00dd2df2f17d431cf3a0938f06c9cf9abc5e9643b6cc466ca3f71f3af246edf3,0.05\n",
+        );
+        assert!(load_hook_costs(&p).is_err());
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn hook_keep_bps_neutral_without_costs_or_unlisted() {
+        let empty: HashMap<[u8; 32], u64> = HashMap::new();
+        let legs = vec![
+            hook_cost_leg([7u8; 32], *b"v4"),
+            hook_cost_leg([8u8; 32], *b"v3"),
+        ];
+        assert_eq!(hook_keep_bps(&legs, &empty), 1_000_000);
+        let mut costs = HashMap::new();
+        costs.insert([9u8; 32], 30_000);
+        assert_eq!(hook_keep_bps(&legs, &costs), 1_000_000);
+        // V3 legs are never costed even when listed.
+        costs.insert([8u8; 32], 500_000);
+        assert_eq!(hook_keep_bps(&legs, &costs), 1_000_000);
+    }
+
+    #[test]
+    fn hook_keep_bps_compounds_costed_v4_legs() {
+        let mut costs = HashMap::new();
+        costs.insert([7u8; 32], 30_000); // 3% haircut
+        let legs = vec![hook_cost_leg([7u8; 32], *b"v4")];
+        assert_eq!(hook_keep_bps(&legs, &costs), 970_000);
+        // Two costed legs compound: 0.97 * 0.90 = 0.873.
+        costs.insert([8u8; 32], 100_000);
+        let legs = vec![
+            hook_cost_leg([7u8; 32], *b"v4"),
+            hook_cost_leg([8u8; 32], *b"v4"),
+        ];
+        assert_eq!(hook_keep_bps(&legs, &costs), 873_000);
     }
 
     /// Scripted quoter backend: every `eth_call` returns the same fixed
