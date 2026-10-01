@@ -1,5 +1,5 @@
 # V4 hook allow-list for the manifest hooks gate (Phase 3 of
-# docs/plans/2026-09-09-v4-quoter-hook-hardening.md).
+# the quoter-hook hardening work).
 #
 # One pool_id per line (`0x` prefix optional, case-insensitive). A V4 pool
 # whose overrides hooks address is nonzero is REFUSED from freshly built

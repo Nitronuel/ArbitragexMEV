@@ -1,6 +1,6 @@
 //! Nitro sequencer-feed trigger lane (shadow side).
 //!
-//! Stage A1 of `docs/plans/2026-09-13-feed-trigger-lane.md`: connect to the
+//! Stage A1 of the feed-trigger lane: connect to the
 //! RHC broadcast feed, log one-line per-message summaries, and optionally
 //! capture raw payloads for decoder fixtures. Log-only — nothing here trades,
 //! gates, or influences the WS lane. Batch decoding into pool-touch events is

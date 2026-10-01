@@ -5,7 +5,7 @@
 # Effect: trade refuses rows touching these pools BEFORE estimate (loudly),
 # instead of spending preflight + estimate on certain reverts. Detection
 # keeps quoting them (no bakeoff/coverage loss); remove an entry the moment
-# a working call shape is found — see docs/plans/STATUS.md 2026-09-14.
+# a working call shape is found — see the 2026-09-14 fork forensics notes.
 pool_id
 0x7159c43bcc3961cf25e85875cbfca5eb4294fb54ce7dd88047bc3559794d832f
 0xe9e93bd1fa0f05fcce035e0f4b456f7f8079e8da9a3dceefb0cc89607dfdaa6a

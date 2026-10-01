@@ -50,7 +50,7 @@ const V4_POOL_MANAGER: Address =
     alloy_primitives::address!("0x8366a39CC670B4001A1121B8F6A443A643e40951");
 
 /// Uniswap V4 `StateView` lens on RHC (Phase 1 of
-/// docs/plans/2026-09-09-v4-quoter-hook-hardening.md): canonical
+/// the quoter-hook hardening work): canonical
 /// `getSlot0`/`getLiquidity` reads. Verified deployed (3,531 bytes live,
 /// official deployments page); cross-checked against extsload before use.
 const RHC_STATE_VIEW: Address =
@@ -86,7 +86,7 @@ impl StopOnSignal {
 #[command(
     name = "shadow-bot",
     version,
-    about = "Read-only V2 shadow observer for Base"
+    about = "Arbitrage detection and execution CLI for Robinhood Chain (chain 4663)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -226,7 +226,7 @@ enum Command {
         /// Production runs with `cast send=allow` (no per-tx prompt), so any
         /// new gate must stay log-only through its soak before it may promote
         /// a row to broadcastable (Phase 0+ policy in
-        /// docs/plans/2026-09-09-v4-quoter-hook-hardening.md).
+        /// the quoter-hook hardening work).
         #[arg(long, default_value_t = false)]
         broadcast: bool,
         /// PROBE OVERRIDE (operator-authorized diagnostics only): broadcast a
@@ -679,7 +679,7 @@ enum Command {
         #[arg(long)]
         csv: Option<PathBuf>,
         /// Append-only quoter-baseline log (Phase 0 of
-        /// docs/plans/2026-09-09-v4-quoter-hook-hardening.md): one row per
+        /// the quoter-hook hardening work): one row per
         /// gate-passing or near-miss quote (floor_ratio in [0.5, 1.0)) with
         /// the math quote's input, predicted output, capacity ratio and
         /// legs, for offline comparison against V4Quoter executable quotes.
@@ -2742,7 +2742,7 @@ fn run_pairs_command(args: &RunPairsArgs<'_>) -> Result<(), String> {
     let prices_path = args.prices;
     let baseline_path = args.log_quote_detail;
     let mut csv_out: Option<std::io::BufWriter<std::fs::File>> = None;
-    // Phase 0 quoter baseline (docs/plans/2026-09-09-v4-quoter-hook-hardening.md):
+    // Phase 0 quoter baseline (the quoter-hook hardening work):
     // append-only, default off, written only for gate-passing + near-miss
     // quotes. Same A14 discipline as the trade tail file.
     let mut baseline_out: Option<std::io::BufWriter<std::fs::File>> = None;

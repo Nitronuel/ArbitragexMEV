@@ -3,7 +3,7 @@
 #
 # Deploys the implementation, then an ERC1967Proxy pointing at it. The PROXY
 # address is permanent; all future layers go through scripts/upgrade-uups.sh.
-# See docs/runbooks/uups-deploy.md (nothing is deployed by saving this file).
+# See the UUPS deploy runbook (nothing is deployed by saving this file).
 #
 # Usage: scripts/deploy-uups.sh [IMPL_CONTRACT] [OWNER_ADDRESS]
 #   IMPL_CONTRACT default: ExecutorUUPS (must exist under contracts/)
@@ -50,7 +50,7 @@ IMPL="${1:-ExecutorUUPS}"
 OWNER="${2:-$DEPLOYER}"
 IMPL_PATH="contracts/$IMPL.sol"
 if [[ ! -f "$IMPL_PATH" ]]; then
-  echo "FATAL: $IMPL_PATH not found — write it first (see docs/runbooks/uups-deploy.md §3)" >&2
+  echo "FATAL: $IMPL_PATH not found — write it first (see the UUPS deploy runbook §3)" >&2
   exit 1
 fi
 

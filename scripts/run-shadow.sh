@@ -28,7 +28,7 @@ else
   printf 'warning: runtime env file not found: %s\n' "$env_file" >&2
   printf '  validate-config and any live command REQUIRE the env file.\n' >&2
   printf '  verify-catalog (offline) does not and can run without it.\n' >&2
-  printf '  see docs/runbooks/shadow-mode.md, section 2.\n' >&2
+  printf '  see the shadow-mode runbook, section 2.\n' >&2
 fi
 
 exec cargo run -q -p shadow-bot -- "$@"

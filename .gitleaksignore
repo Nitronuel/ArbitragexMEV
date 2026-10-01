@@ -1,0 +1,14 @@
+# Audited false positives for `generic-api-key`. Every entry is a public
+# on-chain identifier or a test fixture, not a credential:
+#   - ForkMinOut.t.sol:73     console.log string "livekey-minOut1 OK"
+#   - ForkRow3Pin.t.sol:250   Uniswap V4 poolKey (public pool id)
+#   - ForkRow3Pin.t.sol:288   Uniswap V4 poolKey (public pool id)
+#   - ForkRow3Pin.t.sol:354   Uniswap V4 poolKey (public pool id)
+#   - ForkRow2Pin.t.sol:51    Uniswap V4 pool key constant
+#   - gaps.rs:260             Address literal in a unit test
+67acb72c0f22dc41e54ec67c70d0e6b1ae7ea535:contracts/ForkMinOut.t.sol:generic-api-key:73
+67acb72c0f22dc41e54ec67c70d0e6b1ae7ea535:contracts/ForkRow3Pin.t.sol:generic-api-key:250
+67acb72c0f22dc41e54ec67c70d0e6b1ae7ea535:contracts/ForkRow3Pin.t.sol:generic-api-key:288
+67acb72c0f22dc41e54ec67c70d0e6b1ae7ea535:contracts/ForkRow3Pin.t.sol:generic-api-key:354
+6b63b9a18e5bdbd9b585fbafd9dbcc0376505760:contracts/ForkRow2Pin.t.sol:generic-api-key:51
+7a276c3b6c6a8ee5a0b33bd80c3befed6bb9c7b5:crates/shadow-bot/src/gaps.rs:generic-api-key:260

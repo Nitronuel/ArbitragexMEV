@@ -24,7 +24,7 @@ pub const V4_DYNAMIC_FEE_FLAG: u32 = 0x0080_0000;
 /// sentinels (`0` / `0x800000`) bypass this screen and resolve through
 /// observed Swap fees instead; anything above the bound is refused, never
 /// averaged in. Rationale (Phase 3 of
-/// docs/plans/2026-09-09-v4-quoter-hook-hardening.md): an 89% toll still
+/// the quoter-hook hardening work): an 89% toll still
 /// screens at economics (dust output → `BelowThreshold`), while 90%+ is
 /// predatory-by-construction and refused up front.
 pub const MAX_QUOTABLE_FEE: f64 = 0.9; // was 0.5 (50%) — lifted for full range (was filtering >50% fee honeypots, now 90%)
@@ -680,7 +680,7 @@ pub fn hook_keep_bps(legs: &[LegRoute], costs: &HashMap<[u8; 32], u64>) -> u64 {
 }
 
 /// Scans manifest V4 rows against overrides hooks (Phase 3 of
-/// docs/plans/2026-09-09-v4-quoter-hook-hardening.md): returns the pool
+/// the quoter-hook hardening work): returns the pool
 /// ids (hex, `0x`-prefixed) whose hooks address is nonzero and which are
 /// NOT on the allow-list. Hook pricing needs hook logic — vanilla math on
 /// hook pools produces ghosts — so callers must refuse or loudly exempt
@@ -1361,7 +1361,7 @@ where
 /// V4 state source for [`refetch_invalidated_prices`]: raw
 /// `eth_getStorageAt` against the `PoolManager` mapping, or the canonical
 /// `StateView` lens contract (Phase 1 of
-/// docs/plans/2026-09-09-v4-quoter-hook-hardening.md). `StateView` falls
+/// the quoter-hook hardening work). `StateView` falls
 /// back to the mapping per pool on any error, counted in `fallbacks`.
 #[allow(clippy::doc_markdown)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

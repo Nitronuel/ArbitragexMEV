@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Upgrade the UUPS proxy to a new implementation (adding a layer).
 # Same proxy address forever; funds and approvals stay put.
-# See docs/runbooks/uups-deploy.md §5 (nothing is deployed by saving this file).
+# See the UUPS deploy runbook §5 (nothing is deployed by saving this file).
 #
 # Usage: scripts/upgrade-uups.sh <PROXY_ADDRESS> <NEW_IMPL_CONTRACT>
 #   e.g. scripts/upgrade-uups.sh 0xYourProxy... ExecutorV4Morpho

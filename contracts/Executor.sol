@@ -3,7 +3,7 @@ pragma solidity ^0.8.26;
 
 /// @title RHC Arbitrage Executor — Robinhood Chain (4663)
 /// @notice Borrow → route via RHC router 0x650… → repay → profit.
-///         Hard constraints: SECURITY.md budget $100, no `eth_call` per quote, gate `simulated_profit > gas_cost/expected_win_rate`.
+///         Hard constraints (SECURITY.md): no `eth_call` per quote, gate `simulated_profit > gas_cost/expected_win_rate`.
 ///         Security: authenticate callbacks, bound routes, enforce repayment + minProfit on-chain, fee-on-transfer aware, reentrancy guarded.
 contract Executor {
     address public immutable owner;
